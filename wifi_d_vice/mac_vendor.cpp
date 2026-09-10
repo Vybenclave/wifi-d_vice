@@ -2379,6 +2379,9 @@ String macVendorTag(const uint8_t mac[6]) {
   uint32_t oui = ((uint32_t)mac[0] << 16) | ((uint32_t)mac[1] << 8) | mac[2];
   const char *name = lookupOui(oui);
   char buf[24];
-  snprintf(buf, sizeof(buf), "%s:%02X%02X%02X", name ? name : "Unknown", mac[3], mac[4], mac[5]);
+  if (name)
+    snprintf(buf, sizeof(buf), "%s:%02X%02X%02X", name, mac[3], mac[4], mac[5]);
+  else   // unresolved: show the OUI itself so a miss can be looked up
+    snprintf(buf, sizeof(buf), "OUI %02X%02X%02X (unk)", mac[0], mac[1], mac[2]);
   return String(buf);
 }
