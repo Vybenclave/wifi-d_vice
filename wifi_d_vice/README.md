@@ -40,11 +40,12 @@ The code refers to these rules. It does not repeat them at each location.
 
 DRAM is the internal RAM of the ESP32. The WiFi driver uses approximately
 50 KB of DRAM. The BLE host and controller stack also use a large part of
-the DRAM. The two cannot be resident at the same time. If the second one
-starts when the first one is still resident, it does not get enough memory.
-The firmware then stops with a panic. If a WiFi station link was active, the
-result is a continuous restart. If no link was active, the result is a stop
-with no output.
+the DRAM. There is not enough DRAM for both plus the rest of the firmware.
+If a screen starts the second stack while the first is still resident, the
+init usually does not get enough memory and the firmware stops with a
+panic. If a WiFi station link was active, the result is a continuous
+restart. If no link was active, the result is a stop with no output. So a
+screen tears one stack down before it starts the other.
 
 Rules:
 
@@ -57,11 +58,17 @@ Rules:
 - When a screen that uses BLE stops: call `BLEDevice::deinit(false)` and set
   the cached `BLEScan*` pointer to null. This releases the memory for the
   next WiFi screen.
-- Flock detect needs WiFi and BLE in the same cycle. It hands the radio
-  between them. Only one is active at a time.
+- Flock detect is the exception. It scans WiFi and BLE in turn on a repeat
+  loop, and it keeps BOTH stacks resident for the whole time the screen is
+  open. The two scans do not run at the same instant, but the WiFi driver
+  and the BLE stack hold their memory together. This only fits because of
+  the Classic Bluetooth release below. BLE is freed on flockExit(). A true
+  hand-off (WiFi off before each BLE phase) is a planned change; today it
+  is not done.
 - `setup()` calls `esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT)`.
   This build uses BLE only. This call releases approximately 28 KB of
-  Classic Bluetooth controller memory for the full session.
+  Classic Bluetooth controller memory for the full session. It is what
+  gives Flock detect the headroom to hold both stacks.
 
 ### Do not use `WIFI_MODE_NULL` between screens
 
