@@ -156,8 +156,8 @@ you rely on it.
 ## Credits
 
 - The MAC OUI -> vendor table (`wifi_d_vice/mac_vendor.cpp`) is a curated
-  subset of Andy Allan's OUI list:
-  https://gist.github.com/aallan/b4bb86db86079509e6159810ae9bd3e4
+  subset of Wireshark's `manuf` list:
+  https://www.wireshark.org/download/automated/data/manuf
 
 ## License
 

@@ -3,8 +3,8 @@
 // Curated OUI-prefix -> vendor-name lookup (not the full IEEE registry --
 // that's tens of thousands of entries, impractical to embed here). Covers
 // common consumer/IoT/networking vendors likely to show up in a scan.
-// Built from Andy Allan's OUI list mirror
-// (https://gist.github.com/aallan/b4bb86db86079509e6159810ae9bd3e4).
+// A subset of Wireshark's `manuf` list
+// (https://www.wireshark.org/download/automated/data/manuf).
 // Falls back to "Unknown" for anything not in the table.
 //
 // Returns "Vendor:XXYYZZ" (vendor short name, colon, last 3 MAC bytes as
