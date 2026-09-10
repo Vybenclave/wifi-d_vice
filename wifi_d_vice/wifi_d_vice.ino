@@ -4,15 +4,20 @@
 // ownership, UI conventions), and ~/.claude/skills/esp32-cyd + pins.h for
 // the board / addon wiring.
 //
-// Features: WiFi + BLE scanning, a WiFi IDS (deauth/disassoc, beacon-flood
-// and auth/assoc-flood detection on one shared promiscuous core), rogue-AP
-// / evil-twin detection against an SD baseline, a WiFi-scan RSSI direction
-// finder, Flock Safety camera detection, Bluetooth skimmer detection, a
-// CC1101 SubGHz sweep, a Meshtastic mesh monitor, and GPS-tagged
-// wardriving. Analysis of received traffic -- no attack traffic is
-// generated here (see DESIGN.md). NFC/RFID detection (PN532) was tried and
-// dropped -- low value on its own, and covered better by a dedicated
-// Chameleon-style tool over BLE.
+// Features: WiFi + BLE scanning, a WiFi IDS (deauth/disassoc, beacon-flood,
+// auth/assoc-flood, Pwnagotchi and a baseline-free evil-twin score on one
+// shared promiscuous core), rogue-AP / evil-twin detection against an SD
+// baseline, a WiFi-scan RSSI direction finder, Flock Safety camera
+// detection, BLE tracker detection (incl. Google FMDN), Bluetooth skimmer
+// detection, Flipper Zero / Meta-glasses tagging in the BLE scan, a CC1101
+// SubGHz screen (sweep / frequency analyzer / GDO0-gated raw OOK capture to
+// .sub), a Meshtastic mesh monitor, GPS-tagged wardriving, and a Recon
+// category: probe-request watch, client/station map, WiFi camera-OUI
+// detector, drone Remote ID (WiFi+BLE), and a BLE advertisement-spam watch.
+// Analysis of received traffic -- no attack traffic is generated here (see
+// DESIGN.md). NFC/RFID detection (PN532) was tried and dropped -- low value
+// on its own, and covered better by a dedicated Chameleon-style tool over
+// BLE.
 //
 // The Engagement Page (client/tester/passphrase, gated by native BLE
 // Secure Connections passkey pairing + bonding as a second factor -- see

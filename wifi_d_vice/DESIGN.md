@@ -9,14 +9,39 @@ detectors with traffic from other equipment.
 
 - WiFi scan and an access-point direction finder that uses signal strength.
 - Rogue access point and evil twin, with a known-good baseline on the SD
-  card.
-- BLE scan and a tracker detector (for example AirTag and SmartTag).
-- Deauthentication-flood detector.
+  card. The WiFi IDS screen also carries a baseline-free evil-twin score
+  (same SSID, different BSSID, divergent on randomized MAC / security
+  downgrade / RSSI / channel) and a Pwnagotchi-presence check.
+- BLE scan and a tracker detector (AirTag, SmartTag, Tile, Chipolo, and the
+  Google Find My Device network).
+- Deauthentication / disassociation flood detector, plus beacon-flood and
+  auth/assoc-flood detectors, on one shared promiscuous core.
 - Flock Safety camera detection.
-- BLE skimmer detection.
-- CC1101 sub-GHz sweep (315, 433, 868, and 915 MHz).
+- BLE skimmer detection (module names + the 0xFFD0 UART-bridge service).
+- Flipper Zero and Meta / Ray-Ban glasses tagging in the BLE scan.
+- CC1101 sub-GHz screen with three modes: band sweep, frequency analyzer
+  (strongest ISM centre), and raw OOK capture to a Flipper .sub file. Raw
+  capture needs the CC1101 GDO0 line wired to a spare GPIO (System >
+  Hardware); a live probe gates the mode until it is connected.
 - Meshtastic mesh monitor over BLE.
 - GPS wardriving.
+
+### Recon category
+
+Passive analysis screens added for Marauder / Wireless Wizard / Flipper
+feature parity:
+
+- Probe-request watch -- the SSIDs nearby clients are directed-probing for.
+- Client / station map -- client devices in the air, from management
+  frames (probe / assoc / auth): MAC, OUI vendor, last AP, RSSI, frames.
+- WiFi camera detector -- beacon BSSID OUI against a camera-vendor table,
+  plus an SSID substring pass; tap to direction-find.
+- Drone Remote ID -- ASTM F3411 / open-drone-id over WiFi (beacon vendor
+  IE, NaN action frames) and BLE (0xFFFA service data, DJI). Decodes the
+  UAS serial and the operator-reported position.
+- BLE advertisement-spam watch -- advert rate, distinct-address estimate,
+  and Apple Continuity / SwiftPair / Fast-Pair frame counts feed one
+  severity verdict.
 
 ## Roadmap
 

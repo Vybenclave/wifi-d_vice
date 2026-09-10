@@ -50,11 +50,17 @@ screen tears one stack down before it starts the other.
 Rules:
 
 - Before a screen that uses BLE starts BLE (`ble_scan`, `tracker_detect`,
-  `skimmer_detect`, `meshtastic_mon`, `engagement`, `webdl`): call
+  `skimmer_detect`, `meshtastic_mon`, `engagement`, `webdl`,
+  `ble_spam_detect`, and `drone_detect` on its BLE tab): call
   `WiFi.disconnect(true, false)`, then `WiFi.mode(WIFI_OFF)`, then a short
   `delay`, then `BLEDevice::init()`. `WiFi.disconnect(true, false)` ends an
   active link and releases its network sockets. It keeps the saved
   credentials.
+- The Recon screens `probe_watch` and `client_map`, and `drone_detect` on
+  its WiFi tab, hold the shared `wifi_ids` promiscuous core -- same
+  constraint as `wifi_ids` itself: not compatible with a concurrent STA
+  link or with BLE. `drone_detect` tears one stack fully down before
+  bringing up the other when its tab is switched.
 - When a screen that uses BLE stops: call `BLEDevice::deinit(false)` and set
   the cached `BLEScan*` pointer to null. This releases the memory for the
   next WiFi screen.

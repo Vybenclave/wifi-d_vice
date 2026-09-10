@@ -119,7 +119,7 @@ void clientMapLoop() {
   if (!running) return;
   wifiIdsLoop();
   uint32_t now = millis();
-  if ((dirty && now - lastDraw > 700) || now - lastDraw > 3000) { draw(); lastDraw = now; }
+  if ((dirty && now - lastDraw > 1200) || now - lastDraw > 4000) { draw(); lastDraw = now; }
 }
 
 void clientMapTouch(const TouchPoint &t) {
