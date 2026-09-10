@@ -10,6 +10,7 @@ enum {
   MOD_FLOCK,     MOD_SKIMMER,   MOD_SUBGHZ,   MOD_MESHTASTIC,
   MOD_ENGAGEMENT,
   MOD_ROGUE_AP,   // appended (not inserted) so existing "modhide" NVS bits stay aligned
+  MOD_PROBE_WATCH, MOD_CLIENT_MAP, MOD_CAMERA, MOD_DRONE, MOD_BLE_SPAM,   // likewise appended
   MOD_N
 };
 

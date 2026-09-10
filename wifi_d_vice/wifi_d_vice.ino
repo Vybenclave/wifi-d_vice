@@ -53,8 +53,9 @@
 // scan / SubGHz are about spotting that, not opsec in general.
 enum Screen {
   MENU,
-  SUB_WIFI, SUB_CS,
+  SUB_WIFI, SUB_CS, SUB_RECON,
   WIFI_SCAN, NET_STATS, BLE_SCAN, TRACKER, WIFI_IDS, ROGUE_AP, FLOCK, SKIMMER, SUBGHZ, MESHTASTIC, GPS_WARDRIVE,
+  PROBE_WATCH, CLIENT_MAP, CAMERA_DET, DRONE_DET, BLE_SPAM,
   ENGAGEMENT, SYSTEM
 };
 Screen currentScreen = MENU;
@@ -70,6 +71,7 @@ static const TopItem kTop[] = {
   {"Engagement",   ENGAGEMENT, MOD_ENGAGEMENT},
   {"WiFi",         SUB_WIFI,   -1},
   {"Privacy",      SUB_CS,     -1},
+  {"Recon",        SUB_RECON,  -1},
   {"Meshtastic",   MESHTASTIC, MOD_MESHTASTIC},
 };
 static const int kTopCount = sizeof(kTop) / sizeof(kTop[0]);
@@ -90,12 +92,24 @@ static const SubItem kCsItems[] = {
   {"BLE scan",       BLE_SCAN,   MOD_BLE_SCAN},
   {"SubGHz sweep",   SUBGHZ,     MOD_SUBGHZ},
 };
-static const int kMaxSubItems = 5;   // largest of the two submenu lists above
+// Recon: the passive-analysis screens added from Marauder / Wireless
+// Wizard / Flipper feature parity. Kept as their own category so the WiFi
+// and Privacy lists stay at five items (the tallest a submenu can draw
+// without scrolling).
+static const SubItem kReconItems[] = {
+  {"Probe watch",    PROBE_WATCH, MOD_PROBE_WATCH},
+  {"Client map",     CLIENT_MAP,  MOD_CLIENT_MAP},
+  {"Camera detect",  CAMERA_DET,  MOD_CAMERA},
+  {"Drone detect",   DRONE_DET,   MOD_DRONE},
+  {"BLE spam watch", BLE_SPAM,    MOD_BLE_SPAM},
+};
+static const int kMaxSubItems = 5;   // largest of the three submenu lists above
 static Btn subButtons[kMaxSubItems];
 
 static const SubItem *subItemsFor(Screen sub, int *count) {
-  if (sub == SUB_WIFI) { *count = sizeof(kWifiItems) / sizeof(kWifiItems[0]); return kWifiItems; }
-  if (sub == SUB_CS)   { *count = sizeof(kCsItems) / sizeof(kCsItems[0]); return kCsItems; }
+  if (sub == SUB_WIFI)  { *count = sizeof(kWifiItems)  / sizeof(kWifiItems[0]);  return kWifiItems; }
+  if (sub == SUB_CS)    { *count = sizeof(kCsItems)    / sizeof(kCsItems[0]);    return kCsItems; }
+  if (sub == SUB_RECON) { *count = sizeof(kReconItems) / sizeof(kReconItems[0]); return kReconItems; }
   *count = 0;
   return nullptr;
 }
@@ -104,6 +118,7 @@ static const char *subTitleFor(Screen sub) {
   switch (sub) {
     case SUB_WIFI: return "WiFi";
     case SUB_CS: return "Privacy";
+    case SUB_RECON: return "Recon";
     default: return "";
   }
 }
@@ -129,6 +144,7 @@ static Screen parentOf(Screen s) {
   switch (s) {
     case WIFI_SCAN: case NET_STATS: case WIFI_IDS: case ROGUE_AP: case GPS_WARDRIVE: return SUB_WIFI;
     case BLE_SCAN: case TRACKER: case FLOCK: case SKIMMER: case SUBGHZ: return SUB_CS;
+    case PROBE_WATCH: case CLIENT_MAP: case CAMERA_DET: case DRONE_DET: case BLE_SPAM: return SUB_RECON;
     default: return MENU;   // MESHTASTIC / ENGAGEMENT / SYSTEM are top-level
   }
 }
@@ -263,6 +279,11 @@ void exitScreen(Screen s) {
     case FLOCK:         flockExit();    break;
     case SKIMMER:       skimmerExit();  break;
     case SUBGHZ:        subghzExit();  break;
+    case PROBE_WATCH:   probeWatchExit(); break;
+    case CLIENT_MAP:    clientMapExit(); break;
+    case CAMERA_DET:    cameraExit();   break;
+    case DRONE_DET:     droneExit();    break;
+    case BLE_SPAM:      bleSpamExit();  break;
     case MESHTASTIC:    meshExit();     break;
     case GPS_WARDRIVE:  gpsExit();      break;
     case ENGAGEMENT:    engagementExit(); break;
@@ -278,9 +299,10 @@ static bool screenDropsWifi(Screen s) {
   switch (s) {
     case BLE_SCAN: case TRACKER: case FLOCK: case SKIMMER:
     case MESHTASTIC: case WIFI_IDS:
+    case PROBE_WATCH: case CLIENT_MAP: case DRONE_DET: case BLE_SPAM:
       return true;
     default:
-      return false;
+      return false;   // CAMERA_DET uses WiFi.scanNetworks -- no promiscuous, keeps the link
   }
 }
 
@@ -312,7 +334,7 @@ static bool confirmRadioSwitch(Screen target) {
 void enterScreen(Screen s) {
   currentScreen = s;
   switch (s) {
-    case SUB_WIFI: case SUB_CS: drawSubMenu(s); return;
+    case SUB_WIFI: case SUB_CS: case SUB_RECON: drawSubMenu(s); return;
     case WIFI_SCAN:     wifiScanEnter(); break;
     case NET_STATS:     netstatsEnter(); break;
     case BLE_SCAN:      bleScanEnter();  break;
@@ -322,6 +344,11 @@ void enterScreen(Screen s) {
     case FLOCK:         flockEnter();    break;
     case SKIMMER:       skimmerEnter();  break;
     case SUBGHZ:         subghzEnter();  break;
+    case PROBE_WATCH:   probeWatchEnter(); break;
+    case CLIENT_MAP:    clientMapEnter(); break;
+    case CAMERA_DET:    cameraEnter();   break;
+    case DRONE_DET:     droneEnter();    break;
+    case BLE_SPAM:      bleSpamEnter();  break;
     case MESHTASTIC:    meshEnter();     break;
     case GPS_WARDRIVE:  gpsEnter();      break;
     case ENGAGEMENT:    engagementEnter(); break;
@@ -431,7 +458,10 @@ void loop() {
   // screens that scan the entire time they're open.
   ledBusyScreen(currentScreen == FLOCK || currentScreen == SKIMMER ||
                 currentScreen == SUBGHZ || currentScreen == TRACKER ||
-                currentScreen == BLE_SCAN || currentScreen == GPS_WARDRIVE);
+                currentScreen == BLE_SCAN || currentScreen == GPS_WARDRIVE ||
+                currentScreen == PROBE_WATCH || currentScreen == CLIENT_MAP ||
+                currentScreen == CAMERA_DET || currentScreen == DRONE_DET ||
+                currentScreen == BLE_SPAM);
   uiDrawSyncIndicator();   // bottom-right clock-sync status light, every screen
                            // (note: doesn't appear during modal sub-loops like the
                            // keyboard, calibration, or BLE pairing wait -- those
@@ -449,7 +479,7 @@ void loop() {
       if (backDownAt == 0) backDownAt = millis();
       if (millis() - backDownAt > 600) {          // HOLD -> home
         backDownAt = 0;
-        bool isSub = (currentScreen == SUB_WIFI || currentScreen == SUB_CS);
+        bool isSub = (currentScreen == SUB_WIFI || currentScreen == SUB_CS || currentScreen == SUB_RECON);
         if (!isSub) exitScreen(currentScreen);
         currentScreen = MENU;
         drawMenu();
@@ -461,7 +491,7 @@ void loop() {
       bool released = !t.pressed;
       backDownAt = 0;
       if (released) {                             // TAP -> up one level
-        bool isSub = (currentScreen == SUB_WIFI || currentScreen == SUB_CS);
+        bool isSub = (currentScreen == SUB_WIFI || currentScreen == SUB_CS || currentScreen == SUB_RECON);
         if (isSub) {
           currentScreen = MENU;
           drawMenu();
@@ -502,7 +532,7 @@ void loop() {
     return;
   }
 
-  if (currentScreen == SUB_WIFI || currentScreen == SUB_CS) {
+  if (currentScreen == SUB_WIFI || currentScreen == SUB_CS || currentScreen == SUB_RECON) {
     // Back is handled above (tap = to menu, hold = home). Only item taps here.
     if (t.pressed) {
       int count;
@@ -549,6 +579,11 @@ void loop() {
     case FLOCK:         flockLoop();     if (t.pressed) flockTouch(t);     break;
     case SKIMMER:       skimmerLoop();   if (t.pressed) skimmerTouch(t);   break;
     case SUBGHZ:        subghzLoop();    if (t.pressed) subghzTouch(t);    break;
+    case PROBE_WATCH:   probeWatchLoop(); if (t.pressed) probeWatchTouch(t); break;
+    case CLIENT_MAP:    clientMapLoop();  if (t.pressed) clientMapTouch(t);  break;
+    case CAMERA_DET:    cameraLoop();     if (t.pressed) cameraTouch(t);     break;
+    case DRONE_DET:     droneLoop();      if (t.pressed) droneTouch(t);      break;
+    case BLE_SPAM:      bleSpamLoop();    if (t.pressed) bleSpamTouch(t);    break;
     case MESHTASTIC:    meshLoop();      if (t.pressed) meshTouch(t);      break;
     case GPS_WARDRIVE:  gpsLoop();       if (t.pressed) gpsTouch(t);       break;
     case ENGAGEMENT:    engagementLoop(); if (t.pressed) engagementTouch(t); break;

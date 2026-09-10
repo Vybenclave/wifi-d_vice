@@ -66,6 +66,42 @@ static const int kMetaGlassesNamePatternCount = sizeof(kMetaGlassesNamePatterns)
 static const uint16_t kMetaCompanyIds[] = { 0x01AB, 0x058E, 0x0D53 };
 static const int kMetaCompanyIdCount = sizeof(kMetaCompanyIds) / sizeof(kMetaCompanyIds[0]);
 
+// WiFi surveillance-camera OUIs, for camera_detect.cpp (Wireless Wizard's
+// "Camera Detector"). These ARE real IEEE MA-L assignments to the named
+// vendors -- taken from the public registry / Wireshark manuf, not
+// invented (contrast the Flock note above -- no fabricated OUIs). Match is
+// on the top 3 bytes of a beacon BSSID. A hit is "a device from a camera
+// vendor", not proof of a camera: these vendors also ship NVRs, doorbells
+// and the odd router, and a camera behind a router NATs behind that
+// router's OUI. Kept to vendors that are overwhelmingly camera/NVR makers
+// so the false-positive rate stays low; deliberately NOT including Amazon
+// (Ring shares OUIs with Echo/Fire) or Netgear (mostly routers).
+struct CameraOui { uint32_t oui; const char *vendor; };   // oui = 0x00RRGGBB (top 3 MAC bytes)
+static const CameraOui kCameraOuis[] = {
+  {0x001C27, "Hikvision"}, {0x4419B6, "Hikvision"}, {0x4CBD8F, "Hikvision"},
+  {0xBCAD28, "Hikvision"}, {0xC056E3, "Hikvision"}, {0x2857BE, "Hikvision"},
+  {0xE0CA3C, "Hikvision"}, {0xACB927, "Hikvision"},
+  {0x3CEF8C, "Dahua"},     {0x9002A9, "Dahua"},     {0xE0508B, "Dahua"},
+  {0x08EDED, "Dahua"},     {0x24526A, "Dahua"},     {0x14A78B, "Dahua"},
+  {0x4C11BF, "Dahua"},     {0x38AF29, "Dahua"},
+  {0x00408C, "Axis"},      {0xACCC8E, "Axis"},      {0xB8A44F, "Axis"},      {0xE82725, "Axis"},
+  {0xEC71DB, "Reolink"},
+  {0x9C8ECD, "Amcrest"},
+  {0x2CAA8E, "Wyze"},
+  {0x7483C2, "Ubiquiti"},  {0xFCECDA, "Ubiquiti"},  {0x788A20, "Ubiquiti"},
+  {0xE063DA, "Ubiquiti"},  {0x245A4C, "Ubiquiti"},  {0xF492BF, "Ubiquiti"},
+  {0x001344, "Vivotek"},   {0x0002D1, "Vivotek"},
+  {0x000B94, "Uniview"},   {0x48EA63, "Uniview"},
+};
+static const int kCameraOuiCount = sizeof(kCameraOuis) / sizeof(kCameraOuis[0]);
+
+static const char *cameraVendorForBssid(const uint8_t b[6]) {
+  uint32_t o = ((uint32_t)b[0] << 16) | ((uint32_t)b[1] << 8) | b[2];
+  for (int i = 0; i < kCameraOuiCount; i++)
+    if (kCameraOuis[i].oui == o) return kCameraOuis[i].vendor;
+  return nullptr;
+}
+
 static bool matchesAnyPattern(const String &nameLower, const char *const *patterns, int count) {
   for (int i = 0; i < count; i++) {
     if (nameLower.indexOf(patterns[i]) >= 0) return true;

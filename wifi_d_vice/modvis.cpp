@@ -7,6 +7,7 @@ static const char *NAMES[MOD_N] = {
   "Flock detect", "Skimmer detect", "SubGHz sweep", "Meshtastic",
   "Engagement",
   "Rogue AP",
+  "Probe watch", "Client map", "Camera detect", "Drone detect", "BLE spam watch",
 };
 
 static uint32_t s_hidden = 0;   // bit i set => module i hidden

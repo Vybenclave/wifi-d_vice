@@ -30,6 +30,12 @@ void widsEnter();      void widsLoop();      void widsTouch(const TouchPoint &t)
 void flockEnter();     void flockLoop();     void flockTouch(const TouchPoint &t);     void flockExit();
 void skimmerEnter();   void skimmerLoop();   void skimmerTouch(const TouchPoint &t);   void skimmerExit();
 void subghzEnter();    void subghzLoop();    void subghzTouch(const TouchPoint &t);    void subghzExit();
+// Recon category (Marauder / Wireless Wizard / Flipper feature parity, all passive).
+void probeWatchEnter(); void probeWatchLoop(); void probeWatchTouch(const TouchPoint &t); void probeWatchExit();
+void clientMapEnter();  void clientMapLoop();  void clientMapTouch(const TouchPoint &t);  void clientMapExit();
+void cameraEnter();     void cameraLoop();     void cameraTouch(const TouchPoint &t);     void cameraExit();
+void droneEnter();      void droneLoop();      void droneTouch(const TouchPoint &t);      void droneExit();
+void bleSpamEnter();    void bleSpamLoop();    void bleSpamTouch(const TouchPoint &t);    void bleSpamExit();
 void meshEnter();      void meshLoop();      void meshTouch(const TouchPoint &t);      void meshExit();
 bool meshHandleBack();
 void gpsEnter();       void gpsLoop();       void gpsTouch(const TouchPoint &t);       void gpsExit();
