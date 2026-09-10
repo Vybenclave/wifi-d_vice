@@ -2381,7 +2381,9 @@ String macVendorTag(const uint8_t mac[6]) {
   char buf[24];
   if (name)
     snprintf(buf, sizeof(buf), "%s:%02X%02X%02X", name, mac[3], mac[4], mac[5]);
-  else   // unresolved: show the OUI itself so a miss can be looked up
-    snprintf(buf, sizeof(buf), "OUI %02X%02X%02X (unk)", mac[0], mac[1], mac[2]);
+  else if (mac[0] & 0x02)   // locally-administered bit set -> randomized MAC, no real OUI
+    snprintf(buf, sizeof(buf), "random:%02X%02X%02X", mac[3], mac[4], mac[5]);
+  else   // a real OUI we don't have -- show it so it can be looked up
+    snprintf(buf, sizeof(buf), "OUI %02X%02X%02X?", mac[0], mac[1], mac[2]);
   return String(buf);
 }
