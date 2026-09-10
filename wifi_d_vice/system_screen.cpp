@@ -462,7 +462,7 @@ static void systemShowPins() {
   static const char *R24[3] = { "none", "nRF24", "CC2500" };
 
   auto pinDim = [](int i) {
-    if (i == PIN_CC1101_CS)  return !pincfgCC1101();
+    if (i == PIN_CC1101_CS || i == PIN_CC1101_GDO0) return !pincfgCC1101();
     if (i == PIN_RADIO24_CS || i == PIN_RADIO24_IRQ)
       return pincfgRadio24() == RADIO24_NONE;
     return false;

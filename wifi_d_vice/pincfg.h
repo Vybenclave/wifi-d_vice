@@ -11,6 +11,7 @@ enum {
   PIN_CC1101_CS,     // CC1101 sub-GHz chip-select
   PIN_RADIO24_CS,    // 2.4 GHz add-on radio chip-select
   PIN_RADIO24_IRQ,   // 2.4 GHz add-on radio IRQ (nRF24 IRQ / CC2500 GDO0)
+  PIN_CC1101_GDO0,   // CC1101 GDO0 async-data line -- for SubGHz "Raw" capture (-1 = not wired)
   PIN_N
 };
 

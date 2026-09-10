@@ -8,6 +8,7 @@ static const PinDef DEFS[PIN_N] = {
   { "CC1101 CS",   "cc_cs",   CC1101_CS   },
   { "2.4GHz CS",   "r24_cs",  RADIO24_CS  },
   { "2.4GHz IRQ",  "r24_irq", RADIO24_IRQ },
+  { "CC1101 GDO0", "cc_gdo0", CC1101_GDO0 },
 };
 
 static int  s_val[PIN_N];

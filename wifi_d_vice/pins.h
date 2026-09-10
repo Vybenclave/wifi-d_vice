@@ -37,6 +37,12 @@
 
 // --- CC1101 SubGHz (shares the LCD's global-SPI bus/pins, own CS) ---
 #define CC1101_CS 27   // shares TFT_SCK/MOSI/MISO (14/13/12); moved off 17 (now LED_BUSY)
+// GDO0 async-data line for the SubGHz "Raw" OOK capture mode. NOT broken
+// out on the base CYD board -- leave -1 until you solder a wire from the
+// CC1101 GDO0 pad to a spare GPIO and set it in System > Hardware. The
+// SubGHz screen live-probes this pin and hides Raw mode's capture until it
+// sees the line actually toggle.
+#define CC1101_GDO0 -1
 
 // --- 2.4 GHz add-on radio: nRF24L01+ OR CC2500 (shares the global-SPI bus).
 //     No compiled-in default -- assign in System > Hardware > SPI/IRQ pins
