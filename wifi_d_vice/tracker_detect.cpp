@@ -19,8 +19,8 @@
 #include "ui.h"
 #include "wlog.h"
 
-enum { TK_FINDMY = 0, TK_SMARTTAG, TK_TILE, TK_CHIPOLO, TK_UNKNOWN, TK_N };
-static const char *KIND_NAME[TK_N] = { "AirTag/FindMy", "SmartTag", "Tile", "Chipolo", "Tracker?" };
+enum { TK_FINDMY = 0, TK_SMARTTAG, TK_TILE, TK_CHIPOLO, TK_FMDN, TK_UNKNOWN, TK_N };
+static const char *KIND_NAME[TK_N] = { "AirTag/FindMy", "SmartTag", "Tile", "Chipolo", "Google FMDN", "Tracker?" };
 
 struct ClassStat {
   uint32_t firstSeen, lastSeen;
@@ -82,6 +82,18 @@ class Cb : public BLEAdvertisedDeviceCallbacks {
       if (u.indexOf("feed") >= 0 || u.indexOf("feec") >= 0) kind = TK_TILE;
       else if (u.indexOf("fd5a") >= 0) kind = TK_SMARTTAG;
     }
+    // Google Find My Device network (Android's cross-device tag network:
+    // Chipolo/Pebblebee "for Android", Moto Tag, eufy, and every modern
+    // Android phone acting as a finder node). Service data under UUID
+    // 0xFEAA -- the same 16-bit UUID Eddystone uses -- but the first byte is
+    // an FMDN frame type in the 0x40..0x4F range, outside Eddystone's
+    // 0x00/0x10/0x20/0x30 set, so it can't be a beacon we'd misread.
+    for (int i = 0; i < d.getServiceDataCount(); i++) {
+      String su = d.getServiceDataUUID(i).toString(); su.toLowerCase();
+      if (su.indexOf("feaa") < 0) continue;
+      String sd = d.getServiceData(i);
+      if (sd.length() >= 1 && ((uint8_t)sd[0] & 0xF0) == 0x40) kind = TK_FMDN;
+    }
     if (d.haveName()) {
       String nl = d.getName().c_str(); nl.toLowerCase();
       if (nl.indexOf("tile") >= 0) kind = TK_TILE;
@@ -138,7 +150,7 @@ static bool classFollow(int k) {
   if (!classActive(k)) return false;
   const ClassStat &c = cs[k];
   if (millis() - c.firstSeen < FOLLOW_MS) return false;
-  if (k == TK_FINDMY || k == TK_SMARTTAG) return c.macN >= 2 || c.separated;  // rotating types
+  if (k == TK_FINDMY || k == TK_SMARTTAG || k == TK_FMDN) return c.macN >= 2 || c.separated;  // rotating types
   return true;                                                                // Tile/Chipolo: just persistent
 }
 
@@ -179,9 +191,18 @@ static int liveRssiFor(int kind) {
   return best;
 }
 
-// One fixed 36px slot per tracker class -- so a row repaints in place
-// instead of the whole list reflowing (and flickering) every refresh.
-static int slotY(int k) { return UI_CONTENT_Y + 2 + k * 36; }
+// Active classes are packed into consecutive 32px slots from the top. The
+// content area (UI_CONTENT_Y..status bar) only fits MAX_SLOTS of them, and
+// with TK_N up to 6 (FMDN added) not all classes can have a fixed slot like
+// they used to. To keep a row repainting in place -- the anti-flicker point
+// of the old fixed-slot scheme -- the slot assignment is recomputed only
+// when the SET of active classes changes (tracked via activeSig), not on
+// every 1.2s refresh.
+static const int SLOT_H   = 32;
+static const int MAX_SLOTS = 5;   // 58 + 5*32 = 218, clear of the 222px status bar
+static int slotY(int slot) { return UI_CONTENT_Y + 2 + slot * SLOT_H; }
+static uint8_t slotForClass[TK_N];   // TK_N sentinel = not shown
+static uint8_t activeSig = 0xFF;     // bitmask of classes shown last full layout
 
 // Static chrome: action row. Drawn once on enter / on return from locate,
 // NOT in the 1.2s refresh -- redrawing it there was the flicker.
@@ -193,14 +214,28 @@ static void drawListChrome() {
 }
 
 static void drawListRows() {
+  // Recompute the packed slot assignment only when the set of active
+  // classes changes; a change triggers one full list-area repaint, and
+  // between changes each surviving row repaints in the same slot (the
+  // anti-flicker point of the original fixed-slot layout).
+  uint8_t sig = 0;
+  for (int k = 0; k < TK_N; k++) if (classActive(k)) sig |= (1u << k);
+  if (sig != activeSig) {
+    activeSig = sig;
+    int slot = 0;
+    for (int k = 0; k < TK_N; k++)
+      slotForClass[k] = (classActive(k) && slot < MAX_SLOTS) ? (uint8_t)slot++ : (uint8_t)TK_N;
+    uiClearBelow(UI_CONTENT_Y);
+  }
+
   int shown = 0;
   for (int k = 0; k < TK_N; k++) {
-    int y = slotY(k);
-    uiClearRect(4, y, tft.width() - 8, 34);          // just this slot
-    if (!classActive(k)) { rows[k] = {0, 0, 0, 0, ""}; continue; }
+    if (!classActive(k) || slotForClass[k] >= (uint8_t)TK_N) { rows[k] = {0, 0, 0, 0, ""}; continue; }
+    int y = slotY(slotForClass[k]);
+    uiClearRect(4, y, tft.width() - 8, SLOT_H);
     const ClassStat &c = cs[k];
     bool foll = classFollow(k);
-    rows[k] = {4, y, tft.width() - 8, 32, ""};
+    rows[k] = {4, y, tft.width() - 8, SLOT_H - 4, ""};
     tft.drawRect(rows[k].x, rows[k].y, rows[k].w, rows[k].h, foll ? ILI9341_RED : ILI9341_WHITE);
     tft.setTextSize(2);
     tft.setTextColor(foll ? ILI9341_RED : ILI9341_WHITE);
@@ -209,7 +244,7 @@ static void drawListRows() {
     tft.setTextSize(1);
     tft.setTextColor(foll ? ILI9341_RED : ILI9341_CYAN);
     uint32_t d = (millis() - c.firstSeen) / 1000;
-    tft.setCursor(8, y + 21);
+    tft.setCursor(8, y + 19);
     tft.printf("%ddBm  %lum%02lus  %dmac%s", c.rssiSmooth, (unsigned long)(d / 60),
                (unsigned long)(d % 60), c.macN,
                foll ? "  << FOLLOW" : (c.separated ? "  separated" : ""));
@@ -262,6 +297,7 @@ static void updateLocate() {
 void trackerEnter() {
   uiDrawTopBar("Tracker Detect");
   sub = LIST;
+  activeSig = 0xFF;   // force a full slot layout on the first drawListRows()
   memset(cs, 0, sizeof(cs));
   memset(live, 0, sizeof(live));
   memset(tkSeenLogged, 0, sizeof(tkSeenLogged));

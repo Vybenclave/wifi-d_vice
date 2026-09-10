@@ -30,15 +30,30 @@ static int  prevHits = 0;   // for the detection edge
 
 static void draw();
 
+// The UART-bridge service UUID is a weaker signal than the module name (a
+// renamed module still advertises it, but so do some legit serial gadgets),
+// so it only counts when the device is ALSO nameless or generically named --
+// a real HM-10 in a product usually carries the product's name.
+static bool hasSkimmerServiceUuid(BLEAdvertisedDevice &d) {
+  for (int i = 0; i < d.getServiceUUIDCount(); i++) {
+    String u = d.getServiceUUID(i).toString(); u.toLowerCase();
+    if (matchesAnyPattern(u, kSkimmerServiceUuids, kSkimmerServiceUuidCount)) return true;
+  }
+  return false;
+}
+
 static void bleScanDone(BLEScanResults r) {
   hitCount = 0;
   for (int i = 0; i < (int)r.getCount() && hitCount < MAX_HITS; i++) {
     BLEAdvertisedDevice d = r.getDevice(i);
-    if (!d.haveName()) continue;
-    String name = String(d.getName().c_str());
+    String name = d.haveName() ? String(d.getName().c_str()) : String("(no name)");
     String lower = name; lower.toLowerCase();
-    if (matchesAnyPattern(lower, kSkimmerNamePatterns, kSkimmerNamePatternCount))
-      hits[hitCount++] = {name, d.getRSSI()};
+    bool byName = d.haveName() && matchesAnyPattern(lower, kSkimmerNamePatterns, kSkimmerNamePatternCount);
+    bool byUuid = hasSkimmerServiceUuid(d) &&
+                  (!d.haveName() || lower.indexOf("bl") >= 0 || lower.indexOf("uart") >= 0 ||
+                   lower.indexOf("serial") >= 0 || lower.indexOf("spp") >= 0);
+    if (byName || byUuid)
+      hits[hitCount++] = {byUuid && !byName ? name + " [UART]" : name, d.getRSSI()};
   }
   bleDone = true;
 }

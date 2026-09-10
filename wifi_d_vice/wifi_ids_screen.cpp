@@ -64,10 +64,13 @@ enum { SEV_OK = 0, SEV_WATCH = 1, SEV_ALERT = 2 };
 // deauth that claims to be from one of them. LRU eviction by last-seen.
 struct Ap {
   uint8_t  bssid[6];
-  uint16_t seq;    // last beacon sequence number seen
-  int8_t   rssi;   // EWMA of beacon RSSI
-  uint8_t  ch;     // channel its beacons arrive on
-  uint32_t seen;   // millis() of last beacon
+  uint16_t seq;      // last beacon sequence number seen
+  int8_t   rssi;     // EWMA of beacon RSSI
+  uint8_t  ch;       // channel its beacons arrive on
+  uint32_t seen;     // millis() of last beacon
+  uint32_t ssidHash; // FNV-1a of the beacon SSID (0 = hidden/none) -- for the
+                     // baseline-free evil-twin check
+  uint8_t  priv;     // capability Privacy bit (1 = encrypted)
 };
 static const int AP_N = 12;
 static Ap aps[AP_N];
@@ -155,6 +158,14 @@ static bool     vRogue;
 static uint8_t  rogueSeen[8][6];
 static uint8_t  rogueSeenN;
 
+// Baseline-free extras that need no /rogueap.csv (DESIGN.md section 3, and
+// what Marauder's Detect-Pwnagotchi / Wireless Wizard's scored evil-twin
+// do). Both feed the alert log + the banner; there is no room for another
+// stats row.
+static bool     vPwn;        // a Pwnagotchi beacon (src/BSSID de:ad:be:ef:de:ad) was seen
+static bool     pwnLogged;   // one alert-log line per session
+static bool     vTwin;       // two BSSIDs, one SSID, divergent enough to score an evil twin
+
 static bool rogueAlready(const uint8_t *b) {
   for (uint8_t i = 0; i < rogueSeenN; i++)
     if (!memcmp(rogueSeen[i], b, 6)) return true;
@@ -241,6 +252,27 @@ static bool ssidLooksRandom(const uint8_t *s, uint8_t n) {
   return false;
 }
 
+static uint32_t ssidHash32(const uint8_t *s, uint8_t n) {
+  uint32_t h = 2166136261u;
+  for (uint8_t i = 0; i < n; i++) { h ^= s[i]; h *= 16777619u; }
+  return h ? h : 1;   // reserve 0 for "no SSID"
+}
+
+// Pwnagotchi beacons carry a JSON blob in the SSID; the unit's name is the
+// "name":"..." field. Best-effort: the SSID snapshot can be truncated or
+// the field can be past it -- then this returns "?".
+static void pwnName(const uint8_t *s, uint8_t n, char *out, size_t outN) {
+  strncpy(out, "?", outN); out[outN - 1] = 0;
+  const char *key = "\"name\":\"";
+  for (int i = 0; i + 8 < (int)n; i++) {
+    if (memcmp(s + i, key, 8) != 0) continue;
+    int j = i + 8, k = 0;
+    while (j < (int)n && s[j] != '"' && k < (int)outN - 1) out[k++] = (char)s[j++];
+    out[k] = 0;
+    return;
+  }
+}
+
 // ---- detector callbacks (task context, via wifiIdsLoop) -----------
 
 static void onDeauthFamily(const WifiIdsFrame &f, void *) {
@@ -297,6 +329,29 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
   bool haveSsid = beaconSsid(f, &s, &sl);
   if (haveSsid && ssidLooksRandom(s, sl)) bRandom++;
 
+  // Pwnagotchi presence -- a beacon whose transmitter (or BSSID) is the
+  // fixed de:ad:be:ef:de:ad. Not an attack in itself, but a
+  // handshake-harvesting device in range is worth one alert-log line.
+  static const uint8_t PWN_MAC[6] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD };
+  if (!memcmp(f.addr2, PWN_MAC, 6) || !memcmp(b, PWN_MAC, 6)) {
+    vPwn = true;
+    if (!pwnLogged) {
+      pwnLogged = true;
+      char nm[16];
+      if (haveSsid) pwnName(s, sl, nm, sizeof nm); else strcpy(nm, "?");
+      uint32_t el = (millis() - startMs) / 1000;
+      char line[26];
+      snprintf(line, sizeof line, "%02lu:%02lu PWNAGOTCHI %.8s", el / 60, el % 60, nm);
+      alogPush(line);
+      if (wlogIsOpen()) {
+        char wl[96];
+        snprintf(wl, sizeof wl, "%lu,%d,pwnagotchi,watch,%s %ddBm",
+                 (unsigned long)millis(), f.channel, nm, f.rssi);
+        wlogRow(wl); wlogFlush();
+      }
+    }
+  }
+
   // rogue-AP / evil-twin check against the SD baseline
   if (rogueOn && haveSsid && sl < 33) {
     char es[33];
@@ -334,14 +389,61 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
     }
   }
 
-  // baseline for the deauth spoof check -- nearby APs only
+  // baseline for the deauth spoof check -- nearby APs only. Also carries the
+  // SSID hash + Privacy bit for the baseline-free evil-twin check below.
   if (f.rssi > -85) {
+    uint8_t priv = 0;
+    if (f.rawLen >= 36) {
+      uint16_t cap = (uint16_t)(f.raw[34] | (f.raw[35] << 8));
+      priv = (cap & 0x0010) ? 1 : 0;
+    }
+    uint32_t hh = (haveSsid && sl < 33) ? ssidHash32(s, sl) : 0;
+
+    // Baseline-free evil twin: another strong, recent AP advertises the same
+    // SSID from a different BSSID, and the pair diverges more than a legit
+    // multi-AP ESS would. Score needs a randomized (locally-administered)
+    // BSSID or a security-downgrade to reach the threshold -- same-SSID +
+    // different-channel/RSSI alone (normal for mesh / band-steering) tops
+    // out at 3 and does not fire.
+    if (hh) {
+      for (int i = 0; i < AP_N; i++) {
+        if (!aps[i].seen || aps[i].ssidHash != hh) continue;
+        if (!memcmp(aps[i].bssid, b, 6)) continue;             // same AP, different frame
+        if (millis() - aps[i].seen > 60000) continue;          // stale
+        int score = 1;
+        if ((b[0] & 0x02) || (aps[i].bssid[0] & 0x02)) score += 2;   // randomized BSSID
+        if (priv != aps[i].priv)                       score += 2;   // security downgrade
+        if (abs((int)f.rssi - (int)aps[i].rssi) > 25)  score += 1;
+        if (f.channel != aps[i].ch)                    score += 1;
+        if (score >= 4 && !rogueAlready(b)) {
+          vTwin = true;
+          char es[13] = "?";
+          if (haveSsid) { uint8_t n = sl < 12 ? sl : 12; memcpy(es, s, n); es[n] = 0; }
+          uint32_t el = (millis() - startMs) / 1000;
+          char line[26];
+          snprintf(line, sizeof line, "%02lu:%02lu EVIL-TWIN? %.9s", el / 60, el % 60, es);
+          alogPush(line);
+          if (wlogIsOpen()) {
+            char wl[96];
+            snprintf(wl, sizeof wl,
+                     "%lu,%d,eviltwin,alert,%s %02X%02X%02X vs %02X%02X%02X sc%d",
+                     (unsigned long)millis(), f.channel, es,
+                     b[3], b[4], b[5], aps[i].bssid[3], aps[i].bssid[4], aps[i].bssid[5], score);
+            wlogRow(wl); wlogFlush();
+          }
+          break;
+        }
+      }
+    }
+
     Ap *a = apFind(b);
     if (!a) { a = apLruSlot(); memset(a, 0, sizeof(*a)); memcpy(a->bssid, b, 6); a->rssi = f.rssi; }
-    a->rssi = (int8_t)((a->rssi * 3 + f.rssi) / 4);
-    a->seq  = f.seq;
-    a->ch   = f.channel;
-    a->seen = millis();
+    a->rssi     = (int8_t)((a->rssi * 3 + f.rssi) / 4);
+    a->seq      = f.seq;
+    a->ch       = f.channel;
+    a->seen     = millis();
+    if (hh) a->ssidHash = hh;
+    a->priv     = priv;
   }
 }
 
@@ -531,7 +633,8 @@ static void drawStats() {
 
 static uint16_t bannerKey() {
   return (uint16_t)(vD.sev | (vB.sev << 2) | (vA.sev << 4) |
-                    (vSpoofFlag ? 0x40 : 0) | (vRogue ? 0x80 : 0));
+                    (vSpoofFlag ? 0x40 : 0) | (vRogue ? 0x80 : 0) |
+                    (vPwn ? 0x100 : 0) | (vTwin ? 0x200 : 0));
 }
 
 static void drawBanner() {
@@ -543,6 +646,8 @@ static void drawBanner() {
   if (vB.sev > worst) worst = vB.sev;
   if (vA.sev > worst) worst = vA.sev;
   if (vRogue && worst < SEV_ALERT) worst = SEV_ALERT;   // a baseline mismatch is an alert
+  if (vTwin  && worst < SEV_ALERT) worst = SEV_ALERT;   // scored evil twin, no baseline needed
+  if (vPwn   && worst < SEV_WATCH) worst = SEV_WATCH;   // harvester in range -- note, not an attack
 
   tft.fillRect(4, BANNER_Y, tft.width() - 8, BANNER_H,
                worst == SEV_ALERT ? ILI9341_RED : ILI9341_BLACK);
@@ -554,6 +659,8 @@ static void drawBanner() {
     if (vB.sev == SEV_ALERT)      strncat(what, "BEACON-FLOOD ", 20);
     if (vA.sev == SEV_ALERT)      strncat(what, "AUTH-FLOOD ", 20);
     if (vRogue)                   strncat(what, "ROGUE-AP ", 20);
+    if (vTwin)                    strncat(what, "EVIL-TWIN? ", 20);
+    if (vPwn)                     strncat(what, "PWN ", 20);
     tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);
     tft.setCursor(10, BANNER_Y + 4);
@@ -566,7 +673,8 @@ static void drawBanner() {
     tft.setTextSize(1);
     tft.setTextColor(worst == SEV_WATCH ? ILI9341_YELLOW : ILI9341_GREEN);
     tft.setCursor(10, BANNER_Y + 16);
-    tft.print(worst == SEV_WATCH ? "elevated -- watching" : "no attack indicators");
+    tft.print(worst == SEV_WATCH ? (vPwn ? "Pwnagotchi in range" : "elevated -- watching")
+                                 : "no attack indicators");
     if (alerted) { alerted = false; ledSet(false); }
   }
 }
@@ -617,6 +725,7 @@ void widsEnter() {
 
   beepHold(true);          // the banner chirps on the OK->ALERT edge
   vRogue = false;
+  vPwn = vTwin = pwnLogged = false;
   rogueSeenN = 0;
 
   memset(aps, 0, sizeof aps);
@@ -693,6 +802,7 @@ void widsTouch(const TouchPoint &t) {
   alogDirty = true;
   alerted = false;
   vRogue = false;                             // re-arm rogue-AP alerting
+  vPwn = vTwin = pwnLogged = false;
   rogueSeenN = 0;
   ledSet(false);
   lastBannerKey = 0xFFFF;                     // force a banner repaint
