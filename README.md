@@ -153,6 +153,12 @@ ends, and code that needed a cleanup pass for consistency. Take it as a
 learning project first and a field tool second, and read the code before
 you rely on it.
 
+## Credits
+
+- The MAC OUI -> vendor table (`wifi_d_vice/mac_vendor.cpp`) is a curated
+  subset of Andy Allan's OUI list:
+  https://gist.github.com/aallan/b4bb86db86079509e6159810ae9bd3e4
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE).
