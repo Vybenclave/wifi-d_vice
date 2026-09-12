@@ -14,3 +14,9 @@ const char *tzLabel(int idx);
 void        tzSetIndex(int idx);   // set + persist
 int         tzGetIndex();
 int         tzOffsetMinutes();     // convenience: tzOffsetMinutes(tzGetIndex())
+
+// 12-hour ("1:07pm") vs 24-hour ("13:07") display for the bottom-bar clock
+// (same System > Display > Timezone screen). Defaults to 24h. Display-only,
+// same as the offset above -- devtime.h and every log are unaffected.
+bool        tzUse24h();
+void        tzSet24h(bool on);     // set + persist

@@ -266,14 +266,23 @@ static void systemShowThemes() {
   }
 }
 
-// Display-only UTC offset for the bottom-bar clock (tz.h) -- never touches
-// devtime.h or any SD log, which always stay UTC. Same tap-then-Apply
-// pattern as systemShowThemes(), paged (ROWS per screen) since the offset
-// list is too long for one page on this display.
+// Display-only UTC offset + 12h/24h format for the bottom-bar clock (tz.h)
+// -- never touches devtime.h or any SD log, which always stay UTC. Same
+// tap-then-Apply pattern as systemShowThemes(), paged since the offset
+// list is too long for one page on this display. ROWS is computed from
+// the screen height (not a fixed constant) so this doesn't overrun the
+// Apply button in landscape's shorter 240px height.
 static void systemShowTimezone() {
   const int y0 = 34, rowH = 22, gap = 3;
-  const int ROWS = 6;
-  Btn items[ROWS], applyBtn, prevBtn, nextBtn;
+  const int PAGEROW_H = 26, TOGGLE_H = 28, APPLY_H = 34, STACK_GAP = 6, BOTTOM_MARGIN = 8;
+  const int MAX_ROWS = 10;
+  int stackTop = tft.height() - BOTTOM_MARGIN - APPLY_H - STACK_GAP - TOGGLE_H - STACK_GAP - PAGEROW_H;
+  int ROWS = (stackTop - gap - y0) / (rowH + gap);
+  if (ROWS < 3) ROWS = 3;
+  if (ROWS > MAX_ROWS) ROWS = MAX_ROWS;
+  if (ROWS > tzCount()) ROWS = tzCount();
+
+  Btn items[MAX_ROWS], applyBtn, prevBtn, nextBtn, toggleBtn;
   int sel = tzGetIndex();               // pending selection, starts at the active one
   int page = sel / ROWS;
 
@@ -300,8 +309,9 @@ static void systemShowTimezone() {
       y += rowH + gap;
     }
 
-    prevBtn = {8, y + 4, 60, 26, "< prev"};
-    nextBtn = {tft.width() - 68, y + 4, 60, 26, "next >"};
+    int py = stackTop;
+    prevBtn = {8, py, 60, PAGEROW_H, "< prev"};
+    nextBtn = {tft.width() - 68, py, 60, PAGEROW_H, "next >"};
     if (page > 0)          uiDrawButton(prevBtn);    else uiDrawButtonDim(prevBtn);
     if (page < pages - 1)  uiDrawButton(nextBtn);    else uiDrawButtonDim(nextBtn);
     tft.setTextColor(ILI9341_WHITE);
@@ -310,10 +320,14 @@ static void systemShowTimezone() {
     int16_t bx, by; uint16_t bw, bh;
     tft.setTextSize(1);
     tft.getTextBounds(pg, 0, 0, &bx, &by, &bw, &bh);
-    tft.setCursor((tft.width() - (int)bw) / 2, y + 4 + (26 - (int)bh) / 2 - by);
+    tft.setCursor((tft.width() - (int)bw) / 2, py + (PAGEROW_H - (int)bh) / 2 - by);
     tft.print(pg);
 
-    applyBtn = {8, tft.height() - 42, tft.width() - 16, 34,
+    toggleBtn = {8, py + PAGEROW_H + STACK_GAP, tft.width() - 16, TOGGLE_H,
+                 tzUse24h() ? "24-hour clock" : "12-hour clock"};
+    uiDrawMenuButton(toggleBtn);
+
+    applyBtn = {8, py + PAGEROW_H + STACK_GAP + TOGGLE_H + STACK_GAP, tft.width() - 16, APPLY_H,
                 sel == tzGetIndex() ? "Apply (no change)" : "Apply"};
     uiDrawButton(applyBtn);
   };
@@ -325,6 +339,12 @@ static void systemShowTimezone() {
     if (t.pressed && uiTouchInButton(t, applyBtn)) {
       uiWaitForRelease();
       if (sel != tzGetIndex()) { tzSetIndex(sel); drawPicker(); }
+      continue;
+    }
+    if (t.pressed && uiTouchInButton(t, toggleBtn)) {
+      uiWaitForRelease();
+      tzSet24h(!tzUse24h());
+      drawPicker();
       continue;
     }
     int pages = (tzCount() + ROWS - 1) / ROWS;

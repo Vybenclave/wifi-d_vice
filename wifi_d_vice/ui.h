@@ -62,7 +62,7 @@ static const int UI_STATUSBAR_H = 18;
 // Width reserved on the right of the status bar for the clock + battery
 // glyph (uiDrawClock, uiDrawBatteryIndicator) -- uiToast()'s text stops
 // here so it doesn't run under them.
-static const int UI_RIGHTZONE_W = 90;
+static const int UI_RIGHTZONE_W = 96;
 void uiDrawStatusBar();
 
 void uiDrawTopBar(const char *title);

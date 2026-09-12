@@ -40,6 +40,9 @@ Adafruit_ILI9341 tft(TFT_CS, TFT_DC, -1);   // reset shared with EN, see pins.h
 
 static bool s_batForce = false;   // uiDrawTopBar() -> uiDrawBatteryIndicator() repaint on screen change
 static bool s_clockForce = false; // uiDrawStatusBar() -> uiDrawClock() repaint on screen change
+// Hoisted out of the battery-indicator section below (battStatusColor() and
+// uiDrawClock() both want it, and uiDrawClock() is drawn first in loop()).
+static int s_batPct = -2;         // -2 = never read
 static int  s_bgMode  = UI_BG_BLACK;
 void uiSetBgMode(int m) { s_bgMode = m; }
 static void loadBeepVolume();   // defined below beep(); forward-declared for uiInit()
@@ -491,8 +494,22 @@ void uiToast(const char *msg) {
 }
 
 // Manually-computed RGB565 -- Adafruit_ILI9341's color set has no BROWN.
-// (Used by uiDrawBatteryIndicator()'s low-battery pulse, below.)
+// (Used by battStatusColor()'s low-battery pulse, below.)
 static const uint16_t UI_BROWN = 0xA145;
+
+// Same palette uiDrawBatteryIndicator() colors its glyph/label with -- one
+// place, so the clock next to it (uiDrawClock, below) always matches it
+// exactly instead of picking its own colors.
+static uint16_t battStatusColor() {
+  if (s_batPct < 0) return ILI9341_DARKGREY;              // USB / never read yet
+  if (s_batPct < 15) {                                     // low: pulse through these
+    static const uint16_t cyc[5] = {ILI9341_WHITE, ILI9341_YELLOW, ILI9341_ORANGE, UI_BROWN, ILI9341_RED};
+    uint32_t st = (millis() / 250) % 8;
+    return cyc[st <= 4 ? st : 8 - st];
+  }
+  if (s_batPct < 40) return ILI9341_YELLOW;
+  return ILI9341_GREEN;
+}
 
 void uiDrawClock() {
   // Right-aligned, just left of the battery glyph (uiDrawBatteryIndicator),
@@ -500,24 +517,30 @@ void uiDrawClock() {
   // UI_RIGHTZONE_W. Repainted every loop() tick like the battery glyph, but
   // only actually redraws when the printed string changes (once a minute),
   // same "cheap and idempotent" contract as uiDrawBatteryIndicator.
-  static char last[6] = "";
-  char buf[6] = "--:--";   // unsynced: no time to show yet
+  static char last[7] = "";
+  char buf[7] = "--:--";   // unsynced: no time to show yet
   if (devTimeSynced()) {
     time_t now = devTimeNow() + (time_t)tzOffsetMinutes() * 60;
     struct tm t;
     gmtime_r(&now, &t);   // `now` was already shifted by the tz offset above
-    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    if (tzUse24h()) {
+      snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    } else {
+      int h12 = t.tm_hour % 12;
+      if (h12 == 0) h12 = 12;
+      snprintf(buf, sizeof(buf), "%d:%02d%c", h12, t.tm_min, t.tm_hour < 12 ? 'a' : 'p');
+    }
   }
   if (!s_clockForce && strcmp(buf, last) == 0) return;
   s_clockForce = false;
   strcpy(last, buf);
 
   const int rightEdge = tft.width() - 55 - 4;   // 4px gap before the battery label
-  const int textW = 5 * 6;                       // "HH:MM" at text size 1
+  const int textW = 6 * 6;                       // widest case, "12:34p", at text size 1
   int x = rightEdge - textW, y = tft.height() - UI_STATUSBAR_H + 5;
   tft.fillRect(x - 1, y - 1, textW + 2, 10, ILI9341_BLACK);
   tft.setTextSize(1);
-  tft.setTextColor(devTimeSynced() ? ILI9341_WHITE : ILI9341_DARKGREY);
+  tft.setTextColor(battStatusColor());   // same color as the battery glyph/label next to it
   tft.setCursor(x, y);
   tft.print(buf);
 }
@@ -826,7 +849,7 @@ static int battPct(int mv) {
 int uiBatteryPct() { return battPct(uiBatteryMv()); }
 
 static uint32_t s_batReadAt = 0, s_batPaintAt = 0;
-static int s_batMv = 0, s_batPct = -2;   // -2 = never read
+static int s_batMv = 0;                 // s_batPct itself lives up top -- see the comment there
 static int s_batSig = -9999;            // last-painted {pct, pulse-colour}
 
 // Bottom-right corner, rightmost. The clock (uiDrawClock) sits just to its

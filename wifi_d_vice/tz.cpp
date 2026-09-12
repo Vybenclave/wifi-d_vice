@@ -38,12 +38,14 @@ static const TzEntry TZS[] = {
 static const int TZ_N = sizeof(TZS) / sizeof(TZS[0]);
 static const int TZ_DEFAULT = 12;   // UTC+0
 
-static int s_idx = TZ_DEFAULT;
+static int  s_idx  = TZ_DEFAULT;
+static bool s_24h  = true;
 
 void tzLoad() {
   Preferences p;
   p.begin("touchcal", true);
   s_idx = p.getInt("tz", TZ_DEFAULT);
+  s_24h = p.getBool("tz24h", true);
   p.end();
   if (s_idx < 0 || s_idx >= TZ_N) s_idx = TZ_DEFAULT;
 }
@@ -57,7 +59,16 @@ void tzSetIndex(int idx) {
   p.end();
 }
 
+void tzSet24h(bool on) {
+  s_24h = on;
+  Preferences p;
+  p.begin("touchcal", false);
+  p.putBool("tz24h", on);
+  p.end();
+}
+
 int         tzCount()             { return TZ_N; }
 const char *tzLabel(int idx)      { return (idx >= 0 && idx < TZ_N) ? TZS[idx].label : "?"; }
 int         tzGetIndex()          { return s_idx; }
 int         tzOffsetMinutes()     { return TZS[s_idx].offsetMin; }
+bool        tzUse24h()            { return s_24h; }
