@@ -38,6 +38,12 @@ uint16_t thTitleBar();    // top-bar fill (ILI9341_NAVY for the cyan scheme)
 // otherwise, so a screen written with thLabel() retheme automatically
 // instead of needing per-scheme special-casing.
 uint16_t thLabel();
+// Fill/edge for an ARBITRARY scheme id, not just the active one -- for the
+// Themes picker's color swatches, which need to preview every scheme at
+// once regardless of which one is actually active. id must be a
+// THEME_VICE_* value; anything else falls back to the cyan scheme.
+uint16_t thBtnFillFor(int id);
+uint16_t thBtnEdgeFor(int id);
 static const uint16_t TH_BTN_TEXT  = 0x2965;   // dark grey label, all schemes
 static const uint16_t TH_ACCENT    = 0x5F1A;   // cyan accent, all schemes
 static const uint16_t TH_GRAD_TOP  = 0x0844;   // deep indigo, all schemes

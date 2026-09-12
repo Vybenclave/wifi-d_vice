@@ -36,11 +36,12 @@ static const VicePalette VICE_PAL[] = {
   { 0xB5F8, 0x73AF, 0xEF9E, 0xF7DF, 0x2145, 0xDF1C },
 };
 
-static const VicePalette &activeVice() {
-  int i = s_id - THEME_VICE_CYAN;
+static const VicePalette &viceFor(int id) {
+  int i = id - THEME_VICE_CYAN;
   if (i < 0 || i >= (int)(sizeof(VICE_PAL) / sizeof(VICE_PAL[0]))) i = 0;
   return VICE_PAL[i];
 }
+static const VicePalette &activeVice() { return viceFor(s_id); }
 
 void themeLoad() {
   Preferences p;
@@ -69,3 +70,6 @@ uint16_t thBtnBevel()  { return activeVice().bevel; }
 uint16_t thBtnEmboss() { return activeVice().emboss; }
 uint16_t thTitleBar()  { return activeVice().titleBar; }
 uint16_t thLabel()     { return themeIsVice() ? activeVice().label : BASIC_LABEL; }
+
+uint16_t thBtnFillFor(int id) { return viceFor(id).fill; }
+uint16_t thBtnEdgeFor(int id) { return viceFor(id).edge; }

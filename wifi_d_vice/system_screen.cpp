@@ -205,21 +205,47 @@ static void systemTestGps() {
   }
 }
 
-// Tapping a theme row only selects it; nothing changes until "Apply".
+static const char *themeSwatchName(int id) {
+  switch (id) {
+    case THEME_VICE_CYAN:  return "Cyan";
+    case THEME_VICE_AMBER: return "Amber";
+    case THEME_VICE_GREEN: return "Green";
+    case THEME_VICE_GREY:  return "Grey";
+    default:                return "?";
+  }
+}
+
+// Black or white, whichever reads better on an arbitrary RGB565 fill --
+// so a swatch's label stays legible no matter how bright/dark a future
+// color scheme's fill turns out to be, without hand-tuning per scheme.
+static uint16_t contrastTextFor(uint16_t c) {
+  int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
+  int luma = (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
+  return luma / 1000 > 140 ? ILI9341_BLACK : ILI9341_WHITE;
+}
+
+static void drawOnMarker(int cx, int cy) {
+  tft.fillCircle(cx, cy, 5, ILI9341_GREEN);
+  tft.drawCircle(cx, cy, 5, ILI9341_BLACK);
+}
+
+// Tapping a theme/swatch only selects it; nothing changes until "Apply".
 // Apply persists the choice and re-skins live -- theme state is read at
 // draw time, so no restart is needed; a full clear first kills any
 // leftover pixels from the old skin.
+//
+// "Basic" is a normal full-width button (it's not a color); the four Vice
+// choices are a compact 2x2 grid of solid-fill swatches below it -- each
+// swatch IS its scheme's actual button color, so no caption is needed to
+// explain what "amber" or "green" looks like, and the whole picker is
+// much shorter than the old one-row-per-theme list.
 static void systemShowThemes() {
-  // Row height is computed from screen height (not a fixed 40) so THEME_N
-  // rows -- now 5, since Vice split into 4 color schemes -- still fit
-  // above the caption and Apply button in landscape's shorter 240px
-  // height, the same way the Timezone screen's row count does.
-  const int y0 = 40, APPLY_H = 38, CAPTION_H = 14, GAP = 6;
-  int applyY = tft.height() - 8 - APPLY_H;
-  int captionY = applyY - GAP - CAPTION_H;
-  int listBudget = captionY - GAP - y0;
-  int step = listBudget / THEME_N;
-  int rowH = step - 6; if (rowH < 14) rowH = 14;
+  const int y0 = 40, BASIC_H = 34, APPLY_H = 38, GAP = 8, BOTTOM_MARGIN = 8;
+  int applyY = tft.height() - BOTTOM_MARGIN - APPLY_H;
+  int gridTop = y0 + BASIC_H + GAP;
+  int gridBottom = applyY - GAP;
+  int cellW = (tft.width() - 16 - GAP) / 2;
+  int cellH = (gridBottom - gridTop - GAP) / 2;
 
   Btn items[THEME_N], applyBtn;
   int sel = themeGet();                 // pending selection, starts at the active one
@@ -227,24 +253,34 @@ static void systemShowThemes() {
   auto drawPicker = [&]() {
     uiDrawTopBar("Themes");
     uiClearBelow(29);
-    int y = y0;
-    for (int i = 0; i < THEME_N; i++) {
-      items[i] = {8, y, tft.width() - 16, rowH, themeName(i)};
-      uiDrawButton(items[i]);
-      if (i == sel)                      // pending selection: cyan outline
-        tft.drawRect(items[i].x - 3, items[i].y - 3,
-                     items[i].w + 6, items[i].h + 6, ILI9341_CYAN);
-      tft.fillRect(tft.width() - 46, y + rowH / 2 - 7, 40, 14, uiBgColor(y + rowH / 2 - 7));
-      if (i == themeGet()) {             // "on" marker: currently active theme
-        tft.setTextColor(ILI9341_GREEN);
-        tft.setCursor(tft.width() - 42, y + rowH / 2 - 5);
-        tft.print("on");
-      }
-      y += step;
+
+    items[THEME_BASIC] = {8, y0, tft.width() - 16, BASIC_H, themeName(THEME_BASIC)};
+    uiDrawButton(items[THEME_BASIC]);
+    if (sel == THEME_BASIC)
+      tft.drawRect(items[0].x - 3, items[0].y - 3, items[0].w + 6, items[0].h + 6, ILI9341_CYAN);
+    if (themeGet() == THEME_BASIC)
+      drawOnMarker(items[0].x + items[0].w - 12, items[0].y + items[0].h / 2);
+
+    for (int k = 0; k < 4; k++) {
+      int id = THEME_VICE_CYAN + k;
+      int col = k % 2, row = k / 2;
+      int x = 8 + col * (cellW + GAP);
+      int y = gridTop + row * (cellH + GAP);
+      items[id] = {x, y, cellW, cellH, themeSwatchName(id)};
+
+      uint16_t fill = thBtnFillFor(id);
+      tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
+      tft.drawRoundRect(x, y, cellW, cellH, 8, thBtnEdgeFor(id));
+      tft.setTextColor(contrastTextFor(fill));
+      tft.setTextSize(2);
+      int16_t bx, by; uint16_t bw, bh;
+      tft.getTextBounds(themeSwatchName(id), 0, 0, &bx, &by, &bw, &bh);
+      tft.setCursor(x + (cellW - (int)bw) / 2 - bx, y + (cellH - (int)bh) / 2 - by);
+      tft.print(themeSwatchName(id));
+
+      if (sel == id) tft.drawRect(x - 3, y - 3, cellW + 6, cellH + 6, ILI9341_CYAN);
+      if (themeGet() == id) drawOnMarker(x + cellW - 12, y + 12);
     }
-    tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(8, captionY);
-    tft.print("Vice = synthwave, in your color.");
 
     applyBtn = {8, applyY, tft.width() - 16, APPLY_H,
                 sel == themeGet() ? "Apply (no change)" : "Apply"};
