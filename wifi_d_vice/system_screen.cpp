@@ -210,7 +210,17 @@ static void systemTestGps() {
 // draw time, so no restart is needed; a full clear first kills any
 // leftover pixels from the old skin.
 static void systemShowThemes() {
-  const int y0 = 44, step = 40;
+  // Row height is computed from screen height (not a fixed 40) so THEME_N
+  // rows -- now 5, since Vice split into 4 color schemes -- still fit
+  // above the caption and Apply button in landscape's shorter 240px
+  // height, the same way the Timezone screen's row count does.
+  const int y0 = 40, APPLY_H = 38, CAPTION_H = 14, GAP = 6;
+  int applyY = tft.height() - 8 - APPLY_H;
+  int captionY = applyY - GAP - CAPTION_H;
+  int listBudget = captionY - GAP - y0;
+  int step = listBudget / THEME_N;
+  int rowH = step - 6; if (rowH < 14) rowH = 14;
+
   Btn items[THEME_N], applyBtn;
   int sel = themeGet();                 // pending selection, starts at the active one
 
@@ -219,24 +229,24 @@ static void systemShowThemes() {
     uiClearBelow(29);
     int y = y0;
     for (int i = 0; i < THEME_N; i++) {
-      items[i] = {8, y, tft.width() - 16, 30, themeName(i)};
+      items[i] = {8, y, tft.width() - 16, rowH, themeName(i)};
       uiDrawButton(items[i]);
       if (i == sel)                      // pending selection: cyan outline
         tft.drawRect(items[i].x - 3, items[i].y - 3,
                      items[i].w + 6, items[i].h + 6, ILI9341_CYAN);
-      tft.fillRect(tft.width() - 46, y + 9, 40, 14, uiBgColor(y + 9));
+      tft.fillRect(tft.width() - 46, y + rowH / 2 - 7, 40, 14, uiBgColor(y + rowH / 2 - 7));
       if (i == themeGet()) {             // "on" marker: currently active theme
         tft.setTextColor(ILI9341_GREEN);
-        tft.setCursor(tft.width() - 42, y + 11);
+        tft.setCursor(tft.width() - 42, y + rowH / 2 - 5);
         tft.print("on");
       }
       y += step;
     }
     tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(8, y + 8);
-    tft.print("Vice = synthwave.");
+    tft.setCursor(8, captionY);
+    tft.print("Vice = synthwave, in your color.");
 
-    applyBtn = {8, tft.height() - 46, tft.width() - 16, 38,
+    applyBtn = {8, applyY, tft.width() - 16, APPLY_H,
                 sel == themeGet() ? "Apply (no change)" : "Apply"};
     uiDrawButton(applyBtn);
   };

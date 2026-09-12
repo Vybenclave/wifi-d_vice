@@ -358,7 +358,7 @@ void uiClearBelow(int y0) {
 
 void uiDrawTopBar(const char *title) {
   s_bgMode = UI_BG_BLACK;   // opt-in per screen; default back to plain
-  tft.fillRect(0, 0, tft.width(), 28, ILI9341_NAVY);
+  tft.fillRect(0, 0, tft.width(), 28, themeIsVice() ? thTitleBar() : ILI9341_NAVY);
   tft.drawFastHLine(0, 28, tft.width(), ILI9341_WHITE);
   uiDrawStatusBar();
   uiDrawButton(kBackBtn);
@@ -389,11 +389,11 @@ bool uiTouchInBackArea(const TouchPoint &t) {
 void uiDrawButton(const Btn &b) {
   if (themeIsVice()) {
     int r = b.h / 2; if (r > 10) r = 10; if (r < 3) r = 3;
-    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, TH_BTN_FILL);
-    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, TH_BTN_EDGE);
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, thBtnFill());
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, thBtnEdge());
     if (b.w > 4 && b.h > 4)
-      tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, TH_BTN_EDGE);
-    tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, TH_BTN_BEVEL);
+      tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, thBtnEdge());
+    tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, thBtnBevel());
 
     // Label starts at the global cap (UI_MENU_BTN_MAXSIZE, see ui.h) and
     // steps down until it fits -- one knob for button text size app-wide.
@@ -408,7 +408,7 @@ void uiDrawButton(const Btn &b) {
     tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
     int tx = b.x + (b.w - (int)bw) / 2 - bx;
     int ty = b.y + (b.h - (int)bh) / 2 - by;
-    tft.setTextColor(TH_BTN_EMBOSS);
+    tft.setTextColor(thBtnEmboss());
     tft.setCursor(tx - 1, ty - 1); tft.print(b.label);
     tft.setTextColor(TH_BTN_TEXT);
     tft.setCursor(tx, ty);         tft.print(b.label);
