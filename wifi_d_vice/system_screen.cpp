@@ -6,7 +6,6 @@
 #include "system_screen.h"
 #include <SD.h>
 #include <Preferences.h>
-#include <TinyGPSPlus.h>
 #include "qrcode.h"
 #include "pins.h"
 #include "sd_bus.h"
@@ -18,8 +17,11 @@
 // #include "demo.h"   // Outrun easter egg -- retired, kept for reference
 #include "splash.h"
 #include "theme.h"
+#include "tz.h"
+#include "devtime.h"
 #include "modvis.h"
 #include "pincfg.h"
+#include "gps_shared.h"
 
 static const char *REPO_URL = "https://github.com/Vybenclave/wifi-d_vice";
 
@@ -145,27 +147,25 @@ void systemEnter() {
 
 void systemLoop() {}
 
-// Live GPS bring-up: opens the NMEA UART on GPS_RX and shows byte flow,
-// sentence count, sats, fix, position, HDOP and time. Back to exit.
+// Live GPS bring-up: shows sentence count, sats, fix, position, HDOP and
+// time off the shared background reader (gps_shared.h) -- it's been
+// running the UART since boot for the GPS time sync, so this just reads
+// its live TinyGPSPlus state instead of opening a second reader on top of
+// it (that would have starved whichever one lost the race for bytes).
+// Back to exit.
 static void systemTestGps() {
   uiDrawTopBar("Test GPS");
   uiClearBelow(29);
-  Serial1.begin(9600, SERIAL_8N1, GPS_RX, -1);
-  TinyGPSPlus gps;
-  uint32_t bytes = 0, sentences = 0, lastDraw = 0;
-  bool anyData = false;
+  TinyGPSPlus &gps = gpsShared();
+  uint32_t lastDraw = 0;
 
   for (;;) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      bytes++; anyData = true;
-      if (gps.encode(c)) sentences++;
-    }
     TouchPoint t = uiReadTouch();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); break; }
 
     if (millis() - lastDraw > 400) {
       lastDraw = millis();
+      bool anyData = gps.charsProcessed() > 0;
       tft.fillRect(0, 32, tft.width(), tft.height() - 44, ILI9341_BLACK);
       tft.setTextSize(1);
       int y = 36;
@@ -176,8 +176,8 @@ static void systemTestGps() {
       };
       line(ILI9341_WHITE, "RX pin", String(GPS_RX));
       line(anyData ? ILI9341_GREEN : ILI9341_RED, "serial",
-           anyData ? (String(bytes) + " bytes") : String("no data"));
-      line(sentences ? ILI9341_GREEN : ILI9341_YELLOW, "NMEA ok", String(sentences));
+           anyData ? (String(gps.charsProcessed()) + " bytes") : String("no data"));
+      line(gps.sentencesWithFix() ? ILI9341_GREEN : ILI9341_YELLOW, "NMEA ok", String(gps.passedChecksum()));
       line(gps.satellites.isValid() ? ILI9341_GREEN : ILI9341_YELLOW, "sats",
            gps.satellites.isValid() ? String(gps.satellites.value()) : String("--"));
       line(gps.location.isValid() ? ILI9341_GREEN : ILI9341_YELLOW, "fix",
@@ -193,6 +193,8 @@ static void systemTestGps() {
         snprintf(b, sizeof(b), "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
         line(ILI9341_WHITE, "UTC", b);
       }
+      line(devTimeSynced() ? ILI9341_GREEN : ILI9341_YELLOW, "dev clock",
+           devTimeSynced() ? devTimeNowString() : String("unsynced"));
       if (!anyData) {
         tft.setTextColor(ILI9341_YELLOW);
         tft.setCursor(4, tft.height() - 16);
@@ -201,7 +203,6 @@ static void systemTestGps() {
     }
     delay(5);
   }
-  Serial1.end();
 }
 
 // Tapping a theme row only selects it; nothing changes until "Apply".
@@ -257,6 +258,87 @@ static void systemShowThemes() {
       if (t.pressed && uiTouchInButton(t, items[i])) {
         uiWaitForRelease();
         sel = i;
+        drawPicker();
+        break;
+      }
+    }
+    delay(15);
+  }
+}
+
+// Display-only UTC offset for the bottom-bar clock (tz.h) -- never touches
+// devtime.h or any SD log, which always stay UTC. Same tap-then-Apply
+// pattern as systemShowThemes(), paged (ROWS per screen) since the offset
+// list is too long for one page on this display.
+static void systemShowTimezone() {
+  const int y0 = 34, rowH = 22, gap = 3;
+  const int ROWS = 6;
+  Btn items[ROWS], applyBtn, prevBtn, nextBtn;
+  int sel = tzGetIndex();               // pending selection, starts at the active one
+  int page = sel / ROWS;
+
+  auto drawPicker = [&]() {
+    uiDrawTopBar("Timezone");
+    uiClearBelow(29);
+    int pages = (tzCount() + ROWS - 1) / ROWS;
+    int y = y0;
+    int base = page * ROWS;
+    int n = min(ROWS, tzCount() - base);
+    for (int i = 0; i < n; i++) {
+      int idx = base + i;
+      items[i] = {8, y, tft.width() - 16, rowH, tzLabel(idx)};
+      uiDrawButton(items[i]);
+      if (idx == sel)                    // pending selection: cyan outline
+        tft.drawRect(items[i].x - 2, items[i].y - 2,
+                     items[i].w + 4, items[i].h + 4, ILI9341_CYAN);
+      if (idx == tzGetIndex()) {         // "on" marker: currently active zone
+        tft.fillRect(tft.width() - 38, y + 3, 32, rowH - 6, uiBgColor(y + 3));
+        tft.setTextColor(ILI9341_GREEN);
+        tft.setCursor(tft.width() - 34, y + rowH / 2 - 4);
+        tft.print("on");
+      }
+      y += rowH + gap;
+    }
+
+    prevBtn = {8, y + 4, 60, 26, "< prev"};
+    nextBtn = {tft.width() - 68, y + 4, 60, 26, "next >"};
+    if (page > 0)          uiDrawButton(prevBtn);    else uiDrawButtonDim(prevBtn);
+    if (page < pages - 1)  uiDrawButton(nextBtn);    else uiDrawButtonDim(nextBtn);
+    tft.setTextColor(ILI9341_WHITE);
+    char pg[16];
+    snprintf(pg, sizeof(pg), "%d / %d", page + 1, pages);
+    int16_t bx, by; uint16_t bw, bh;
+    tft.setTextSize(1);
+    tft.getTextBounds(pg, 0, 0, &bx, &by, &bw, &bh);
+    tft.setCursor((tft.width() - (int)bw) / 2, y + 4 + (26 - (int)bh) / 2 - by);
+    tft.print(pg);
+
+    applyBtn = {8, tft.height() - 42, tft.width() - 16, 34,
+                sel == tzGetIndex() ? "Apply (no change)" : "Apply"};
+    uiDrawButton(applyBtn);
+  };
+  drawPicker();
+
+  for (;;) {
+    TouchPoint t = uiReadTouch();
+    if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
+    if (t.pressed && uiTouchInButton(t, applyBtn)) {
+      uiWaitForRelease();
+      if (sel != tzGetIndex()) { tzSetIndex(sel); drawPicker(); }
+      continue;
+    }
+    int pages = (tzCount() + ROWS - 1) / ROWS;
+    if (t.pressed && uiTouchInButton(t, prevBtn) && page > 0) {
+      uiWaitForRelease(); page--; drawPicker(); continue;
+    }
+    if (t.pressed && uiTouchInButton(t, nextBtn) && page < pages - 1) {
+      uiWaitForRelease(); page++; drawPicker(); continue;
+    }
+    int base = page * ROWS, n = min(ROWS, tzCount() - base);
+    for (int i = 0; i < n; i++) {
+      if (t.pressed && uiTouchInButton(t, items[i])) {
+        uiWaitForRelease();
+        sel = base + i;
         drawPicker();
         break;
       }
@@ -611,10 +693,11 @@ static void systemShowDisplayMenu() {
   static const SysItem items[] = {
     {"Screen orientation", systemShowRotationPicker, nullptr},
     {"Themes",             systemShowThemes,         nullptr},
+    {"Timezone",           systemShowTimezone,       nullptr},
     {"Recalibrate touch",  uiRunCalibration,         nullptr},
     {nullptr,              sysToggleSplash,          splashLbl},
   };
-  systemSubPage("Display", items, 4);
+  systemSubPage("Display", items, 5);
 }
 
 // V_bat calibration. The reading is raw_ADC * BAT_DIV * factor; this page

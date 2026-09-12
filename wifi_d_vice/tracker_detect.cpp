@@ -18,6 +18,7 @@
 #include <string.h>
 #include "ui.h"
 #include "wlog.h"
+#include "devtime.h"
 
 enum { TK_FINDMY = 0, TK_SMARTTAG, TK_TILE, TK_CHIPOLO, TK_FMDN, TK_UNKNOWN, TK_N };
 static const char *KIND_NAME[TK_N] = { "AirTag/FindMy", "SmartTag", "Tile", "Chipolo", "Google FMDN", "Tracker?" };
@@ -160,9 +161,9 @@ static void trackerLogEdges() {
   for (int k = 0; k < TK_N; k++) {
     bool act = classActive(k);
     if (act && !tkSeenLogged[k]) {
-      char line[96];
-      snprintf(line, sizeof(line), "%lu,seen,%s,%d,%u",
-               (unsigned long)millis(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
+      char line[112];
+      snprintf(line, sizeof(line), "%s,seen,%s,%d,%u",
+               devTimeNowString().c_str(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
       wlogRow(line); wrote = true;
       tkSeenLogged[k] = true;
     } else if (!act) {
@@ -171,9 +172,9 @@ static void trackerLogEdges() {
 
     bool foll = classFollow(k);
     if (foll && !tkFollowLogged[k]) {
-      char line[96];
-      snprintf(line, sizeof(line), "%lu,follow,%s,%d,%u",
-               (unsigned long)millis(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
+      char line[112];
+      snprintf(line, sizeof(line), "%s,follow,%s,%d,%u",
+               devTimeNowString().c_str(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
       wlogRow(line); wrote = true;
       tkFollowLogged[k] = true;
     } else if (!foll) {
@@ -302,7 +303,7 @@ void trackerEnter() {
   memset(live, 0, sizeof(live));
   memset(tkSeenLogged, 0, sizeof(tkSeenLogged));
   memset(tkFollowLogged, 0, sizeof(tkFollowLogged));
-  wlogOpen("tracker", "millis,event,class,rssi,macs");   // event rows only; ok if SD absent
+  wlogOpen("tracker", "utc,event,class,rssi,macs");   // event rows only; ok if SD absent
   uiShowLoading("Listening...");
   if (!pScan) {
     WiFi.disconnect(true, false);   // radio coexistence -- see README

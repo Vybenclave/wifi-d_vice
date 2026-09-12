@@ -21,6 +21,13 @@ void devTimePoll();
 // source has synced, SNTP still runs. 'source' is a short static tag kept for
 // diagnostics (e.g. "meshtastic").
 void devTimeSetEpoch(uint32_t epoch, const char *source);
+// GPS sync (gps_shared.cpp): unlike devTimeSetEpoch() above, this ALWAYS
+// applies the epoch, even if the clock is already synced from SNTP or
+// elsewhere. GPS is a standing hardware clock with its own sanity check
+// upstream (a valid NMEA fix), so a later GPS reading is trusted to
+// correct drift rather than deferred to whatever set the clock first --
+// that's what lets the hourly GPS resync actually do anything.
+void devTimeSyncFromGps(uint32_t epoch);
 uint32_t devTimeNow();          // epoch seconds, 0 if never synced
 String devTimeNowString();      // "YYYY-MM-DD HH:MM:SS", "unsynced" if never synced
 String devDateString();         // "YYYY-MM-DD", "unsynced" if never synced -- for folder names

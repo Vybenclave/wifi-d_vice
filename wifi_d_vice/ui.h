@@ -56,9 +56,13 @@ enum { UI_BG_BLACK = 0, UI_BG_IMAGE = 1 };
 void uiSetBgMode(int mode);
 
 // Persistent bottom chrome: a solid black strip UI_STATUSBAR_H tall with a
-// 1px white rule along its top edge, holding the toast line, the clock-sync
-// dot and the battery glyph. Painted by uiClearBelow() and uiDrawTopBar().
+// 1px white rule along its top edge, holding the toast line, the clock and
+// the battery glyph. Painted by uiClearBelow() and uiDrawTopBar().
 static const int UI_STATUSBAR_H = 18;
+// Width reserved on the right of the status bar for the clock + battery
+// glyph (uiDrawClock, uiDrawBatteryIndicator) -- uiToast()'s text stops
+// here so it doesn't run under them.
+static const int UI_RIGHTZONE_W = 90;
 void uiDrawStatusBar();
 
 void uiDrawTopBar(const char *title);
@@ -96,7 +100,7 @@ static const int UI_CONTENT_Y = UI_ACTIONROW_Y + UI_ACTIONROW_H + 1;       // wi
 // array back for hit-testing (uiTouchInButton against btns[i]).
 void uiDrawActionRow(Btn *btns, int count);
 void uiToast(const char *msg);   // one-line status text at the bottom of the screen (leaves
-                                 // room on the right for uiDrawSyncIndicator(), see below)
+                                 // room on the right for uiDrawClock(), see below)
 // Full-screen modal numeric keypad -- a stripped-down cousin of
 // uiTextInput() (keyboard.cpp) with no letters/layers: a 3x4 grid of big
 // digit keys plus '.', backspace, Cancel and OK, sized for fat-finger taps
@@ -106,11 +110,12 @@ void uiToast(const char *msg);   // one-line status text at the bottom of the sc
 // uiTextInput(). Validation is loose (one '.' max, 20 chars); the caller
 // validates the actual value.
 String uiNumpadInput(const char *prompt, const String &initial = "");
-// Small bottom-right icon, drawn on every screen from the main loop
-// (independent of whatever screen is active): a clock-sync status light.
-// Blank/cleared when devtime.h has a synced clock; when unsynced, cycles
-// white/yellow/orange/brown/red back and forth, 250ms per step.
-void uiDrawSyncIndicator();
+// Small bottom-right clock, drawn on every screen from the main loop
+// (independent of whatever screen is active). Shows "HH:MM" local time
+// (devtime.h's UTC clock shifted by the tz.h offset) once devtime.h has a
+// synced clock; shows "--:--" (dimmed) before that -- no separate
+// "unsynced" indicator, the dashes ARE the indicator.
+void uiDrawClock();
 // Clears the content area (below the top bar) and shows a one-line yellow
 // status message. Call this before any blocking radio/SD init or scan a
 // screen's Enter() does, so there's visible feedback instead of a stale or
@@ -181,8 +186,8 @@ int   uiBatteryRawMv();              // before the cal factor
 float uiBatteryCal();               // current factor (default 1.0)
 void  uiBatterySetCal(float k);     // clamped 0.5..2.0, persisted
 void  uiBatterySetCalFromActual(int actualMv);   // factor = actualMv / rawMv
-// Battery glyph + % in the bottom-right corner (left of it: the clock-sync
-// dot). Call every loop()
-// iteration (self-throttled); pulses colours like the clock-sync dot when
-// below 15%. uiDrawTopBar() forces a repaint on a screen change.
+// Battery glyph + % in the bottom-right corner (left of it: the clock,
+// uiDrawClock()). Call every loop() iteration (self-throttled); pulses
+// colours when below 15%. uiDrawTopBar() forces a repaint on a screen
+// change.
 void uiDrawBatteryIndicator();

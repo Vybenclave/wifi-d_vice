@@ -5,6 +5,7 @@
 #include "mac_vendor.h"
 #include "wlog.h"
 #include "known_signatures.h"
+#include "devtime.h"
 
 enum SubMode { LIST, DETAIL, LOCATE };
 static SubMode subMode = LIST;
@@ -91,9 +92,9 @@ static void doScan() {
       BLEAdvertisedDevice d = results->getDevice(i);
       uint8_t mac[6];
       memcpy(mac, d.getAddress().getNative(), 6);
-      char line[176];
-      snprintf(line, sizeof(line), "%lu,%s,%s,%s,%d",
-               (unsigned long)millis(),
+      char line[192];
+      snprintf(line, sizeof(line), "%s,%s,%s,%s,%d",
+               devTimeNowString().c_str(),
                d.haveName() ? d.getName().c_str() : "(no name)",
                d.getAddress().toString().c_str(),
                macVendorTag(mac).c_str(), d.getRSSI());
@@ -246,7 +247,7 @@ void bleScanTouch(const TouchPoint &t) {
     if (!t.isNewPress) return;   // manual bounds check below, not uiTouchInButton() -- needs its own edge guard
     if (uiTouchInButton(t, logBtn)) {
       if (!logging) {
-        logging = wlogOpen("blescan", "millis,name,mac,vendor,rssi");
+        logging = wlogOpen("blescan", "utc,name,mac,vendor,rssi");
       } else {
         logging = false;
         wlogClose();

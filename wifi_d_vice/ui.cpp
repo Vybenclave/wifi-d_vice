@@ -2,8 +2,11 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <math.h>
+#include <time.h>
+#include <string.h>
 #include "driver/dac_continuous.h"
 #include "devtime.h"
+#include "tz.h"
 #include "theme.h"
 #include "bg_landscape.h"   // BG_LANDSCAPE[19200]  160x120, upscaled x2
 #include "bg_portrait.h"    // BG_PORTRAIT[19200]   120x160
@@ -36,6 +39,7 @@ static void dacInit() {
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, -1);   // reset shared with EN, see pins.h
 
 static bool s_batForce = false;   // uiDrawTopBar() -> uiDrawBatteryIndicator() repaint on screen change
+static bool s_clockForce = false; // uiDrawStatusBar() -> uiDrawClock() repaint on screen change
 static int  s_bgMode  = UI_BG_BLACK;
 void uiSetBgMode(int m) { s_bgMode = m; }
 static void loadBeepVolume();   // defined below beep(); forward-declared for uiInit()
@@ -340,7 +344,8 @@ void uiDrawStatusBar() {
   int y = tft.height() - UI_STATUSBAR_H;
   tft.fillRect(0, y, tft.width(), UI_STATUSBAR_H, ILI9341_BLACK);
   tft.drawFastHLine(0, y, tft.width(), ILI9341_WHITE);
-  s_batForce = true;   // the battery glyph lives in the bar -- repaint it
+  s_batForce = true;     // the battery glyph lives in the bar -- repaint it
+  s_clockForce = true;   // ditto the clock -- this just painted over it
 }
 
 void uiClearBelow(int y0) {
@@ -473,10 +478,10 @@ bool uiTouchInButton(const TouchPoint &t, const Btn &b) {
 void uiToast(const char *msg) {
   // Live inside the status bar, but leave its 1px white top rule intact.
   int y = tft.height() - UI_STATUSBAR_H + 1;
-  // Right edge is short -- the bottom-right corner carries the clock-sync
-  // dot (uiDrawSyncIndicator) and the battery glyph (uiDrawBatteryIndicator)
-  // on every screen. Without this the toast text runs under them.
-  int w = tft.width() - 78;
+  // Right edge is short -- the bottom-right corner carries the clock
+  // (uiDrawClock) and the battery glyph (uiDrawBatteryIndicator) on every
+  // screen. Without this the toast text runs under them.
+  int w = tft.width() - UI_RIGHTZONE_W;
   tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
   tft.setTextWrap(false);
   tft.setTextColor(ILI9341_YELLOW);
@@ -486,20 +491,35 @@ void uiToast(const char *msg) {
 }
 
 // Manually-computed RGB565 -- Adafruit_ILI9341's color set has no BROWN.
+// (Used by uiDrawBatteryIndicator()'s low-battery pulse, below.)
 static const uint16_t UI_BROWN = 0xA145;
 
-void uiDrawSyncIndicator() {
-  // Sits just left of the battery glyph (uiDrawBatteryIndicator), which
-  // occupies roughly the rightmost 55px of the bottom edge.
-  const int cx = tft.width() - 64, cy = tft.height() - 10, r = 5;
+void uiDrawClock() {
+  // Right-aligned, just left of the battery glyph (uiDrawBatteryIndicator),
+  // which occupies roughly the rightmost 55px of the bottom edge -- see
+  // UI_RIGHTZONE_W. Repainted every loop() tick like the battery glyph, but
+  // only actually redraws when the printed string changes (once a minute),
+  // same "cheap and idempotent" contract as uiDrawBatteryIndicator.
+  static char last[6] = "";
+  char buf[6] = "--:--";   // unsynced: no time to show yet
   if (devTimeSynced()) {
-    tft.fillRect(cx - r - 1, cy - r - 1, 2 * r + 3, 2 * r + 3, ILI9341_BLACK);
-    return;
+    time_t now = devTimeNow() + (time_t)tzOffsetMinutes() * 60;
+    struct tm t;
+    gmtime_r(&now, &t);   // `now` was already shifted by the tz offset above
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
   }
-  static const uint16_t colors[5] = {ILI9341_WHITE, ILI9341_YELLOW, ILI9341_ORANGE, UI_BROWN, ILI9341_RED};
-  uint32_t step = (millis() / 250) % 8;   // 0..7, ping-pongs across the 5 colors
-  int idx = step <= 4 ? step : 8 - step;
-  tft.fillCircle(cx, cy, r, colors[idx]);
+  if (!s_clockForce && strcmp(buf, last) == 0) return;
+  s_clockForce = false;
+  strcpy(last, buf);
+
+  const int rightEdge = tft.width() - 55 - 4;   // 4px gap before the battery label
+  const int textW = 5 * 6;                       // "HH:MM" at text size 1
+  int x = rightEdge - textW, y = tft.height() - UI_STATUSBAR_H + 5;
+  tft.fillRect(x - 1, y - 1, textW + 2, 10, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(devTimeSynced() ? ILI9341_WHITE : ILI9341_DARKGREY);
+  tft.setCursor(x, y);
+  tft.print(buf);
 }
 
 void uiShowLoading(const char *msg) {
@@ -809,10 +829,10 @@ static uint32_t s_batReadAt = 0, s_batPaintAt = 0;
 static int s_batMv = 0, s_batPct = -2;   // -2 = never read
 static int s_batSig = -9999;            // last-painted {pct, pulse-colour}
 
-// Bottom-right corner, rightmost. The clock-sync dot sits just to its left
-// (uiDrawSyncIndicator). Drawn from loop() every iteration like the sync
-// dot -- only the ADC read is throttled (5s); the ~50px repaint is cheap
-// and keeps the glyph alive after any screen's uiClearBelow().
+// Bottom-right corner, rightmost. The clock (uiDrawClock) sits just to its
+// left. Drawn from loop() every iteration like the clock -- only the ADC
+// read is throttled (5s); the ~50px repaint is cheap and keeps the glyph
+// alive after any screen's uiClearBelow().
 void uiDrawBatteryIndicator() {
   uint32_t now = millis();
   if (s_batPct == -2 || now - s_batReadAt > 5000) {

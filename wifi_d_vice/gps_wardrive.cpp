@@ -1,22 +1,22 @@
-// GPS-tagged WiFi wardriving logger. GPS is receive-only NMEA on GPIO35 (see
-// pins.h) -- read-only modules like the GT-U7/NEO-6M don't need a command
-// path back for basic fix data. Logs to SD (see sd_bus.h).
+// GPS-tagged WiFi wardriving logger. The GPS fix comes from the shared
+// background reader (gps_shared.h) now -- it's been running since boot for
+// the GPS time sync, so this screen just reads its live TinyGPSPlus state
+// instead of opening a second reader on the same UART. Logs to SD (see
+// sd_bus.h).
 //
 // The SD log format (plaintext engagement header, encrypted= marker, then
 // encrypt-when-armed rows) is shared with the other scan screens and lives
 // in wlog.{cpp,h} now -- this screen just formats rows and hands them over.
-#include <TinyGPSPlus.h>
 #include <SD.h>
 #include <WiFi.h>
 #include "ui.h"
 #include "pins.h"
 #include "sd_bus.h"
 #include "gps_shared.h"
+#include "devtime.h"
 #include "engagement.h"
 #include "wlog.h"
 
-static TinyGPSPlus gps;
-static HardwareSerial gpsSerial(1);
 static bool sdOk = false;
 static bool logging = false;
 static uint32_t lastTick = 0;
@@ -43,7 +43,9 @@ static void draw();   // defined below
 
 void gpsEnter() {
   uiDrawTopBar("Wardrive");
-  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX, -1);
+  // GPS UART is opened once at boot by gpsSharedBegin() (it's also the GPS
+  // time-sync source now, so it has to run whether or not this screen is
+  // ever visited) -- nothing to open here.
   // SD check first: uiShowLoading() clears the content area (incl. the
   // action row), so drawing the button before this wiped it on the first
   // visit and nothing redrew it. Do the check, THEN the button, THEN draw().
@@ -73,14 +75,14 @@ static void draw() {
   int y = UI_CONTENT_Y + 4;
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(4, y);
-  const char *fixState = gps.location.isValid() ? "yes"
+  const char *fixState = gpsShared().location.isValid() ? "yes"
                        : (lastFixMs && millis() - lastFixMs < 15000) ? "yes"
                        : lastFixMs ? "stale" : "none";
   tft.printf("Fix: %s  sats: %lu", fixState,
-             gps.satellites.isValid() ? (unsigned long)gps.satellites.value() : 0UL);
+             gpsShared().satellites.isValid() ? (unsigned long)gpsShared().satellites.value() : 0UL);
   y += 16;
   tft.setCursor(4, y);
-  if (gps.location.isValid()) tft.printf("lat %.6f  lon %.6f", gps.location.lat(), gps.location.lng());
+  if (gpsShared().location.isValid()) tft.printf("lat %.6f  lon %.6f", gpsShared().location.lat(), gpsShared().location.lng());
   else tft.print("lat --  lon --");
   y += 16;
   tft.setCursor(4, y);
@@ -104,16 +106,14 @@ static void draw() {
   }
 }
 
-bool gpsGetLastFix(int &year, int &month, int &day, int &hour, int &minute) {
-  if (!gps.date.isValid() || !gps.time.isValid()) return false;
-  year = gps.date.year(); month = gps.date.month(); day = gps.date.day();
-  hour = gps.time.hour(); minute = gps.time.minute();
-  return true;
-}
+// gpsGetLastFix() itself now lives in gps_shared.cpp -- it reads the same
+// background parser this screen does, so there's no reason to keep a
+// second copy here.
 
 void gpsLoop() {
-  while (gpsSerial.available()) gps.encode(gpsSerial.read());
-
+  // Byte draining + NMEA decode happens in gpsSharedLoop() (called from the
+  // main loop() regardless of the active screen); this just reads the
+  // result.
   if (greenOffAt && millis() >= greenOffAt) { ledGreen(false); greenOffAt = 0; }
 
   uint32_t interval = logging ? 5000 : 1000;
@@ -123,9 +123,9 @@ void gpsLoop() {
   // Cache the last good fix. A "static location" capture only needs one
   // fix (or none) -- keep logging AP data regardless, with a fix column
   // that's blank when we've never had one and flagged stale when it's old.
-  if (gps.location.isValid()) {
-    lastLat = gps.location.lat();
-    lastLon = gps.location.lng();
+  if (gpsShared().location.isValid()) {
+    lastLat = gpsShared().location.lat();
+    lastLon = gpsShared().location.lng();
     lastFixMs = millis();
   }
 
@@ -139,9 +139,9 @@ void gpsLoop() {
       if (!haveFix)       snprintf(coords, sizeof(coords), ",,nofix");
       else if (freshFix)  snprintf(coords, sizeof(coords), "%.6f,%.6f,", lastLat, lastLon);
       else                snprintf(coords, sizeof(coords), "%.6f,%.6f,stale", lastLat, lastLon);
-      char line[176];
-      snprintf(line, sizeof(line), "%lu,%s,%s,%s,%d,%d",
-               (unsigned long)millis(), coords,
+      char line[192];
+      snprintf(line, sizeof(line), "%s,%s,%s,%s,%d,%d",
+               devTimeNowString().c_str(), coords,
                WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(), WiFi.RSSI(i), WiFi.channel(i));
       wlogRow(line);
       rowsLogged++;
@@ -157,7 +157,7 @@ void gpsLoop() {
 void gpsTouch(const TouchPoint &t) {
   if (!uiTouchInButton(t, toggleBtn)) return;
   if (!logging) {
-    if (wlogOpen("wardrive", "millis,lat,lon,fix,ssid,bssid,rssi,channel")) {
+    if (wlogOpen("wardrive", "utc,lat,lon,fix,ssid,bssid,rssi,channel")) {
       logging = true;
       rowsLogged = 0;
     }

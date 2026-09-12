@@ -81,9 +81,9 @@ static void harvestListScan(int n) {
   // then a single flush for the batch.
   if (logging) {
     for (int i = 0; i < n; i++) {
-      char line[200];
-      snprintf(line, sizeof(line), "%lu,%s,%s,%d,%d,%s",
-               (unsigned long)millis(), WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(),
+      char line[220];
+      snprintf(line, sizeof(line), "%s,%s,%s,%d,%d,%s",
+               devTimeNowString().c_str(), WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(),
                (int)WiFi.RSSI(i), (int)WiFi.channel(i), encName(WiFi.encryptionType(i)));
       wlogRow(line);
     }
@@ -366,7 +366,7 @@ void wifiScanTouch(const TouchPoint &t) {
     if (!t.isNewPress) return;   // manual bounds check below, not uiTouchInButton() -- needs its own edge guard
     if (uiTouchInButton(t, logBtn)) {
       if (!logging) {
-        logging = wlogOpen("wifiscan", "millis,ssid,bssid,rssi,channel,security");
+        logging = wlogOpen("wifiscan", "utc,ssid,bssid,rssi,channel,security");
       } else {
         logging = false;
         wlogClose();

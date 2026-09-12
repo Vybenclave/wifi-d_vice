@@ -28,6 +28,12 @@
 // encrypted records keyed from the passphrase. The same BLE connection also
 // syncs wall-clock time from the phone/laptop via the standard Current Time
 // Service (devtime.h) -- most OSes push this automatically, no extra step.
+// The GPS module (gps_shared.h) is a second, WiFi/BLE-independent time
+// source: it retries every 15s from boot until it gets a fix-derived UTC
+// time, then resyncs hourly to correct drift. Every SD log timestamps rows
+// in that same UTC clock (devTimeNowString()) regardless of which source
+// set it; the bottom-bar clock shows it shifted by System > Display >
+// Timezone, a display-only preference (tz.h) that never touches the logs.
 //
 // Everything here is unverified on physical hardware -- see pins.h and the
 // esp32-cyd skill for the sourcing/caveats on the base pin map, and treat
@@ -42,6 +48,8 @@
 #include "system_screen.h"
 #include "onboarding.h"
 #include "devtime.h"
+#include "tz.h"
+#include "gps_shared.h"
 #include "engagement.h"
 #include "engstore.h"
 #include "theme.h"
@@ -401,10 +409,18 @@ void setup() {
 
   uiInit();
   themeLoad();
+  tzLoad();
   modvisLoad();
   engStoreBegin();
   engagementBootUnlock();      // no-op unless the SD card marks an engagement active
   bootWifiPending = wifiAutoConnectOnBoot();   // non-blocking; link comes up during the splash
+  // GPS is receive-only on its own UART (GPS_RX, see pins.h) -- safe to
+  // open at boot and leave running the whole session. gpsSharedLoop() (see
+  // loop() below) drains it continuously and drives the GPS time sync
+  // (every 15s until the clock is set, then hourly) regardless of which
+  // screen is up; the Wardrive screen and the Hardware > Test GPS page
+  // both just read the same live fix instead of opening their own UART.
+  gpsSharedBegin();
   showSplash(2600);           // WIFI D_VICE splash, tap to skip
   onboardingRunIfNeeded();
   drawMenu();
@@ -455,6 +471,7 @@ void loop() {
     devTimeBeginNet();     // boot auto-connect is up -- start SNTP
   }
   devTimePoll();           // promote to synced once an SNTP reply lands
+  gpsSharedLoop();         // drain the GPS UART + run its own 15s/1hr time-sync schedule
   serviceArmedLed();       // 250ms/1250ms pulse while an engagement is armed
 
   // Blue "working" heartbeat on the continuously-scanning screens. The
@@ -467,8 +484,8 @@ void loop() {
                 currentScreen == PROBE_WATCH || currentScreen == CLIENT_MAP ||
                 currentScreen == CAMERA_DET || currentScreen == DRONE_DET ||
                 currentScreen == BLE_SPAM);
-  uiDrawSyncIndicator();   // bottom-right clock-sync status light, every screen
-                           // (note: doesn't appear during modal sub-loops like the
+  uiDrawClock();           // bottom-right clock, every screen (note: doesn't
+                           // appear during modal sub-loops like the
                            // keyboard, calibration, or BLE pairing wait -- those
                            // don't return to this loop() until they finish)
   uiDrawBatteryIndicator();   // bottom-right battery glyph + %, same caveat
