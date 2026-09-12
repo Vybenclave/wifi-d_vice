@@ -14,7 +14,13 @@
 // A future SD-loadable custom theme (a /vice_themes/ folder -- see the
 // project roadmap) would reference these same accessors for "the user's
 // chosen color" rather than hardcoding its own.
-enum { ACCENT_CYAN = 0, ACCENT_AMBER = 1, ACCENT_GREEN = 2, ACCENT_GREY = 3, ACCENT_N = 4 };
+enum {
+  ACCENT_CYAN = 0, ACCENT_AMBER, ACCENT_GREEN, ACCENT_GREY,
+  ACCENT_RED, ACCENT_ORANGE, ACCENT_YELLOW, ACCENT_LIME,
+  ACCENT_BLUE, ACCENT_INDIGO, ACCENT_PURPLE, ACCENT_MAGENTA,
+  ACCENT_PINK, ACCENT_SKY, ACCENT_WHITE, ACCENT_ROSE,
+  ACCENT_N,
+};
 
 void        accentLoad();          // read from NVS -- call once at boot
 void        accentSet(int id);     // set + persist

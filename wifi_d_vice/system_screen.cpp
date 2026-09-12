@@ -219,49 +219,78 @@ static uint16_t contrastTextFor(uint16_t c) {
 
 // Swatch-grid picker for the accent color (accent.h) -- each cell IS
 // that color's actual fill, so the name alone doesn't have to explain
-// it. 2 columns, as many rows as ACCENT_N needs. Dropdown-style: tapping
-// a cell selects it and returns immediately, no separate Apply step.
-// TODO once ACCENT_N grows past what one screen comfortably fits (the
-// project's 16-color baseline will): page it, the same way
-// uiDropdownPick() pages a plain list. Fine unpaged for today's 4.
+// it. 2 columns, paged so a cell never shrinks below MIN_CELL_H even
+// with all 16 colors. Dropdown-style: tapping a cell selects it and
+// returns immediately, no separate Apply step; tapping the empty space
+// below the grid (only shown when there's more than one page) advances
+// to the next page, same gesture uiDropdownPick() uses for a plain list.
 static int pickAccentColor(int current) {
   const int y0 = 34, cols = 2, gap = 8, bottomMargin = UI_STATUSBAR_H + 4;
-  int rows = (ACCENT_N + cols - 1) / cols;
-  int cellW = (tft.width() - 16 - gap) / cols;
-  int cellH = (tft.height() - bottomMargin - y0 - gap * (rows - 1)) / rows;
-  if (cellH > 90) cellH = 90;   // don't get silly big on a tall screen with only 4 colors
+  const int MIN_CELL_H = 50;
+  int rowsFit = (tft.height() - bottomMargin - y0 + gap) / (MIN_CELL_H + gap);
+  if (rowsFit < 1) rowsFit = 1;
+  int perPage = rowsFit * cols;
+  if (perPage > ACCENT_N) perPage = ACCENT_N;
+  int pages = (ACCENT_N + perPage - 1) / perPage;
+  int page = (current >= 0 && current < ACCENT_N) ? current / perPage : 0;
 
-  uiDrawTopBar("Accent Color");
-  uiClearBelow(29);
-  Btn cell[ACCENT_N];
-  for (int id = 0; id < ACCENT_N; id++) {
-    int col = id % cols, row = id / cols;
-    int x = 8 + col * (cellW + gap);
-    int y = y0 + row * (cellH + gap);
-    cell[id] = {x, y, cellW, cellH, accentName(id)};
+  Btn cell[ACCENT_N];   // only [0, n) of this page's cells are ever filled in
+  int n = 0, rows = 0, cellH = 0;
+  auto draw = [&]() {
+    uiDrawTopBar("Accent Color");
+    uiClearBelow(29);
+    int base = page * perPage;
+    n = min(perPage, ACCENT_N - base);
+    rows = (n + cols - 1) / cols;
+    int cellW = (tft.width() - 16 - gap) / cols;
+    cellH = (tft.height() - bottomMargin - y0 - gap * (rows - 1)) / rows;
+    if (cellH > 90) cellH = 90;   // don't get silly big on a tall screen with few colors on the page
 
-    uint16_t fill = accentFillFor(id);
-    tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
-    tft.drawRoundRect(x, y, cellW, cellH, 8, accentEdgeFor(id));
-    tft.setTextColor(contrastTextFor(fill));
-    tft.setTextSize(2);
-    int16_t bx, by; uint16_t bw, bh;
-    tft.getTextBounds(accentName(id), 0, 0, &bx, &by, &bw, &bh);
-    tft.setCursor(x + (cellW - (int)bw) / 2 - bx, y + (cellH - (int)bh) / 2 - by);
-    tft.print(accentName(id));
+    for (int i = 0; i < n; i++) {
+      int id = base + i;
+      int col = i % cols, row = i / cols;
+      int x = 8 + col * (cellW + gap);
+      int y = y0 + row * (cellH + gap);
+      cell[i] = {x, y, cellW, cellH, accentName(id)};
 
-    if (id == current) {   // "current" marker -- a double outline reads on any fill color
-      tft.drawRect(x - 3, y - 3, cellW + 6, cellH + 6, ILI9341_GREEN);
-      tft.drawRect(x - 2, y - 2, cellW + 4, cellH + 4, ILI9341_GREEN);
+      uint16_t fill = accentFillFor(id);
+      tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
+      tft.drawRoundRect(x, y, cellW, cellH, 8, accentEdgeFor(id));
+      tft.setTextColor(contrastTextFor(fill));
+      tft.setTextSize(cellH >= 40 ? 2 : 1);
+      int16_t bx, by; uint16_t bw, bh;
+      tft.getTextBounds(accentName(id), 0, 0, &bx, &by, &bw, &bh);
+      tft.setCursor(x + (cellW - (int)bw) / 2 - bx, y + (cellH - (int)bh) / 2 - by);
+      tft.print(accentName(id));
+
+      if (id == current) {   // "current" marker -- a double outline reads on any fill color
+        tft.drawRect(x - 3, y - 3, cellW + 6, cellH + 6, ILI9341_GREEN);
+        tft.drawRect(x - 2, y - 2, cellW + 4, cellH + 4, ILI9341_GREEN);
+      }
     }
-  }
+    if (pages > 1) {
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(1);
+      char pg[32];
+      snprintf(pg, sizeof(pg), "page %d/%d -- tap to advance", page + 1, pages);
+      tft.setCursor(8, y0 + rows * (cellH + gap) + 2);
+      tft.print(pg);
+    }
+  };
+  draw();
 
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return current; }
-    for (int id = 0; id < ACCENT_N; id++)
-      if (uiTouchInButton(t, cell[id])) { uiWaitForRelease(); return id; }
+    int base = page * perPage;
+    for (int i = 0; i < n; i++)
+      if (uiTouchInButton(t, cell[i])) { uiWaitForRelease(); return base + i; }
+    if (t.isNewPress && pages > 1 && t.y > y0 + rows * (cellH + gap)) {
+      uiWaitForRelease();
+      page = (page + 1) % pages;
+      draw();
+    }
     delay(15);
   }
 }
