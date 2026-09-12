@@ -282,6 +282,7 @@ void drawSubMenu(Screen sub) {
 }
 
 void exitScreen(Screen s) {
+  uiClearToast();   // stop any ticker this screen left running -- see ui.h
   switch (s) {
     case WIFI_SCAN:     wifiScanExit(); break;
     case NET_STATS:     netstatsExit(); break;

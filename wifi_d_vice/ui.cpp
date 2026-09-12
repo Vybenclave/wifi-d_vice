@@ -596,6 +596,19 @@ void uiToast(const char *msg) {
   }
 }
 
+void uiClearToast() {
+  // The ticker (uiTickToast(), via uiServiceChrome()) runs from the main
+  // loop() regardless of which screen is active -- without this, a
+  // message from a screen you've LEFT keeps redrawing itself over
+  // whatever the next screen puts in the status bar, forever, since
+  // nothing else ever tells it to stop.
+  s_toastScrolling = false;
+  s_toastMsg = "";
+  int y = tft.height() - UI_STATUSBAR_H + 1;
+  int w = tft.width() - UI_RIGHTZONE_W;
+  tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
+}
+
 // Advances the status-bar ticker, if the last uiToast() message was too
 // long to fit -- called every loop() tick via uiServiceChrome(), self-
 // throttled to TOAST_STEP_MS so it reads as a marquee, not a flicker.
@@ -620,7 +633,13 @@ static const uint16_t UI_BROWN = 0xA145;
 
 // Same palette uiDrawBatteryIndicator() colors its glyph/label with -- one
 // place, so the clock next to it (uiDrawClock, below) always matches it
-// exactly instead of picking its own colors.
+// exactly instead of picking its own colors. The charge-state warning
+// colors (low-battery pulse, mid-range yellow, USB grey) stay fixed --
+// they're a functional signal, not branding, and a pulsing "danger" red
+// swapped for whatever the user's accent happens to be would defeat the
+// point. "All is well" (>=40%, off USB) is the exception: that's most of
+// a device's life, so THAT'S the one state tied to the accent -- the
+// clock/battery corner reads in the user's chosen color most of the time.
 static uint16_t battStatusColor() {
   if (s_batPct < 0) return ILI9341_DARKGREY;              // USB / never read yet
   if (s_batPct < 15) {                                     // low: pulse through these
@@ -629,7 +648,7 @@ static uint16_t battStatusColor() {
     return cyc[st <= 4 ? st : 8 - st];
   }
   if (s_batPct < 40) return ILI9341_YELLOW;
-  return ILI9341_GREEN;
+  return accentFill();
 }
 
 void uiDrawClock() {
@@ -992,7 +1011,7 @@ void uiDrawBatteryIndicator() {
   if (s_batPct < 0)        col = ILI9341_DARKGREY;
   else if (low) { uint32_t st = (now / 250) % 8; cycIdx = st <= 4 ? st : 8 - st; col = cyc[cycIdx]; }
   else if (s_batPct < 40)  col = ILI9341_YELLOW;
-  else                     col = ILI9341_GREEN;
+  else                     col = accentFill();   // "all is well" -- tied to the accent, see battStatusColor()
 
   // Only repaint when the rendered content actually changes -- redrawing
   // every loop() strobed the icon. Force one on a screen change, and one

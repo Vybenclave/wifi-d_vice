@@ -124,7 +124,14 @@ void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn);
 // system_screen.cpp's Accent Color picker for that shape.
 int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current);
 void uiToast(const char *msg);   // one-line status text at the bottom of the screen (leaves
-                                 // room on the right for uiDrawClock(), see below)
+                                 // room on the right for uiDrawClock(), see below) -- character-
+                                 // steps a ticker (see uiServiceChrome()) if it's too long to fit
+// Stops the ticker and blanks the toast area. MUST be called on every
+// screen exit -- see exitScreen() in the .ino, the one place this is
+// wired in -- or a message from a screen you've left keeps redrawing
+// itself indefinitely (uiTickToast() runs off the main loop(), not tied
+// to any particular screen).
+void uiClearToast();
 // Full-screen modal numeric keypad -- a stripped-down cousin of
 // uiTextInput() (keyboard.cpp) with no letters/layers: a 3x4 grid of big
 // digit keys plus '.', backspace, Cancel and OK, sized for fat-finger taps
