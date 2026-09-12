@@ -99,6 +99,19 @@ static const int UI_CONTENT_Y = UI_ACTIONROW_Y + UI_ACTIONROW_H + 1;       // wi
 // are computed here and overwritten). Returns nothing -- read the same
 // array back for hit-testing (uiTouchInButton against btns[i]).
 void uiDrawActionRow(Btn *btns, int count);
+// The project's ONE paging control -- every paged list/grid screen uses
+// this, not its own prev/next buttons or a "tap the empty space" gesture.
+// Draws "< prev   N / M   next >" in one row at (x=8..width-8, y, h);
+// prevBtn/nextBtn come back dimmed (via uiDrawButtonDim()) at either end
+// when there's no previous/next page. The caller still does its own
+// touch handling on the two Btn outs, same shape every time:
+//   if (uiTouchInButton(t, prevBtn) && page > 0)         { ...; page--; }
+//   if (uiTouchInButton(t, nextBtn) && page < pages - 1) { ...; page++; }
+// Always draws (even at page 1/1, both ends dimmed) rather than hiding
+// itself for a single page -- keeps a paged screen's layout constant
+// instead of jumping around depending on item count.
+static const int UI_PAGER_H = 26;
+void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn);
 // Pull-down-menu picker: opens a full list of `count` text options
 // (itemLabel(i) supplies each one) below the top bar, paged if it doesn't
 // fit; tapping a row selects it and returns immediately (no separate

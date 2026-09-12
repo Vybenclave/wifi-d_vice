@@ -472,18 +472,37 @@ void uiDrawActionRow(Btn *btns, int count) {
   }
 }
 
+void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn) {
+  prevBtn = {8, y, 60, UI_PAGER_H, "< prev"};
+  nextBtn = {tft.width() - 68, y, 60, UI_PAGER_H, "next >"};
+  if (page > 0)          uiDrawButton(prevBtn);    else uiDrawButtonDim(prevBtn);
+  if (page < pages - 1)  uiDrawButton(nextBtn);    else uiDrawButtonDim(nextBtn);
+  tft.setTextColor(ILI9341_WHITE);
+  char pg[16];
+  snprintf(pg, sizeof(pg), "%d / %d", page + 1, pages);
+  int16_t bx, by; uint16_t bw, bh;
+  tft.setTextSize(1);
+  tft.getTextBounds(pg, 0, 0, &bx, &by, &bw, &bh);
+  tft.setCursor((tft.width() - (int)bw) / 2, y + (UI_PAGER_H - (int)bh) / 2 - by);
+  tft.print(pg);
+}
+
 int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current) {
   if (count <= 0) return current;
   const int MAX_ROWS = 10;
-  const int y0 = 34, rowH = 30, gap = 4, bottomMargin = UI_STATUSBAR_H + 4;
-  int maxRows = (tft.height() - bottomMargin - y0) / (rowH + gap);
+  const int y0 = 34, rowH = 30, gap = 4, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
+  // Room is always reserved for the pager row -- see uiDrawPager()'s
+  // comment on why it's drawn even at one page, rather than the layout
+  // changing shape depending on whether paging is actually needed.
+  int maxRows = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0) / (rowH + gap);
   if (maxRows < 1) maxRows = 1;
   if (maxRows > MAX_ROWS) maxRows = MAX_ROWS;
   if (maxRows > count) maxRows = count;
   int pages = (count + maxRows - 1) / maxRows;
   int page = (current >= 0 && current < count) ? current / maxRows : 0;
+  const int pagerY = y0 + maxRows * (rowH + gap) - gap + pagerGap;
 
-  Btn items[MAX_ROWS];
+  Btn items[MAX_ROWS], prevBtn, nextBtn;
   int n = 0;   // rows actually drawn on the current page -- read back in the touch loop below
   auto draw = [&]() {
     uiDrawTopBar(title);
@@ -499,13 +518,7 @@ int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), 
         tft.drawRect(items[i].x - 3, items[i].y - 3, items[i].w + 6, items[i].h + 6, ILI9341_GREEN);
       y += rowH + gap;
     }
-    if (pages > 1) {
-      tft.setTextColor(ILI9341_WHITE);
-      char pg[24];
-      snprintf(pg, sizeof(pg), "page %d/%d -- tap to advance", page + 1, pages);
-      tft.setCursor(8, y + 2);
-      tft.print(pg);
-    }
+    uiDrawPager(pagerY, page, pages, prevBtn, nextBtn);
   };
   draw();
 
@@ -520,11 +533,8 @@ int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), 
         return base + i;   // tap = select AND close, dropdown-style
       }
     }
-    if (t.isNewPress && pages > 1 && t.y > y0 + n * (rowH + gap)) {
-      uiWaitForRelease();
-      page = (page + 1) % pages;
-      draw();
-    }
+    if (uiTouchInButton(t, prevBtn) && page > 0) { uiWaitForRelease(); page--; draw(); continue; }
+    if (uiTouchInButton(t, nextBtn) && page < pages - 1) { uiWaitForRelease(); page++; draw(); continue; }
     delay(15);
   }
 }
