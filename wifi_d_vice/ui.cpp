@@ -359,7 +359,7 @@ void uiClearBelow(int y0) {
 
 void uiDrawTopBar(const char *title) {
   s_bgMode = UI_BG_BLACK;   // opt-in per screen; default back to plain
-  tft.fillRect(0, 0, tft.width(), 28, themeIsVice() ? accentTitleBar() : ILI9341_NAVY);
+  tft.fillRect(0, 0, tft.width(), 28, accentTitleBar());   // universal -- Basic used a fixed navy before
   tft.drawFastHLine(0, 28, tft.width(), ILI9341_WHITE);
   uiDrawStatusBar();
   uiDrawButton(kBackBtn);
@@ -420,8 +420,8 @@ void uiDrawButton(const Btn &b) {
   tft.setTextSize(1);
   int16_t bx, by; uint16_t bw, bh;
   tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
-  tft.drawRect(b.x, b.y, b.w, b.h, ILI9341_WHITE);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.drawRect(b.x, b.y, b.w, b.h, accentLabel());   // universal -- was a fixed white border/text
+  tft.setTextColor(accentLabel());
   tft.setCursor(b.x + (b.w - (int)bw) / 2, b.y + (b.h - (int)bh) / 2);
   tft.print(b.label);
 }

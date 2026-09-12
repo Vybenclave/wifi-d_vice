@@ -219,14 +219,15 @@ static uint16_t contrastTextFor(uint16_t c) {
 
 // Swatch-grid picker for the accent color (accent.h) -- each cell IS
 // that color's actual fill, so the name alone doesn't have to explain
-// it. 2 columns, paged so a cell never shrinks below MIN_CELL_H even
-// with all 16 colors. Dropdown-style: tapping a cell selects it and
-// returns immediately, no separate Apply step; tapping the empty space
-// below the grid (only shown when there's more than one page) advances
-// to the next page, same gesture uiDropdownPick() uses for a plain list.
+// it. 2 columns, row height pinned close to the app's normal ~30px
+// button-row height (not a big square swatch) rather than stretching to
+// fill the screen. Dropdown-style: tapping a cell selects it and returns
+// immediately, no separate Apply step; tapping the empty space below the
+// grid (only shown when there's more than one page) advances to the next
+// page, same gesture uiDropdownPick() uses for a plain list.
 static int pickAccentColor(int current) {
   const int y0 = 34, cols = 2, gap = 8, bottomMargin = UI_STATUSBAR_H + 4;
-  const int MIN_CELL_H = 50;
+  const int MIN_CELL_H = 32, MAX_CELL_H = 36;
   int rowsFit = (tft.height() - bottomMargin - y0 + gap) / (MIN_CELL_H + gap);
   if (rowsFit < 1) rowsFit = 1;
   int perPage = rowsFit * cols;
@@ -244,7 +245,7 @@ static int pickAccentColor(int current) {
     rows = (n + cols - 1) / cols;
     int cellW = (tft.width() - 16 - gap) / cols;
     cellH = (tft.height() - bottomMargin - y0 - gap * (rows - 1)) / rows;
-    if (cellH > 90) cellH = 90;   // don't get silly big on a tall screen with few colors on the page
+    if (cellH > MAX_CELL_H) cellH = MAX_CELL_H;   // stay button-row-sized even with room to spare
 
     for (int i = 0; i < n; i++) {
       int id = base + i;
@@ -253,11 +254,22 @@ static int pickAccentColor(int current) {
       int y = y0 + row * (cellH + gap);
       cell[i] = {x, y, cellW, cellH, accentName(id)};
 
+      // Match the ACTIVE theme's own button rendering, not a fixed swatch
+      // look: Vice gets its usual rounded, filled pill (uiDrawButton's
+      // style); Basic gets a plain square outline on black, same as
+      // every other Basic button -- the outline itself is this color, so
+      // it still previews the hue without contradicting Basic's "no
+      // filled buttons" look everywhere else.
       uint16_t fill = accentFillFor(id);
-      tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
-      tft.drawRoundRect(x, y, cellW, cellH, 8, accentEdgeFor(id));
-      tft.setTextColor(contrastTextFor(fill));
-      tft.setTextSize(cellH >= 40 ? 2 : 1);
+      if (themeIsVice()) {
+        tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
+        tft.drawRoundRect(x, y, cellW, cellH, 8, accentEdgeFor(id));
+        tft.setTextColor(contrastTextFor(fill));
+      } else {
+        tft.drawRect(x, y, cellW, cellH, fill);
+        tft.setTextColor(fill);
+      }
+      tft.setTextSize(cellH >= 28 ? 2 : 1);
       int16_t bx, by; uint16_t bw, bh;
       tft.getTextBounds(accentName(id), 0, 0, &bx, &by, &bw, &bh);
       tft.setCursor(x + (cellW - (int)bw) / 2 - bx, y + (cellH - (int)bh) / 2 - by);
@@ -312,13 +324,16 @@ static void systemShowThemeColor() {
     accentBtn = {8, 88, tft.width() - 16, 40, albl};
     uiDrawButton(themeBtn);
     uiDrawButton(accentBtn);
-    // A live swatch of the current accent next to its row -- under Basic
-    // (whose buttons don't render the accent at all) this is the only
-    // place on the whole Display menu that shows what "Amber" means.
+    // A live swatch of the current accent next to its row, in the active
+    // theme's own style (see pickAccentColor()'s swatches for why).
     int sw = 24;
     int sx = accentBtn.x + accentBtn.w - sw - 10, sy = accentBtn.y + (accentBtn.h - sw) / 2;
-    tft.fillRoundRect(sx, sy, sw, sw, 4, accentFill());
-    tft.drawRoundRect(sx, sy, sw, sw, 4, accentEdge());
+    if (themeIsVice()) {
+      tft.fillRoundRect(sx, sy, sw, sw, 4, accentFill());
+      tft.drawRoundRect(sx, sy, sw, sw, 4, accentEdge());
+    } else {
+      tft.drawRect(sx, sy, sw, sw, accentFill());
+    }
   };
   draw();
 
