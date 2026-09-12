@@ -7,6 +7,7 @@
 #include "devtime.h"
 #include "engstore.h"
 #include "webdl.h"
+#include "accent.h"
 
 static Engagement eng;
 static String passphrase;
@@ -43,7 +44,7 @@ static void kdfBar(int pct) {
 // "Validating..." screen + progress bar. Returns with a key loaded.
 static void deriveKey(const String &pp, const char *title) {
   uiClearBelow(0);
-  bootCenter(ILI9341_CYAN, 2, title, tft.height() / 2 - 16);
+  bootCenter(accentLabel(), 2, title, tft.height() / 2 - 16);
   cryptoSetPassphraseEx(pp, engStoreSalt(), (uint32_t)engStoreIters(), kdfBar);
   ledGreen(false);
 }
@@ -65,7 +66,7 @@ static bool allFieldsFilled() {
 static void drawRow(const Btn &b, const char *label, const String &value) {
   tft.drawRect(b.x, b.y, b.w, b.h, ILI9341_WHITE);
   tft.setTextWrap(false);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(b.x + 2, b.y + (b.h - 8) / 2);      // vertically centred, like every other row
   tft.print(label);
   tft.setTextColor(ILI9341_WHITE);
@@ -93,7 +94,7 @@ static void drawClientRow(int y) {
   clientBtn = {4, y, tft.width() - 8, ROW_H, "Client"};
   tft.drawRect(clientBtn.x, clientBtn.y, clientBtn.w, clientBtn.h, ILI9341_WHITE);
   tft.setTextWrap(false);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(clientBtn.x + 2, clientBtn.y + (ROW_H - 8) / 2);
   tft.print("Client");
 
@@ -104,7 +105,7 @@ static void drawClientRow(int y) {
   tft.setCursor(clientPlusBtn.x + 7, clientPlusBtn.y + (ROW_H - 8) / 2);
   tft.print("+");
   int cx = clientPlusBtn.x - 12, cy = clientBtn.y + ROW_H / 2;
-  tft.fillTriangle(cx - 5, cy - 3, cx + 5, cy - 3, cx, cy + 4, ILI9341_CYAN);
+  tft.fillTriangle(cx - 5, cy - 3, cx + 5, cy - 3, cx, cy + 4, accentLabel());   // pull-down arrow -- universal accent
 
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(clientBtn.x + 90, clientBtn.y + (ROW_H - 8) / 2);
@@ -126,7 +127,7 @@ static void drawFields() {
 
   pairBtn = {4, y, tft.width() - 8, ROW_H, "BLE Pair"};
   tft.drawRect(pairBtn.x, pairBtn.y, pairBtn.w, pairBtn.h, ILI9341_WHITE);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(pairBtn.x + 2, pairBtn.y + (ROW_H - 8) / 2);
   tft.print("BLE Pair");
   bool live = ble2faBondedDeviceConnected();
@@ -154,7 +155,7 @@ static void drawFields() {
 
   exportBtn = {4, y, tft.width() - 8, ROW_H, "BLE export"};
   tft.drawRect(exportBtn.x, exportBtn.y, exportBtn.w, exportBtn.h, ILI9341_WHITE);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(exportBtn.x + 2, exportBtn.y + (ROW_H - 8) / 2);
   tft.print("Export BLE");
   tft.setTextColor(exportOn ? ILI9341_GREEN : ILI9341_YELLOW);
@@ -164,7 +165,7 @@ static void drawFields() {
 
   webBtn = {4, y, tft.width() - 8, ROW_H, "WiFi download"};
   tft.drawRect(webBtn.x, webBtn.y, webBtn.w, webBtn.h, ILI9341_WHITE);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(webBtn.x + 2, webBtn.y + (ROW_H - 8) / 2);
   tft.print("WiFi download");
   tft.setTextColor(ILI9341_YELLOW);
@@ -244,7 +245,7 @@ static void clientPicker() {
   uiDrawTopBar("Select client");
   uiClearBelow(29);
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(6, 33);
   tft.print(n ? "Client folders on the card:" : "No client folders yet.");
 

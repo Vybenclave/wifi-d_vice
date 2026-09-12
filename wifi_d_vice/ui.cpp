@@ -2,9 +2,13 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <math.h>
+#include <time.h>
+#include <string.h>
 #include "driver/dac_continuous.h"
 #include "devtime.h"
+#include "tz.h"
 #include "theme.h"
+#include "accent.h"
 #include "bg_landscape.h"   // BG_LANDSCAPE[19200]  160x120, upscaled x2
 #include "bg_portrait.h"    // BG_PORTRAIT[19200]   120x160
 
@@ -36,6 +40,10 @@ static void dacInit() {
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, -1);   // reset shared with EN, see pins.h
 
 static bool s_batForce = false;   // uiDrawTopBar() -> uiDrawBatteryIndicator() repaint on screen change
+static bool s_clockForce = false; // uiDrawStatusBar() -> uiDrawClock() repaint on screen change
+// Hoisted out of the battery-indicator section below (battStatusColor() and
+// uiDrawClock() both want it, and uiDrawClock() is drawn first in loop()).
+static int s_batPct = -2;         // -2 = never read
 static int  s_bgMode  = UI_BG_BLACK;
 void uiSetBgMode(int m) { s_bgMode = m; }
 static void loadBeepVolume();   // defined below beep(); forward-declared for uiInit()
@@ -340,7 +348,8 @@ void uiDrawStatusBar() {
   int y = tft.height() - UI_STATUSBAR_H;
   tft.fillRect(0, y, tft.width(), UI_STATUSBAR_H, ILI9341_BLACK);
   tft.drawFastHLine(0, y, tft.width(), ILI9341_WHITE);
-  s_batForce = true;   // the battery glyph lives in the bar -- repaint it
+  s_batForce = true;     // the battery glyph lives in the bar -- repaint it
+  s_clockForce = true;   // ditto the clock -- this just painted over it
 }
 
 void uiClearBelow(int y0) {
@@ -350,7 +359,7 @@ void uiClearBelow(int y0) {
 
 void uiDrawTopBar(const char *title) {
   s_bgMode = UI_BG_BLACK;   // opt-in per screen; default back to plain
-  tft.fillRect(0, 0, tft.width(), 28, ILI9341_NAVY);
+  tft.fillRect(0, 0, tft.width(), 28, accentTitleBar());   // universal -- Basic used a fixed navy before
   tft.drawFastHLine(0, 28, tft.width(), ILI9341_WHITE);
   uiDrawStatusBar();
   uiDrawButton(kBackBtn);
@@ -381,11 +390,11 @@ bool uiTouchInBackArea(const TouchPoint &t) {
 void uiDrawButton(const Btn &b) {
   if (themeIsVice()) {
     int r = b.h / 2; if (r > 10) r = 10; if (r < 3) r = 3;
-    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, TH_BTN_FILL);
-    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, TH_BTN_EDGE);
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, accentFill());
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, accentEdge());
     if (b.w > 4 && b.h > 4)
-      tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, TH_BTN_EDGE);
-    tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, TH_BTN_BEVEL);
+      tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, accentEdge());
+    tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, accentBevel());
 
     // Label starts at the global cap (UI_MENU_BTN_MAXSIZE, see ui.h) and
     // steps down until it fits -- one knob for button text size app-wide.
@@ -400,7 +409,7 @@ void uiDrawButton(const Btn &b) {
     tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
     int tx = b.x + (b.w - (int)bw) / 2 - bx;
     int ty = b.y + (b.h - (int)bh) / 2 - by;
-    tft.setTextColor(TH_BTN_EMBOSS);
+    tft.setTextColor(accentEmboss());
     tft.setCursor(tx - 1, ty - 1); tft.print(b.label);
     tft.setTextColor(TH_BTN_TEXT);
     tft.setCursor(tx, ty);         tft.print(b.label);
@@ -411,8 +420,8 @@ void uiDrawButton(const Btn &b) {
   tft.setTextSize(1);
   int16_t bx, by; uint16_t bw, bh;
   tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
-  tft.drawRect(b.x, b.y, b.w, b.h, ILI9341_WHITE);
-  tft.setTextColor(ILI9341_WHITE);
+  tft.drawRect(b.x, b.y, b.w, b.h, accentLabel());   // universal -- was a fixed white border/text
+  tft.setTextColor(accentLabel());
   tft.setCursor(b.x + (b.w - (int)bw) / 2, b.y + (b.h - (int)bh) / 2);
   tft.print(b.label);
 }
@@ -463,6 +472,73 @@ void uiDrawActionRow(Btn *btns, int count) {
   }
 }
 
+void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn) {
+  prevBtn = {8, y, 60, UI_PAGER_H, "< prev"};
+  nextBtn = {tft.width() - 68, y, 60, UI_PAGER_H, "next >"};
+  if (page > 0)          uiDrawButton(prevBtn);    else uiDrawButtonDim(prevBtn);
+  if (page < pages - 1)  uiDrawButton(nextBtn);    else uiDrawButtonDim(nextBtn);
+  tft.setTextColor(ILI9341_WHITE);
+  char pg[16];
+  snprintf(pg, sizeof(pg), "%d / %d", page + 1, pages);
+  int16_t bx, by; uint16_t bw, bh;
+  tft.setTextSize(1);
+  tft.getTextBounds(pg, 0, 0, &bx, &by, &bw, &bh);
+  tft.setCursor((tft.width() - (int)bw) / 2, y + (UI_PAGER_H - (int)bh) / 2 - by);
+  tft.print(pg);
+}
+
+int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current) {
+  if (count <= 0) return current;
+  const int MAX_ROWS = 10;
+  const int y0 = 34, rowH = 30, gap = 4, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
+  // Room is always reserved for the pager row -- see uiDrawPager()'s
+  // comment on why it's drawn even at one page, rather than the layout
+  // changing shape depending on whether paging is actually needed.
+  int maxRows = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0) / (rowH + gap);
+  if (maxRows < 1) maxRows = 1;
+  if (maxRows > MAX_ROWS) maxRows = MAX_ROWS;
+  if (maxRows > count) maxRows = count;
+  int pages = (count + maxRows - 1) / maxRows;
+  int page = (current >= 0 && current < count) ? current / maxRows : 0;
+  const int pagerY = y0 + maxRows * (rowH + gap) - gap + pagerGap;
+
+  Btn items[MAX_ROWS], prevBtn, nextBtn;
+  int n = 0;   // rows actually drawn on the current page -- read back in the touch loop below
+  auto draw = [&]() {
+    uiDrawTopBar(title);
+    uiClearBelow(29);
+    int base = page * maxRows;
+    n = min(maxRows, count - base);
+    int y = y0;
+    for (int i = 0; i < n; i++) {
+      int idx = base + i;
+      items[i] = {8, y, tft.width() - 16, rowH, itemLabel(idx)};
+      uiDrawButton(items[i]);
+      if (idx == current)
+        tft.drawRect(items[i].x - 3, items[i].y - 3, items[i].w + 6, items[i].h + 6, ILI9341_GREEN);
+      y += rowH + gap;
+    }
+    uiDrawPager(pagerY, page, pages, prevBtn, nextBtn);
+  };
+  draw();
+
+  for (;;) {
+    TouchPoint t = uiReadTouch();
+    uiServiceChrome();
+    if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return current; }
+    int base = page * maxRows;
+    for (int i = 0; i < n; i++) {
+      if (uiTouchInButton(t, items[i])) {
+        uiWaitForRelease();
+        return base + i;   // tap = select AND close, dropdown-style
+      }
+    }
+    if (uiTouchInButton(t, prevBtn) && page > 0) { uiWaitForRelease(); page--; draw(); continue; }
+    if (uiTouchInButton(t, nextBtn) && page < pages - 1) { uiWaitForRelease(); page++; draw(); continue; }
+    delay(15);
+  }
+}
+
 bool uiTouchInButton(const TouchPoint &t, const Btn &b) {
   // isNewPress, not pressed -- a held touch must not keep re-triggering
   // this button/screen change on every poll. See TouchPoint's comment in
@@ -470,36 +546,143 @@ bool uiTouchInButton(const TouchPoint &t, const Btn &b) {
   return t.isNewPress && t.x >= b.x && t.x < b.x + b.w && t.y >= b.y && t.y < b.y + b.h;
 }
 
-void uiToast(const char *msg) {
-  // Live inside the status bar, but leave its 1px white top rule intact.
+// --- toast (status-bar message), with a step-scroll ticker for anything
+// too long to fit -----------------------------------------------------
+// A message longer than the reserved width used to just run straight
+// under the clock/battery corner (Adafruit_GFX's print() doesn't clip to
+// any rect on its own). Now the widest thing ever handed to tft.print()
+// here is a substring already sliced to fit -- whether that's the whole
+// message (short enough) or one CHARACTER-stepped window of a longer one
+// -- so it can't bleed into that corner either way. Stepping by whole
+// characters (not pixels) means no per-pixel clipping/canvas trick is
+// needed at all, which matters on this MCU: a smooth pixel scroll would
+// need an offscreen canvas blitted pixel-by-pixel over SPI every ~30ms,
+// competing for CPU/SPI time with whatever scan the active screen is
+// running. A few characters advancing a few times a second still reads
+// unmistakably as a ticker.
+static String   s_toastMsg;
+static bool     s_toastScrolling = false;
+static int      s_toastCharsFit = 0;
+static int      s_toastOffset = 0;
+static uint32_t s_toastLastStep = 0;
+static const uint32_t TOAST_STEP_MS = 350;
+static const char *TOAST_LOOP_GAP = "     ";   // separates the end from the restart
+
+static void toastDrawWindow(const String &window) {
   int y = tft.height() - UI_STATUSBAR_H + 1;
-  // Right edge is short -- the bottom-right corner carries the clock-sync
-  // dot (uiDrawSyncIndicator) and the battery glyph (uiDrawBatteryIndicator)
-  // on every screen. Without this the toast text runs under them.
-  int w = tft.width() - 78;
+  int w = tft.width() - UI_RIGHTZONE_W;   // clock (uiDrawClock) + battery glyph live past here
   tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
   tft.setTextWrap(false);
   tft.setTextColor(ILI9341_YELLOW);
   tft.setTextSize(1);
   tft.setCursor(4, y + 3);
-  tft.print(msg);
+  tft.print(window);
+}
+
+void uiToast(const char *msg) {
+  int w = tft.width() - UI_RIGHTZONE_W;
+  s_toastMsg = msg;
+  s_toastCharsFit = (w - 4) / 6;   // default font: 6px advance/char at text size 1
+  if (s_toastCharsFit < 1) s_toastCharsFit = 1;
+
+  if ((int)s_toastMsg.length() <= s_toastCharsFit) {
+    s_toastScrolling = false;
+    toastDrawWindow(s_toastMsg);
+  } else {
+    s_toastScrolling = true;
+    s_toastOffset = 0;
+    s_toastLastStep = millis();
+    toastDrawWindow(s_toastMsg.substring(0, s_toastCharsFit));
+  }
+}
+
+void uiClearToast() {
+  // The ticker (uiTickToast(), via uiServiceChrome()) runs from the main
+  // loop() regardless of which screen is active -- without this, a
+  // message from a screen you've LEFT keeps redrawing itself over
+  // whatever the next screen puts in the status bar, forever, since
+  // nothing else ever tells it to stop.
+  s_toastScrolling = false;
+  s_toastMsg = "";
+  int y = tft.height() - UI_STATUSBAR_H + 1;
+  int w = tft.width() - UI_RIGHTZONE_W;
+  tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
+}
+
+// Advances the status-bar ticker, if the last uiToast() message was too
+// long to fit -- called every loop() tick via uiServiceChrome(), self-
+// throttled to TOAST_STEP_MS so it reads as a marquee, not a flicker.
+static void uiTickToast() {
+  if (!s_toastScrolling) return;
+  uint32_t now = millis();
+  if (now - s_toastLastStep < TOAST_STEP_MS) return;
+  s_toastLastStep = now;
+
+  String loopMsg = s_toastMsg + TOAST_LOOP_GAP;
+  int total = loopMsg.length();
+  s_toastOffset = (s_toastOffset + 1) % total;
+
+  String window;
+  for (int i = 0; i < s_toastCharsFit; i++) window += loopMsg[(s_toastOffset + i) % total];
+  toastDrawWindow(window);
 }
 
 // Manually-computed RGB565 -- Adafruit_ILI9341's color set has no BROWN.
+// (Used by battStatusColor()'s low-battery pulse, below.)
 static const uint16_t UI_BROWN = 0xA145;
 
-void uiDrawSyncIndicator() {
-  // Sits just left of the battery glyph (uiDrawBatteryIndicator), which
-  // occupies roughly the rightmost 55px of the bottom edge.
-  const int cx = tft.width() - 64, cy = tft.height() - 10, r = 5;
-  if (devTimeSynced()) {
-    tft.fillRect(cx - r - 1, cy - r - 1, 2 * r + 3, 2 * r + 3, ILI9341_BLACK);
-    return;
+// Same palette uiDrawBatteryIndicator() colors its glyph/label with -- one
+// place, so the clock next to it (uiDrawClock, below) always matches it
+// exactly instead of picking its own colors. The charge-state warning
+// colors (low-battery pulse, mid-range yellow, USB grey) stay fixed --
+// they're a functional signal, not branding, and a pulsing "danger" red
+// swapped for whatever the user's accent happens to be would defeat the
+// point. "All is well" (>=40%, off USB) is the exception: that's most of
+// a device's life, so THAT'S the one state tied to the accent -- the
+// clock/battery corner reads in the user's chosen color most of the time.
+static uint16_t battStatusColor() {
+  if (s_batPct < 0) return ILI9341_DARKGREY;              // USB / never read yet
+  if (s_batPct < 15) {                                     // low: pulse through these
+    static const uint16_t cyc[5] = {ILI9341_WHITE, ILI9341_YELLOW, ILI9341_ORANGE, UI_BROWN, ILI9341_RED};
+    uint32_t st = (millis() / 250) % 8;
+    return cyc[st <= 4 ? st : 8 - st];
   }
-  static const uint16_t colors[5] = {ILI9341_WHITE, ILI9341_YELLOW, ILI9341_ORANGE, UI_BROWN, ILI9341_RED};
-  uint32_t step = (millis() / 250) % 8;   // 0..7, ping-pongs across the 5 colors
-  int idx = step <= 4 ? step : 8 - step;
-  tft.fillCircle(cx, cy, r, colors[idx]);
+  if (s_batPct < 40) return ILI9341_YELLOW;
+  return accentFill();
+}
+
+void uiDrawClock() {
+  // Right-aligned, just left of the battery glyph (uiDrawBatteryIndicator),
+  // which occupies roughly the rightmost 55px of the bottom edge -- see
+  // UI_RIGHTZONE_W. Repainted every loop() tick like the battery glyph, but
+  // only actually redraws when the printed string changes (once a minute),
+  // same "cheap and idempotent" contract as uiDrawBatteryIndicator.
+  static char last[7] = "";
+  char buf[7] = "--:--";   // unsynced: no time to show yet
+  if (devTimeSynced()) {
+    time_t now = devTimeNow() + (time_t)tzOffsetMinutes() * 60;
+    struct tm t;
+    gmtime_r(&now, &t);   // `now` was already shifted by the tz offset above
+    if (tzUse24h()) {
+      snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    } else {
+      int h12 = t.tm_hour % 12;
+      if (h12 == 0) h12 = 12;
+      snprintf(buf, sizeof(buf), "%d:%02d%c", h12, t.tm_min, t.tm_hour < 12 ? 'a' : 'p');
+    }
+  }
+  if (!s_clockForce && strcmp(buf, last) == 0) return;
+  s_clockForce = false;
+  strcpy(last, buf);
+
+  const int rightEdge = tft.width() - 55 - 4;   // 4px gap before the battery label
+  const int textW = 6 * 6;                       // widest case, "12:34p", at text size 1
+  int x = rightEdge - textW, y = tft.height() - UI_STATUSBAR_H + 5;
+  tft.fillRect(x - 1, y - 1, textW + 2, 10, ILI9341_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(battStatusColor());   // same color as the battery glyph/label next to it
+  tft.setCursor(x, y);
+  tft.print(buf);
 }
 
 void uiShowLoading(const char *msg) {
@@ -806,13 +989,13 @@ static int battPct(int mv) {
 int uiBatteryPct() { return battPct(uiBatteryMv()); }
 
 static uint32_t s_batReadAt = 0, s_batPaintAt = 0;
-static int s_batMv = 0, s_batPct = -2;   // -2 = never read
+static int s_batMv = 0;                 // s_batPct itself lives up top -- see the comment there
 static int s_batSig = -9999;            // last-painted {pct, pulse-colour}
 
-// Bottom-right corner, rightmost. The clock-sync dot sits just to its left
-// (uiDrawSyncIndicator). Drawn from loop() every iteration like the sync
-// dot -- only the ADC read is throttled (5s); the ~50px repaint is cheap
-// and keeps the glyph alive after any screen's uiClearBelow().
+// Bottom-right corner, rightmost. The clock (uiDrawClock) sits just to its
+// left. Drawn from loop() every iteration like the clock -- only the ADC
+// read is throttled (5s); the ~50px repaint is cheap and keeps the glyph
+// alive after any screen's uiClearBelow().
 void uiDrawBatteryIndicator() {
   uint32_t now = millis();
   if (s_batPct == -2 || now - s_batReadAt > 5000) {
@@ -828,7 +1011,7 @@ void uiDrawBatteryIndicator() {
   if (s_batPct < 0)        col = ILI9341_DARKGREY;
   else if (low) { uint32_t st = (now / 250) % 8; cycIdx = st <= 4 ? st : 8 - st; col = cyc[cycIdx]; }
   else if (s_batPct < 40)  col = ILI9341_YELLOW;
-  else                     col = ILI9341_GREEN;
+  else                     col = accentFill();   // "all is well" -- tied to the accent, see battStatusColor()
 
   // Only repaint when the rendered content actually changes -- redrawing
   // every loop() strobed the icon. Force one on a screen change, and one
@@ -860,6 +1043,12 @@ void uiDrawBatteryIndicator() {
   int fw = (s_batPct >= 0) ? (bodyW - 4) * s_batPct / 100 : 0;
   tft.fillRect(bx + 2, by + 2, bodyW - 4, bodyH - 4, ILI9341_BLACK);   // interior
   if (fw > 0) tft.fillRect(bx + 2, by + 2, fw, bodyH - 4, col);        // charge bar
+}
+
+void uiServiceChrome() {
+  uiDrawClock();
+  uiDrawBatteryIndicator();
+  uiTickToast();
 }
 
 // --- numeric keypad ------------------------------------------------------
@@ -899,7 +1088,7 @@ String uiNumpadInput(const char *prompt, const String &initial) {
 
   uiClearBelow(0);
   tft.setTextWrap(false);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setTextSize(1);
   tft.setCursor(4, 4);
   tft.print(prompt);

@@ -29,6 +29,7 @@
 #include "pins.h"
 #include "pincfg.h"
 #include "sd_bus.h"
+#include "accent.h"
 
 // Constructed on first entry so it picks up any runtime CS / GDO0 override
 // (System > SPI / IRQ pins) rather than the compile-time default.
@@ -140,7 +141,7 @@ static void drawSweepChrome() {
   tft.setTextColor(ok ? ILI9341_WHITE : ILI9341_RED);
   tft.setCursor(4, LABEL_Y);
   tft.print(ok ? kBands[band].label : "CC1101 not responding");
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   int prevEnd = -100;
   for (int c = 0; c < NCENTERS; c++) {
     int s = stepForFreq(kCenters[c].mhz);
@@ -235,7 +236,7 @@ static void drawAnalyzer() {
   for (int c = 0; c < NCENTERS; c++) {
     int y = GRAPH_TOP + c * rowH;
     tft.fillRect(0, y, tft.width(), rowH - 1, ILI9341_BLACK);
-    tft.setTextColor(c == strongC ? ILI9341_RED : ILI9341_CYAN);
+    tft.setTextColor(c == strongC ? ILI9341_RED : accentLabel());
     tft.setCursor(2, y + (rowH - 8) / 2);
     tft.printf("%.2f", kCenters[c].mhz);
     int v  = constrain(cRssi[c], -110, -30);
@@ -281,7 +282,7 @@ static void drawRawChrome() {
   }
   tft.setTextColor(ILI9341_WHITE);
   tft.printf("OOK @ %.2f MHz   GDO0=GPIO%d", rawFreqMhz, gdoPin);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(4, LABEL_Y + 12);
   tft.print(rawHave ? "captured -- tap graph to save .sub" : "press capture and send a signal");
 }

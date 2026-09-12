@@ -56,9 +56,13 @@ enum { UI_BG_BLACK = 0, UI_BG_IMAGE = 1 };
 void uiSetBgMode(int mode);
 
 // Persistent bottom chrome: a solid black strip UI_STATUSBAR_H tall with a
-// 1px white rule along its top edge, holding the toast line, the clock-sync
-// dot and the battery glyph. Painted by uiClearBelow() and uiDrawTopBar().
+// 1px white rule along its top edge, holding the toast line, the clock and
+// the battery glyph. Painted by uiClearBelow() and uiDrawTopBar().
 static const int UI_STATUSBAR_H = 18;
+// Width reserved on the right of the status bar for the clock + battery
+// glyph (uiDrawClock, uiDrawBatteryIndicator) -- uiToast()'s text stops
+// here so it doesn't run under them.
+static const int UI_RIGHTZONE_W = 96;
 void uiDrawStatusBar();
 
 void uiDrawTopBar(const char *title);
@@ -95,8 +99,39 @@ static const int UI_CONTENT_Y = UI_ACTIONROW_Y + UI_ACTIONROW_H + 1;       // wi
 // are computed here and overwritten). Returns nothing -- read the same
 // array back for hit-testing (uiTouchInButton against btns[i]).
 void uiDrawActionRow(Btn *btns, int count);
+// The project's ONE paging control -- every paged list/grid screen uses
+// this, not its own prev/next buttons or a "tap the empty space" gesture.
+// Draws "< prev   N / M   next >" in one row at (x=8..width-8, y, h);
+// prevBtn/nextBtn come back dimmed (via uiDrawButtonDim()) at either end
+// when there's no previous/next page. The caller still does its own
+// touch handling on the two Btn outs, same shape every time:
+//   if (uiTouchInButton(t, prevBtn) && page > 0)         { ...; page--; }
+//   if (uiTouchInButton(t, nextBtn) && page < pages - 1) { ...; page++; }
+// Always draws (even at page 1/1, both ends dimmed) rather than hiding
+// itself for a single page -- keeps a paged screen's layout constant
+// instead of jumping around depending on item count.
+static const int UI_PAGER_H = 26;
+void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn);
+// Pull-down-menu picker: opens a full list of `count` text options
+// (itemLabel(i) supplies each one) below the top bar, paged if it doesn't
+// fit; tapping a row selects it and returns immediately (no separate
+// Apply step -- that's the caller's business if it wants one). Back
+// cancels and returns `current` unchanged. Services the clock/battery
+// corner itself each frame (see uiServiceChrome()) so it's safe to call
+// from any screen without that corner going dark for as long as the list
+// is open. For a plain text list -- something that wants to preview a
+// COLOR per row (a swatch) needs its own picker; see
+// system_screen.cpp's Accent Color picker for that shape.
+int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current);
 void uiToast(const char *msg);   // one-line status text at the bottom of the screen (leaves
-                                 // room on the right for uiDrawSyncIndicator(), see below)
+                                 // room on the right for uiDrawClock(), see below) -- character-
+                                 // steps a ticker (see uiServiceChrome()) if it's too long to fit
+// Stops the ticker and blanks the toast area. MUST be called on every
+// screen exit -- see exitScreen() in the .ino, the one place this is
+// wired in -- or a message from a screen you've left keeps redrawing
+// itself indefinitely (uiTickToast() runs off the main loop(), not tied
+// to any particular screen).
+void uiClearToast();
 // Full-screen modal numeric keypad -- a stripped-down cousin of
 // uiTextInput() (keyboard.cpp) with no letters/layers: a 3x4 grid of big
 // digit keys plus '.', backspace, Cancel and OK, sized for fat-finger taps
@@ -106,11 +141,12 @@ void uiToast(const char *msg);   // one-line status text at the bottom of the sc
 // uiTextInput(). Validation is loose (one '.' max, 20 chars); the caller
 // validates the actual value.
 String uiNumpadInput(const char *prompt, const String &initial = "");
-// Small bottom-right icon, drawn on every screen from the main loop
-// (independent of whatever screen is active): a clock-sync status light.
-// Blank/cleared when devtime.h has a synced clock; when unsynced, cycles
-// white/yellow/orange/brown/red back and forth, 250ms per step.
-void uiDrawSyncIndicator();
+// Small bottom-right clock, drawn on every screen from the main loop
+// (independent of whatever screen is active). Shows "HH:MM" local time
+// (devtime.h's UTC clock shifted by the tz.h offset) once devtime.h has a
+// synced clock; shows "--:--" (dimmed) before that -- no separate
+// "unsynced" indicator, the dashes ARE the indicator.
+void uiDrawClock();
 // Clears the content area (below the top bar) and shows a one-line yellow
 // status message. Call this before any blocking radio/SD init or scan a
 // screen's Enter() does, so there's visible feedback instead of a stale or
@@ -181,8 +217,15 @@ int   uiBatteryRawMv();              // before the cal factor
 float uiBatteryCal();               // current factor (default 1.0)
 void  uiBatterySetCal(float k);     // clamped 0.5..2.0, persisted
 void  uiBatterySetCalFromActual(int actualMv);   // factor = actualMv / rawMv
-// Battery glyph + % in the bottom-right corner (left of it: the clock-sync
-// dot). Call every loop()
-// iteration (self-throttled); pulses colours like the clock-sync dot when
-// below 15%. uiDrawTopBar() forces a repaint on a screen change.
+// Battery glyph + % in the bottom-right corner (left of it: the clock,
+// uiDrawClock()). Call every loop() iteration (self-throttled); pulses
+// colours when below 15%. uiDrawTopBar() forces a repaint on a screen
+// change.
 void uiDrawBatteryIndicator();
+// The clock, the battery glyph, and the toast ticker's next scroll step
+// (see uiToast()) -- one call. main loop() calls this every iteration
+// (see the .ino); any OTHER blocking touch-poll loop (a settings
+// sub-page, a modal wait) needs to call this itself once per iteration,
+// or all three just go dark/stop scrolling for as long as that loop owns
+// the CPU -- they're normally only alive because loop() keeps running.
+void uiServiceChrome();

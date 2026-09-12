@@ -43,6 +43,7 @@
 #include "wifi_ids.h"
 #include "wlog.h"
 #include "rogue_ap.h"
+#include "devtime.h"
 
 // ---- window ------------------------------------------------------------
 //
@@ -344,9 +345,9 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
       snprintf(line, sizeof line, "%02lu:%02lu PWNAGOTCHI %.8s", el / 60, el % 60, nm);
       alogPush(line);
       if (wlogIsOpen()) {
-        char wl[96];
-        snprintf(wl, sizeof wl, "%lu,%d,pwnagotchi,watch,%s %ddBm",
-                 (unsigned long)millis(), f.channel, nm, f.rssi);
+        char wl[112];
+        snprintf(wl, sizeof wl, "%s,%d,pwnagotchi,watch,%s %ddBm",
+                 devTimeNowString().c_str(), f.channel, nm, f.rssi);
         wlogRow(wl); wlogFlush();
       }
     }
@@ -379,9 +380,9 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
                el / 60, el % 60, rogueKindTag(rk), es);
       alogPush(line);
       if (wlogIsOpen()) {
-        char wl[96];
-        snprintf(wl, sizeof wl, "%lu,%d,rogue,%s,%s %02X%02X%02X ch%u %ddBm",
-                 (unsigned long)millis(), f.channel, rogueKindTag(rk), es,
+        char wl[112];
+        snprintf(wl, sizeof wl, "%s,%d,rogue,%s,%s %02X%02X%02X ch%u %ddBm",
+                 devTimeNowString().c_str(), f.channel, rogueKindTag(rk), es,
                  f.addr3[3], f.addr3[4], f.addr3[5], f.channel, f.rssi);
         wlogRow(wl);
         wlogFlush();
@@ -424,10 +425,10 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
           snprintf(line, sizeof line, "%02lu:%02lu EVIL-TWIN? %.9s", el / 60, el % 60, es);
           alogPush(line);
           if (wlogIsOpen()) {
-            char wl[96];
+            char wl[112];
             snprintf(wl, sizeof wl,
-                     "%lu,%d,eviltwin,alert,%s %02X%02X%02X vs %02X%02X%02X sc%d",
-                     (unsigned long)millis(), f.channel, es,
+                     "%s,%d,eviltwin,alert,%s %02X%02X%02X vs %02X%02X%02X sc%d",
+                     devTimeNowString().c_str(), f.channel, es,
                      b[3], b[4], b[5], aps[i].bssid[3], aps[i].bssid[4], aps[i].bssid[5], score);
             wlogRow(wl); wlogFlush();
           }
@@ -577,9 +578,9 @@ static void wlogVerdictEdges(uint8_t pd, uint8_t pb, uint8_t pa) {
   bool wrote = false;
   for (int i = 0; i < 3; i++) {
     if (d[i].now == d[i].prev) continue;
-    char line[80];
-    snprintf(line, sizeof(line), "%lu,%d,%s,%s,%u/%u",
-             (unsigned long)millis(), wifiIdsChannel(), d[i].name,
+    char line[96];
+    snprintf(line, sizeof(line), "%s,%d,%s,%s,%u/%u",
+             devTimeNowString().c_str(), wifiIdsChannel(), d[i].name,
              sevTag(d[i].now), d[i].a, d[i].b);
     wlogRow(line);
     wrote = true;
@@ -753,7 +754,7 @@ void widsEnter() {
   lastWlogSummary = millis();
   running = true;
 
-  wlogOpen("wifiids", "millis,channel,detector,severity,detail");   // event rows only
+  wlogOpen("wifiids", "utc,channel,detector,severity,detail");   // event rows only
 
   drawStats();
   drawBanner();
@@ -785,9 +786,9 @@ void widsLoop() {
     uint8_t worst = vD.sev;
     if (vB.sev > worst) worst = vB.sev;
     if (vA.sev > worst) worst = vA.sev;
-    char line[96];
-    snprintf(line, sizeof(line), "%lu,%d,summary,%s,d%u/b%u/a%u",
-             (unsigned long)millis(), wifiIdsChannel(), sevTag(worst),
+    char line[112];
+    snprintf(line, sizeof(line), "%s,%d,summary,%s,d%u/b%u/a%u",
+             devTimeNowString().c_str(), wifiIdsChannel(), sevTag(worst),
              (unsigned)(vD.a + vD.b), vB.a, vA.a);
     wlogRow(line);
     wlogFlush();

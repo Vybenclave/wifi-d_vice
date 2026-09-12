@@ -5,6 +5,7 @@
 #include <BLEUtils.h>
 #include <esp_gap_ble_api.h>
 #include "ui.h"
+#include "accent.h"
 
 static volatile bool bonded = false;
 static volatile bool passkeyPending = false;
@@ -31,7 +32,7 @@ static void drawPasskey(uint32_t pass_key) {
   tft.setCursor(10, 88);
   tft.print("pairing prompt:");
   tft.setTextSize(4);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(50, 130);
   tft.printf("%06lu", (unsigned long)pass_key);
 }

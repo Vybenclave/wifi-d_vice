@@ -57,6 +57,16 @@ void devTimeSetEpoch(uint32_t epoch, const char *source) {
   syncSource = (source && *source) ? source : "ext";
 }
 
+void devTimeSyncFromGps(uint32_t epoch) {
+  if (epoch < 1704067200UL || epoch > 4102444800UL) return;  // 2024-01-01 .. 2100
+  struct timeval tv;
+  tv.tv_sec = (time_t)epoch;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  synced = true;
+  syncSource = "gps";
+}
+
 void devTimeSetFromCTS(uint16_t year, uint8_t month, uint8_t day, uint8_t hh, uint8_t mm, uint8_t ss) {
   struct tm tmv = {};
   tmv.tm_year = year - 1900;

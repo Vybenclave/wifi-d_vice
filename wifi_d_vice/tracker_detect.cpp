@@ -18,6 +18,8 @@
 #include <string.h>
 #include "ui.h"
 #include "wlog.h"
+#include "devtime.h"
+#include "accent.h"
 
 enum { TK_FINDMY = 0, TK_SMARTTAG, TK_TILE, TK_CHIPOLO, TK_FMDN, TK_UNKNOWN, TK_N };
 static const char *KIND_NAME[TK_N] = { "AirTag/FindMy", "SmartTag", "Tile", "Chipolo", "Google FMDN", "Tracker?" };
@@ -160,9 +162,9 @@ static void trackerLogEdges() {
   for (int k = 0; k < TK_N; k++) {
     bool act = classActive(k);
     if (act && !tkSeenLogged[k]) {
-      char line[96];
-      snprintf(line, sizeof(line), "%lu,seen,%s,%d,%u",
-               (unsigned long)millis(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
+      char line[112];
+      snprintf(line, sizeof(line), "%s,seen,%s,%d,%u",
+               devTimeNowString().c_str(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
       wlogRow(line); wrote = true;
       tkSeenLogged[k] = true;
     } else if (!act) {
@@ -171,9 +173,9 @@ static void trackerLogEdges() {
 
     bool foll = classFollow(k);
     if (foll && !tkFollowLogged[k]) {
-      char line[96];
-      snprintf(line, sizeof(line), "%lu,follow,%s,%d,%u",
-               (unsigned long)millis(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
+      char line[112];
+      snprintf(line, sizeof(line), "%s,follow,%s,%d,%u",
+               devTimeNowString().c_str(), KIND_NAME[k], cs[k].rssiSmooth, cs[k].macN);
       wlogRow(line); wrote = true;
       tkFollowLogged[k] = true;
     } else if (!foll) {
@@ -242,7 +244,7 @@ static void drawListRows() {
     tft.setCursor(8, y + 2);
     tft.print(KIND_NAME[k]);
     tft.setTextSize(1);
-    tft.setTextColor(foll ? ILI9341_RED : ILI9341_CYAN);
+    tft.setTextColor(foll ? ILI9341_RED : accentLabel());
     uint32_t d = (millis() - c.firstSeen) / 1000;
     tft.setCursor(8, y + 19);
     tft.printf("%ddBm  %lum%02lus  %dmac%s", c.rssiSmooth, (unsigned long)(d / 60),
@@ -266,7 +268,7 @@ static void drawLocateChrome() {
   uiDrawActionRow(r, 1);
   backRow = r[0];
   tft.setTextSize(2);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(6, UI_CONTENT_Y + 6);
   tft.print(KIND_NAME[locKind]);
   tft.drawRect(4, UI_CONTENT_Y + 74, tft.width() - 8, 24, ILI9341_WHITE);
@@ -284,7 +286,7 @@ static void updateLocate() {
 
   tft.fillRect(4, UI_CONTENT_Y + 34, tft.width() - 8, 34, ILI9341_BLACK);
   tft.setTextSize(3);
-  tft.setTextColor(rssi > -127 ? ILI9341_CYAN : ILI9341_DARKGREY);
+  tft.setTextColor(rssi > -127 ? accentLabel() : ILI9341_DARKGREY);
   tft.setCursor(6, UI_CONTENT_Y + 34);
   if (rssi > -127) tft.printf("%4d dBm", rssi); else tft.print(" -- lost");
 
@@ -302,7 +304,7 @@ void trackerEnter() {
   memset(live, 0, sizeof(live));
   memset(tkSeenLogged, 0, sizeof(tkSeenLogged));
   memset(tkFollowLogged, 0, sizeof(tkFollowLogged));
-  wlogOpen("tracker", "millis,event,class,rssi,macs");   // event rows only; ok if SD absent
+  wlogOpen("tracker", "utc,event,class,rssi,macs");   // event rows only; ok if SD absent
   uiShowLoading("Listening...");
   if (!pScan) {
     WiFi.disconnect(true, false);   // radio coexistence -- see README

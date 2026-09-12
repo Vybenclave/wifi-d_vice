@@ -5,6 +5,8 @@
 #include "mac_vendor.h"
 #include "wlog.h"
 #include "known_signatures.h"
+#include "devtime.h"
+#include "accent.h"
 
 enum SubMode { LIST, DETAIL, LOCATE };
 static SubMode subMode = LIST;
@@ -91,9 +93,9 @@ static void doScan() {
       BLEAdvertisedDevice d = results->getDevice(i);
       uint8_t mac[6];
       memcpy(mac, d.getAddress().getNative(), 6);
-      char line[176];
-      snprintf(line, sizeof(line), "%lu,%s,%s,%s,%d",
-               (unsigned long)millis(),
+      char line[192];
+      snprintf(line, sizeof(line), "%s,%s,%s,%s,%d",
+               devTimeNowString().c_str(),
                d.haveName() ? d.getName().c_str() : "(no name)",
                d.getAddress().toString().c_str(),
                macVendorTag(mac).c_str(), d.getRSSI());
@@ -128,7 +130,7 @@ static void drawRows() {
     snprintf(nm, sizeof(nm), "%-13.13s", rows[i].name.c_str());
     tft.print(nm);
     tft.setTextSize(1);
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(accentLabel());
     tft.setCursor(4 + 13 * 12 + 4, y + 5);
     if (cls != BC_NONE) tft.printf("%-7s %ddBm", bleClassLabel(cls), rows[i].rssi);
     else                tft.printf("%s %ddBm", macVendorTag(rows[i].mac).c_str(), rows[i].rssi);
@@ -151,17 +153,23 @@ static void drawRows() {
 }
 
 static void drawDetail() {
-  uiClearBelow(29);
+  // Action row, not a bottom-pinned footer -- matches drawLocateChrome()
+  // below (and the UI rule in ui.h). This used to sit at tft.height()-44,
+  // stranded far below this short 4-line info block on a tall screen --
+  // looked like the button had "fallen" to the bottom of the screen.
+  uiClearBelow(UI_ACTIONROW_Y);
+  Btn row[1] = {{0, 0, 0, 0, "Track"}};
+  uiDrawActionRow(row, 1);
+  trackBtn = row[0];
+
   const BleRow &r = rows[selected];
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(4, 34);  tft.printf("Name: %s", r.name.c_str());
-  tft.setCursor(4, 50);  tft.printf("MAC:  %s", r.macStr.c_str());
-  tft.setCursor(4, 66);  tft.printf("Vendor: %s", macVendorTag(r.mac).c_str());
-  tft.setCursor(4, 82);  tft.printf("RSSI: %d dBm", r.rssi);
-
-  trackBtn = {4, tft.height() - 44, tft.width() - 8, 36, "Track"};
-  uiDrawMenuButton(trackBtn);
+  tft.setTextColor(accentLabel());
+  int y = UI_CONTENT_Y + 4;
+  tft.setCursor(4, y);  tft.printf("Name: %s", r.name.c_str());               y += 16;
+  tft.setCursor(4, y);  tft.printf("MAC:  %s", r.macStr.c_str());             y += 16;
+  tft.setCursor(4, y);  tft.printf("Vendor: %s", macVendorTag(r.mac).c_str()); y += 16;
+  tft.setCursor(4, y);  tft.printf("RSSI: %d dBm", r.rssi);
 }
 
 static void drawLocateChrome() {
@@ -169,7 +177,7 @@ static void drawLocateChrome() {
   Btn row[1] = {{0,0,0,0, muted ? "unmute" : "mute"}};
   uiDrawActionRow(row, 1);
   muteBtn = row[0];
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setTextSize(2);
   tft.setCursor(4, UI_CONTENT_Y + 6);
   tft.print(rows[selected].name);
@@ -194,7 +202,7 @@ static void updateLocate() {
   if (rssi != lastRssiShown) {
     lastRssiShown = rssi;
     tft.fillRect(4, UI_CONTENT_Y + 36, tft.width() - 8, 34, ILI9341_BLACK);
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(accentLabel());
     tft.setTextSize(3);
     tft.setCursor(4, UI_CONTENT_Y + 36);
     tft.printf("%4d dBm", rssi);
@@ -246,7 +254,7 @@ void bleScanTouch(const TouchPoint &t) {
     if (!t.isNewPress) return;   // manual bounds check below, not uiTouchInButton() -- needs its own edge guard
     if (uiTouchInButton(t, logBtn)) {
       if (!logging) {
-        logging = wlogOpen("blescan", "millis,name,mac,vendor,rssi");
+        logging = wlogOpen("blescan", "utc,name,mac,vendor,rssi");
       } else {
         logging = false;
         wlogClose();

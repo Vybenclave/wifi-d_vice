@@ -8,6 +8,7 @@
 #include <Adafruit_GFX.h>   // GFXcanvas16 -- off-screen graph buffer
 #include "ui.h"
 #include "screens.h"
+#include "accent.h"
 
 // "Net stats" -- reached from WiFi > Net stats. An internal three-item menu:
 //
@@ -211,7 +212,7 @@ static void drawLegend() {
 static void drawCaption(const char *cap) {
   tft.fillRect(0, UI_CONTENT_Y, tft.width() - 84, gY - UI_CONTENT_Y, ILI9341_BLACK);
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setCursor(4, UI_CONTENT_Y + 2);
   tft.print(cap);
 }
@@ -820,7 +821,7 @@ static void drawConnCard() {
     y += 12;
   };
   auto hdr = [&](const char *h) {
-    tft.setTextColor(ILI9341_CYAN); tft.setCursor(4, y); tft.print(h);
+    tft.setTextColor(accentLabel()); tft.setCursor(4, y); tft.print(h);
     y += 12;
   };
   // Wrapping row: the ASN / org string ("AS7922 Comcast Cable

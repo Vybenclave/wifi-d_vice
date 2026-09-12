@@ -10,6 +10,7 @@
 #include "ui.h"
 #include "screens.h"
 #include "rogue_ap.h"
+#include "accent.h"
 
 enum RView { RV_VIEW, RV_LEARN, RV_DONE };
 static RView    view = RV_VIEW;
@@ -54,7 +55,7 @@ static void drawView() {
   tft.fillRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y, ILI9341_BLACK);
   tft.setTextSize(1);
 
-  tft.setTextColor(rogueApLoaded() ? ILI9341_CYAN : ILI9341_YELLOW);
+  tft.setTextColor(rogueApLoaded() ? accentLabel() : ILI9341_YELLOW);
   tft.setCursor(4, UI_CONTENT_Y);
   if (rogueApLoaded())
     tft.printf("baseline: %d nets  --  Learn to redo", rogueApCount());

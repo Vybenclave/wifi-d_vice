@@ -8,6 +8,7 @@
 #include "engstore.h"
 #include "wlog.h"
 #include "wifiauto.h"
+#include "accent.h"
 
 // Set when the user taps a shortcut on the post-connect screen; the main
 // loop drains it via wifiScanTakePendingJump() and switches screens.
@@ -81,9 +82,9 @@ static void harvestListScan(int n) {
   // then a single flush for the batch.
   if (logging) {
     for (int i = 0; i < n; i++) {
-      char line[200];
-      snprintf(line, sizeof(line), "%lu,%s,%s,%d,%d,%s",
-               (unsigned long)millis(), WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(),
+      char line[220];
+      snprintf(line, sizeof(line), "%s,%s,%s,%d,%d,%s",
+               devTimeNowString().c_str(), WiFi.SSID(i).c_str(), WiFi.BSSIDstr(i).c_str(),
                (int)WiFi.RSSI(i), (int)WiFi.channel(i), encName(WiFi.encryptionType(i)));
       wlogRow(line);
     }
@@ -113,7 +114,7 @@ static void drawList() {
     snprintf(nm, sizeof(nm), "%-13.13s", rows[i].ssid.c_str());
     tft.print(nm);
     tft.setTextSize(1);
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(accentLabel());
     tft.setCursor(4 + 13 * 12 + 4, y + 5);
     tft.printf("c%-3d %ddBm", rows[i].channel, rows[i].rssi);
     y += LIST_STEP;
@@ -122,31 +123,37 @@ static void drawList() {
 }
 
 static void drawDetail() {
-  uiClearBelow(29);
+  // Action row, not a bottom-pinned footer -- matches drawList() and
+  // drawLocateChrome() in this same file (and the UI rule in ui.h: a
+  // per-screen button belongs in the action row, not floating wherever).
+  // This used to sit at tft.height()-44, which put it right under a short
+  // 5-line info block on a short (landscape) screen but stranded it far
+  // below a big empty gap in portrait -- looked like the button had
+  // "fallen" to the bottom of the screen.
+  uiClearBelow(UI_ACTIONROW_Y);
+  Btn row[2] = {{0, 0, 0, 0, "Connect"}, {0, 0, 0, 0, "Track"}};
+  uiDrawActionRow(row, 2);
+  connectBtn = row[0];
+  trackBtn   = row[1];
+
   const ApInfo &r = rows[selected];
   char macStr[18];
   snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
            r.bssid[0], r.bssid[1], r.bssid[2], r.bssid[3], r.bssid[4], r.bssid[5]);
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(4, 34);  tft.printf("SSID: %s", r.ssid.c_str());
-  tft.setCursor(4, 50);  tft.printf("BSSID: %s", macStr);
-  tft.setCursor(4, 66);  tft.printf("Vendor: %s", macVendorTag(r.bssid).c_str());
-  tft.setCursor(4, 82);  tft.printf("Channel: %d   Security: %s", r.channel, encName(r.enc));
-  tft.setCursor(4, 98);  tft.printf("RSSI: %d dBm", r.rssi);
+  tft.setTextColor(accentLabel());
+  int y = UI_CONTENT_Y + 4;
+  tft.setCursor(4, y);       tft.printf("SSID: %s", r.ssid.c_str());          y += 16;
+  tft.setCursor(4, y);       tft.printf("BSSID: %s", macStr);                 y += 16;
+  tft.setCursor(4, y);       tft.printf("Vendor: %s", macVendorTag(r.bssid).c_str()); y += 16;
+  tft.setCursor(4, y);       tft.printf("Channel: %d   Security: %s", r.channel, encName(r.enc)); y += 16;
+  tft.setCursor(4, y);       tft.printf("RSSI: %d dBm", r.rssi);              y += 18;
 
   if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == r.ssid) {
     tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(4, 116);
+    tft.setCursor(4, y);
     tft.print("connected  "); tft.print(WiFi.localIP());
   }
-
-  int by = tft.height() - 44;
-  int halfW = (tft.width() - 12) / 2;
-  connectBtn = {4, by, halfW, 36, "Connect"};
-  trackBtn   = {8 + halfW, by, tft.width() - 12 - halfW, 36, "Track"};
-  uiDrawMenuButton(connectBtn);
-  uiDrawMenuButton(trackBtn);
 }
 
 // Blocking join flow (modal, like the on-screen keyboard it calls): prompt
@@ -286,7 +293,7 @@ static void drawLocateChrome() {
   Btn row[1] = {{0,0,0,0, muted ? "unmute" : "mute"}};
   uiDrawActionRow(row, 1);
   muteBtn = row[0];
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(accentLabel());
   tft.setTextSize(2);
   tft.setCursor(4, UI_CONTENT_Y + 6);
   tft.print(rows[selected].ssid);
@@ -298,7 +305,7 @@ static void applyLocateReading(int rssi) {
   if (rssi != lastRssiShown) {
     lastRssiShown = rssi;
     tft.fillRect(4, UI_CONTENT_Y + 36, tft.width() - 8, 34, ILI9341_BLACK);
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(accentLabel());
     tft.setTextSize(3);
     tft.setCursor(4, UI_CONTENT_Y + 36);
     tft.printf("%4d dBm", rssi);
@@ -366,7 +373,7 @@ void wifiScanTouch(const TouchPoint &t) {
     if (!t.isNewPress) return;   // manual bounds check below, not uiTouchInButton() -- needs its own edge guard
     if (uiTouchInButton(t, logBtn)) {
       if (!logging) {
-        logging = wlogOpen("wifiscan", "millis,ssid,bssid,rssi,channel,security");
+        logging = wlogOpen("wifiscan", "utc,ssid,bssid,rssi,channel,security");
       } else {
         logging = false;
         wlogClose();
