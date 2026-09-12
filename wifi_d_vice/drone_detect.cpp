@@ -20,7 +20,7 @@
 #include <string.h>
 #include "ui.h"
 #include "wifi_ids.h"
-#include "theme.h"
+#include "accent.h"
 
 struct Drone {
   char    id[21];       // UAS ID / serial (ASCII, from a Basic ID message)
@@ -233,7 +233,7 @@ static void draw() {
     if (!dr[i].hits) continue;
     const Drone &d = dr[i];
     bool fresh = millis() - d.seen < 10000;
-    tft.setTextColor(fresh ? ILI9341_RED : thLabel());
+    tft.setTextColor(fresh ? ILI9341_RED : accentLabel());
     tft.setCursor(4, y);
     tft.printf("[%c] %-20.20s %ddBm x%u", d.src, d.id, d.rssi, d.hits);
     if (d.lat != 0 || d.lon != 0) {

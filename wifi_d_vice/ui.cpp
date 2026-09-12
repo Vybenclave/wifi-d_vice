@@ -8,6 +8,7 @@
 #include "devtime.h"
 #include "tz.h"
 #include "theme.h"
+#include "accent.h"
 #include "bg_landscape.h"   // BG_LANDSCAPE[19200]  160x120, upscaled x2
 #include "bg_portrait.h"    // BG_PORTRAIT[19200]   120x160
 
@@ -358,7 +359,7 @@ void uiClearBelow(int y0) {
 
 void uiDrawTopBar(const char *title) {
   s_bgMode = UI_BG_BLACK;   // opt-in per screen; default back to plain
-  tft.fillRect(0, 0, tft.width(), 28, themeIsVice() ? thTitleBar() : ILI9341_NAVY);
+  tft.fillRect(0, 0, tft.width(), 28, themeIsVice() ? accentTitleBar() : ILI9341_NAVY);
   tft.drawFastHLine(0, 28, tft.width(), ILI9341_WHITE);
   uiDrawStatusBar();
   uiDrawButton(kBackBtn);
@@ -389,11 +390,11 @@ bool uiTouchInBackArea(const TouchPoint &t) {
 void uiDrawButton(const Btn &b) {
   if (themeIsVice()) {
     int r = b.h / 2; if (r > 10) r = 10; if (r < 3) r = 3;
-    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, thBtnFill());
-    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, thBtnEdge());
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, accentFill());
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, accentEdge());
     if (b.w > 4 && b.h > 4)
-      tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, thBtnEdge());
-    tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, thBtnBevel());
+      tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, accentEdge());
+    tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, accentBevel());
 
     // Label starts at the global cap (UI_MENU_BTN_MAXSIZE, see ui.h) and
     // steps down until it fits -- one knob for button text size app-wide.
@@ -408,7 +409,7 @@ void uiDrawButton(const Btn &b) {
     tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
     int tx = b.x + (b.w - (int)bw) / 2 - bx;
     int ty = b.y + (b.h - (int)bh) / 2 - by;
-    tft.setTextColor(thBtnEmboss());
+    tft.setTextColor(accentEmboss());
     tft.setCursor(tx - 1, ty - 1); tft.print(b.label);
     tft.setTextColor(TH_BTN_TEXT);
     tft.setCursor(tx, ty);         tft.print(b.label);
@@ -468,6 +469,63 @@ void uiDrawActionRow(Btn *btns, int count) {
     btns[i].w = (i == count - 1) ? tft.width() - i * w : w;
     btns[i].h = UI_ACTIONROW_H;
     uiDrawMenuButton(btns[i]);
+  }
+}
+
+int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current) {
+  if (count <= 0) return current;
+  const int MAX_ROWS = 10;
+  const int y0 = 34, rowH = 30, gap = 4, bottomMargin = UI_STATUSBAR_H + 4;
+  int maxRows = (tft.height() - bottomMargin - y0) / (rowH + gap);
+  if (maxRows < 1) maxRows = 1;
+  if (maxRows > MAX_ROWS) maxRows = MAX_ROWS;
+  if (maxRows > count) maxRows = count;
+  int pages = (count + maxRows - 1) / maxRows;
+  int page = (current >= 0 && current < count) ? current / maxRows : 0;
+
+  Btn items[MAX_ROWS];
+  int n = 0;   // rows actually drawn on the current page -- read back in the touch loop below
+  auto draw = [&]() {
+    uiDrawTopBar(title);
+    uiClearBelow(29);
+    int base = page * maxRows;
+    n = min(maxRows, count - base);
+    int y = y0;
+    for (int i = 0; i < n; i++) {
+      int idx = base + i;
+      items[i] = {8, y, tft.width() - 16, rowH, itemLabel(idx)};
+      uiDrawButton(items[i]);
+      if (idx == current)
+        tft.drawRect(items[i].x - 3, items[i].y - 3, items[i].w + 6, items[i].h + 6, ILI9341_GREEN);
+      y += rowH + gap;
+    }
+    if (pages > 1) {
+      tft.setTextColor(ILI9341_WHITE);
+      char pg[24];
+      snprintf(pg, sizeof(pg), "page %d/%d -- tap to advance", page + 1, pages);
+      tft.setCursor(8, y + 2);
+      tft.print(pg);
+    }
+  };
+  draw();
+
+  for (;;) {
+    TouchPoint t = uiReadTouch();
+    uiServiceChrome();
+    if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return current; }
+    int base = page * maxRows;
+    for (int i = 0; i < n; i++) {
+      if (uiTouchInButton(t, items[i])) {
+        uiWaitForRelease();
+        return base + i;   // tap = select AND close, dropdown-style
+      }
+    }
+    if (t.isNewPress && pages > 1 && t.y > y0 + n * (rowH + gap)) {
+      uiWaitForRelease();
+      page = (page + 1) % pages;
+      draw();
+    }
+    delay(15);
   }
 }
 
@@ -905,6 +963,11 @@ void uiDrawBatteryIndicator() {
   if (fw > 0) tft.fillRect(bx + 2, by + 2, fw, bodyH - 4, col);        // charge bar
 }
 
+void uiServiceChrome() {
+  uiDrawClock();
+  uiDrawBatteryIndicator();
+}
+
 // --- numeric keypad ------------------------------------------------------
 // Deliberately NOT folded into keyboard.cpp's uiTextInput(): that grid is
 // all about letter layers + case + punctuation for Wi-Fi passphrases, none
@@ -942,7 +1005,7 @@ String uiNumpadInput(const char *prompt, const String &initial) {
 
   uiClearBelow(0);
   tft.setTextWrap(false);
-  tft.setTextColor(thLabel());
+  tft.setTextColor(accentLabel());
   tft.setTextSize(1);
   tft.setCursor(4, 4);
   tft.print(prompt);

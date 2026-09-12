@@ -11,7 +11,7 @@
 #include <WiFi.h>
 #include "ui.h"
 #include "known_signatures.h"
-#include "theme.h"
+#include "accent.h"
 
 struct Hit { char ssid[20]; uint8_t bssid[6]; const char *vendor; int rssi; uint8_t ch; };
 static const int MAX_HITS = 10;
@@ -76,7 +76,7 @@ static void drawList() {
     tft.setCursor(4, y);
     tft.printf("%-9s %02X%02X%02X ch%-2d %ddBm", hits[i].vendor,
                hits[i].bssid[3], hits[i].bssid[4], hits[i].bssid[5], hits[i].ch, hits[i].rssi);
-    tft.setTextColor(thLabel());
+    tft.setTextColor(accentLabel());
     tft.setCursor(12, y + 10);
     tft.printf("%-.24s", hits[i].ssid);
     y += 24;
@@ -96,7 +96,7 @@ static void drawLocateChrome() {
   tft.setCursor(6, UI_CONTENT_Y + 4);
   tft.printf("%s", hits[locIdx].vendor);
   tft.setTextSize(1);
-  tft.setTextColor(thLabel());
+  tft.setTextColor(accentLabel());
   tft.setCursor(6, UI_CONTENT_Y + 24);
   tft.printf("%02X%02X%02X  ch%d  %-.20s", hits[locIdx].bssid[3], hits[locIdx].bssid[4],
              hits[locIdx].bssid[5], hits[locIdx].ch, hits[locIdx].ssid);

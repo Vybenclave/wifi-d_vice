@@ -8,7 +8,7 @@
 #include "engstore.h"
 #include "wlog.h"
 #include "wifiauto.h"
-#include "theme.h"
+#include "accent.h"
 
 // Set when the user taps a shortcut on the post-connect screen; the main
 // loop drains it via wifiScanTakePendingJump() and switches screens.
@@ -114,7 +114,7 @@ static void drawList() {
     snprintf(nm, sizeof(nm), "%-13.13s", rows[i].ssid.c_str());
     tft.print(nm);
     tft.setTextSize(1);
-    tft.setTextColor(thLabel());
+    tft.setTextColor(accentLabel());
     tft.setCursor(4 + 13 * 12 + 4, y + 5);
     tft.printf("c%-3d %ddBm", rows[i].channel, rows[i].rssi);
     y += LIST_STEP;
@@ -141,7 +141,7 @@ static void drawDetail() {
   snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
            r.bssid[0], r.bssid[1], r.bssid[2], r.bssid[3], r.bssid[4], r.bssid[5]);
   tft.setTextSize(1);
-  tft.setTextColor(thLabel());
+  tft.setTextColor(accentLabel());
   int y = UI_CONTENT_Y + 4;
   tft.setCursor(4, y);       tft.printf("SSID: %s", r.ssid.c_str());          y += 16;
   tft.setCursor(4, y);       tft.printf("BSSID: %s", macStr);                 y += 16;
@@ -293,7 +293,7 @@ static void drawLocateChrome() {
   Btn row[1] = {{0,0,0,0, muted ? "unmute" : "mute"}};
   uiDrawActionRow(row, 1);
   muteBtn = row[0];
-  tft.setTextColor(thLabel());
+  tft.setTextColor(accentLabel());
   tft.setTextSize(2);
   tft.setCursor(4, UI_CONTENT_Y + 6);
   tft.print(rows[selected].ssid);
@@ -305,7 +305,7 @@ static void applyLocateReading(int rssi) {
   if (rssi != lastRssiShown) {
     lastRssiShown = rssi;
     tft.fillRect(4, UI_CONTENT_Y + 36, tft.width() - 8, 34, ILI9341_BLACK);
-    tft.setTextColor(thLabel());
+    tft.setTextColor(accentLabel());
     tft.setTextSize(3);
     tft.setCursor(4, UI_CONTENT_Y + 36);
     tft.printf("%4d dBm", rssi);

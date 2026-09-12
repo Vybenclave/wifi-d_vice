@@ -99,6 +99,17 @@ static const int UI_CONTENT_Y = UI_ACTIONROW_Y + UI_ACTIONROW_H + 1;       // wi
 // are computed here and overwritten). Returns nothing -- read the same
 // array back for hit-testing (uiTouchInButton against btns[i]).
 void uiDrawActionRow(Btn *btns, int count);
+// Pull-down-menu picker: opens a full list of `count` text options
+// (itemLabel(i) supplies each one) below the top bar, paged if it doesn't
+// fit; tapping a row selects it and returns immediately (no separate
+// Apply step -- that's the caller's business if it wants one). Back
+// cancels and returns `current` unchanged. Services the clock/battery
+// corner itself each frame (see uiServiceChrome()) so it's safe to call
+// from any screen without that corner going dark for as long as the list
+// is open. For a plain text list -- something that wants to preview a
+// COLOR per row (a swatch) needs its own picker; see
+// system_screen.cpp's Accent Color picker for that shape.
+int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current);
 void uiToast(const char *msg);   // one-line status text at the bottom of the screen (leaves
                                  // room on the right for uiDrawClock(), see below)
 // Full-screen modal numeric keypad -- a stripped-down cousin of
@@ -191,3 +202,9 @@ void  uiBatterySetCalFromActual(int actualMv);   // factor = actualMv / rawMv
 // colours when below 15%. uiDrawTopBar() forces a repaint on a screen
 // change.
 void uiDrawBatteryIndicator();
+// Both of the above, one call. main loop() calls them directly (see the
+// .ino); any OTHER blocking touch-poll loop (a settings sub-page, a modal
+// wait) needs to call this itself once per iteration, or the clock and
+// battery glyph just go dark for as long as that loop owns the CPU --
+// they're normally only alive because loop() keeps running.
+void uiServiceChrome();

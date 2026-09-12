@@ -7,7 +7,7 @@
 // and MeshPacket payloads for TEXT_MESSAGE_APP (1) and TELEMETRY_APP (67).
 // Nothing is written onto the mesh -- receive/display only.
 #include "meshtastic_mon.h"
-#include "theme.h"
+#include "accent.h"
 #include "keyboard.h"
 #include "devtime.h"
 #include <WiFi.h>
@@ -360,7 +360,7 @@ static void drawTabs() {
   uiDrawMenuButton(tabFeed);
   int sx = (view == 0) ? tabNodes.x : tabFeed.x;
   int sw = (view == 0) ? tabNodes.w : tabFeed.w;
-  tft.fillRect(sx + 2, TABS_Y + TABS_H - 4, sw - 4, 3, TH_ACCENT);
+  tft.fillRect(sx + 2, TABS_Y + TABS_H - 4, sw - 4, 3, accentFill());
 }
 
 static void drawBody() {
@@ -376,7 +376,7 @@ static void drawBody() {
 
   int y = BODY_Y + (linkUp ? 4 : 18);
   if (view == 0) {
-    tft.setTextColor(thLabel());
+    tft.setTextColor(accentLabel());
     tft.setCursor(4, y);
     tft.printf("my !%06x   nodes: %d", (unsigned)(myNum & 0xFFFFFF), nodeN);
     y += 14;
@@ -453,7 +453,7 @@ static void stopScan() {
 static void drawScanning() {
   tft.fillRect(0, 30, tft.width(), 44, ILI9341_BLACK);
   tft.setTextSize(1);
-  tft.setTextColor(thLabel());
+  tft.setTextColor(accentLabel());
   tft.setCursor(6, 40);
   uint32_t el = millis() - scanStartMs;
   uint32_t left = el >= SCAN_MS ? 0 : (SCAN_MS - el) / 1000 + 1;
@@ -477,7 +477,7 @@ static void drawPick() {
     uiDrawMenuButton(forgetBtn);
     return;
   }
-  tft.setTextColor(thLabel());
+  tft.setTextColor(accentLabel());
   tft.setCursor(6, 34);
   tft.print("Pick a node:");
   int y = 50;

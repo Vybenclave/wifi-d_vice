@@ -53,6 +53,7 @@
 #include "engagement.h"
 #include "engstore.h"
 #include "theme.h"
+#include "accent.h"
 #include "splash.h"
 #include "modvis.h"
 #include "pincfg.h"
@@ -201,10 +202,9 @@ static bool touchInGear(const TouchPoint &t) {
 }
 
 void drawMenu() {
-  bool vice = themeIsVice();
   uiSetBgMode(UI_BG_IMAGE);   // the dimmed scene behind the category buttons
   uiClearBelow(0);            // bg image (Vice) or flat black (Basic)
-  tft.setTextColor(vice ? TH_ACCENT : ILI9341_WHITE);
+  tft.setTextColor(accentLabel());   // universal accent -- shows under Basic too now
   tft.setTextSize(3);
   tft.setCursor(8, 4);
   tft.print("WIFI D_VICE");
@@ -409,6 +409,7 @@ void setup() {
 
   uiInit();
   themeLoad();
+  accentLoad();
   tzLoad();
   modvisLoad();
   engStoreBegin();

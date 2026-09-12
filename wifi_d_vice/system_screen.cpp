@@ -17,6 +17,7 @@
 // #include "demo.h"   // Outrun easter egg -- retired, kept for reference
 #include "splash.h"
 #include "theme.h"
+#include "accent.h"
 #include "tz.h"
 #include "devtime.h"
 #include "modvis.h"
@@ -107,7 +108,7 @@ static void drawAbout() {
     };
 
     int y = s_qrBottom + 12;
-    centerLine(y, thLabel(),      "WIFI D_VICE  v0.9"); y += 15;
+    centerLine(y, accentLabel(),      "WIFI D_VICE  v0.9"); y += 15;
     centerLine(y, ILI9341_WHITE,  "MIT license");                   y += 13;
     centerLine(y, ILI9341_WHITE,  "github.com/Vybenclave/wifi-d_vice"); y += 16;
     char batl[32];
@@ -121,6 +122,7 @@ static void drawAbout() {
     // Tapping the QR code shows the splash art (was the Miami Vice demo).
     for (;;) {
       TouchPoint t = uiReadTouch();
+      uiServiceChrome();
       if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
       if (t.pressed && t.x >= s_qrX && t.x < s_qrX + s_qrPx &&
           t.y >= s_qrTop && t.y < s_qrTop + s_qrPx) {
@@ -161,6 +163,7 @@ static void systemTestGps() {
 
   for (;;) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); break; }
 
     if (millis() - lastDraw > 400) {
@@ -170,7 +173,7 @@ static void systemTestGps() {
       tft.setTextSize(1);
       int y = 36;
       auto line = [&](uint16_t col, const char *k, const String &v) {
-        tft.setTextColor(thLabel());  tft.setCursor(4, y);   tft.print(k);
+        tft.setTextColor(accentLabel());  tft.setCursor(4, y);   tft.print(k);
         tft.setTextColor(col);           tft.setCursor(100, y); tft.print(v);
         y += 15;
       };
@@ -205,108 +208,108 @@ static void systemTestGps() {
   }
 }
 
-static const char *themeSwatchName(int id) {
-  switch (id) {
-    case THEME_VICE_CYAN:  return "Cyan";
-    case THEME_VICE_AMBER: return "Amber";
-    case THEME_VICE_GREEN: return "Green";
-    case THEME_VICE_GREY:  return "Grey";
-    default:                return "?";
-  }
-}
-
 // Black or white, whichever reads better on an arbitrary RGB565 fill --
 // so a swatch's label stays legible no matter how bright/dark a future
-// color scheme's fill turns out to be, without hand-tuning per scheme.
+// accent color's fill turns out to be, without hand-tuning per color.
 static uint16_t contrastTextFor(uint16_t c) {
   int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
   int luma = (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
   return luma / 1000 > 140 ? ILI9341_BLACK : ILI9341_WHITE;
 }
 
-static void drawOnMarker(int cx, int cy) {
-  tft.fillCircle(cx, cy, 5, ILI9341_GREEN);
-  tft.drawCircle(cx, cy, 5, ILI9341_BLACK);
-}
+// Swatch-grid picker for the accent color (accent.h) -- each cell IS
+// that color's actual fill, so the name alone doesn't have to explain
+// it. 2 columns, as many rows as ACCENT_N needs. Dropdown-style: tapping
+// a cell selects it and returns immediately, no separate Apply step.
+// TODO once ACCENT_N grows past what one screen comfortably fits (the
+// project's 16-color baseline will): page it, the same way
+// uiDropdownPick() pages a plain list. Fine unpaged for today's 4.
+static int pickAccentColor(int current) {
+  const int y0 = 34, cols = 2, gap = 8, bottomMargin = UI_STATUSBAR_H + 4;
+  int rows = (ACCENT_N + cols - 1) / cols;
+  int cellW = (tft.width() - 16 - gap) / cols;
+  int cellH = (tft.height() - bottomMargin - y0 - gap * (rows - 1)) / rows;
+  if (cellH > 90) cellH = 90;   // don't get silly big on a tall screen with only 4 colors
 
-// Tapping a theme/swatch only selects it; nothing changes until "Apply".
-// Apply persists the choice and re-skins live -- theme state is read at
-// draw time, so no restart is needed; a full clear first kills any
-// leftover pixels from the old skin.
-//
-// "Basic" is a normal full-width button (it's not a color); the four Vice
-// choices are a compact 2x2 grid of solid-fill swatches below it -- each
-// swatch IS its scheme's actual button color, so no caption is needed to
-// explain what "amber" or "green" looks like, and the whole picker is
-// much shorter than the old one-row-per-theme list.
-static void systemShowThemes() {
-  const int y0 = 40, BASIC_H = 34, APPLY_H = 38, GAP = 8, BOTTOM_MARGIN = 8;
-  int applyY = tft.height() - BOTTOM_MARGIN - APPLY_H;
-  int gridTop = y0 + BASIC_H + GAP;
-  int gridBottom = applyY - GAP;
-  int cellW = (tft.width() - 16 - GAP) / 2;
-  int cellH = (gridBottom - gridTop - GAP) / 2;
+  uiDrawTopBar("Accent Color");
+  uiClearBelow(29);
+  Btn cell[ACCENT_N];
+  for (int id = 0; id < ACCENT_N; id++) {
+    int col = id % cols, row = id / cols;
+    int x = 8 + col * (cellW + gap);
+    int y = y0 + row * (cellH + gap);
+    cell[id] = {x, y, cellW, cellH, accentName(id)};
 
-  Btn items[THEME_N], applyBtn;
-  int sel = themeGet();                 // pending selection, starts at the active one
+    uint16_t fill = accentFillFor(id);
+    tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
+    tft.drawRoundRect(x, y, cellW, cellH, 8, accentEdgeFor(id));
+    tft.setTextColor(contrastTextFor(fill));
+    tft.setTextSize(2);
+    int16_t bx, by; uint16_t bw, bh;
+    tft.getTextBounds(accentName(id), 0, 0, &bx, &by, &bw, &bh);
+    tft.setCursor(x + (cellW - (int)bw) / 2 - bx, y + (cellH - (int)bh) / 2 - by);
+    tft.print(accentName(id));
 
-  auto drawPicker = [&]() {
-    uiDrawTopBar("Themes");
-    uiClearBelow(29);
-
-    items[THEME_BASIC] = {8, y0, tft.width() - 16, BASIC_H, themeName(THEME_BASIC)};
-    uiDrawButton(items[THEME_BASIC]);
-    if (sel == THEME_BASIC)
-      tft.drawRect(items[0].x - 3, items[0].y - 3, items[0].w + 6, items[0].h + 6, ILI9341_CYAN);
-    if (themeGet() == THEME_BASIC)
-      drawOnMarker(items[0].x + items[0].w - 12, items[0].y + items[0].h / 2);
-
-    for (int k = 0; k < 4; k++) {
-      int id = THEME_VICE_CYAN + k;
-      int col = k % 2, row = k / 2;
-      int x = 8 + col * (cellW + GAP);
-      int y = gridTop + row * (cellH + GAP);
-      items[id] = {x, y, cellW, cellH, themeSwatchName(id)};
-
-      uint16_t fill = thBtnFillFor(id);
-      tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
-      tft.drawRoundRect(x, y, cellW, cellH, 8, thBtnEdgeFor(id));
-      tft.setTextColor(contrastTextFor(fill));
-      tft.setTextSize(2);
-      int16_t bx, by; uint16_t bw, bh;
-      tft.getTextBounds(themeSwatchName(id), 0, 0, &bx, &by, &bw, &bh);
-      tft.setCursor(x + (cellW - (int)bw) / 2 - bx, y + (cellH - (int)bh) / 2 - by);
-      tft.print(themeSwatchName(id));
-
-      if (sel == id) tft.drawRect(x - 3, y - 3, cellW + 6, cellH + 6, ILI9341_CYAN);
-      if (themeGet() == id) drawOnMarker(x + cellW - 12, y + 12);
+    if (id == current) {   // "current" marker -- a double outline reads on any fill color
+      tft.drawRect(x - 3, y - 3, cellW + 6, cellH + 6, ILI9341_GREEN);
+      tft.drawRect(x - 2, y - 2, cellW + 4, cellH + 4, ILI9341_GREEN);
     }
-
-    applyBtn = {8, applyY, tft.width() - 16, APPLY_H,
-                sel == themeGet() ? "Apply (no change)" : "Apply"};
-    uiDrawButton(applyBtn);
-  };
-  drawPicker();
+  }
 
   for (;;) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
+    if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return current; }
+    for (int id = 0; id < ACCENT_N; id++)
+      if (uiTouchInButton(t, cell[id])) { uiWaitForRelease(); return id; }
+    delay(15);
+  }
+}
+
+// Theme (structural: Basic/Vice, theme.h) and Accent Color (universal
+// color, accent.h) are INDEPENDENT settings -- switching one never
+// touches the other. Each gets its own pull-down row; picking an option
+// applies immediately and closes the dropdown, so there's no separate
+// Apply step or pending-vs-active distinction to track here.
+static void systemShowThemeColor() {
+  Btn themeBtn, accentBtn;
+  auto draw = [&]() {
+    uiDrawTopBar("Theme & Color");
+    uiClearBelow(29);
+    char tlbl[24], albl[24];
+    snprintf(tlbl, sizeof(tlbl), "Theme: %s", themeName(themeGet()));
+    snprintf(albl, sizeof(albl), "Accent: %s", accentName(accentGet()));
+    themeBtn  = {8, 40, tft.width() - 16, 40, tlbl};
+    accentBtn = {8, 88, tft.width() - 16, 40, albl};
+    uiDrawButton(themeBtn);
+    uiDrawButton(accentBtn);
+    // A live swatch of the current accent next to its row -- under Basic
+    // (whose buttons don't render the accent at all) this is the only
+    // place on the whole Display menu that shows what "Amber" means.
+    int sw = 24;
+    int sx = accentBtn.x + accentBtn.w - sw - 10, sy = accentBtn.y + (accentBtn.h - sw) / 2;
+    tft.fillRoundRect(sx, sy, sw, sw, 4, accentFill());
+    tft.drawRoundRect(sx, sy, sw, sw, 4, accentEdge());
+  };
+  draw();
+
+  for (;;) {
+    TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
-    if (t.pressed && uiTouchInButton(t, applyBtn)) {
+    if (uiTouchInButton(t, themeBtn)) {
       uiWaitForRelease();
-      if (sel != themeGet()) {
-        themeSet(sel);
-        uiClearBelow(0);                 // wipe old-skin artifacts before repaint
-        drawPicker();
-      }
+      int chosen = uiDropdownPick("Theme", THEME_N, themeName, themeGet());
+      if (chosen != themeGet()) { themeSet(chosen); uiClearBelow(0); }   // wipe old-skin artifacts
+      draw();
       continue;
     }
-    for (int i = 0; i < THEME_N; i++) {
-      if (t.pressed && uiTouchInButton(t, items[i])) {
-        uiWaitForRelease();
-        sel = i;
-        drawPicker();
-        break;
-      }
+    if (uiTouchInButton(t, accentBtn)) {
+      uiWaitForRelease();
+      int chosen = pickAccentColor(accentGet());
+      if (chosen != accentGet()) { accentSet(chosen); uiClearBelow(0); }
+      draw();
+      continue;
     }
     delay(15);
   }
@@ -314,13 +317,15 @@ static void systemShowThemes() {
 
 // Display-only UTC offset + 12h/24h format + auto-DST for the bottom-bar
 // clock (tz.h) -- never touches devtime.h or any SD log, which always stay
-// UTC. Same tap-then-Apply pattern as systemShowThemes(), paged since the
-// offset list is too long for one page on this display. ROWS is computed
-// from the screen height (not a fixed constant) so this doesn't overrun
-// the Apply button in landscape's shorter 240px height.
+// UTC. Paged since the offset list is too long for one page on this
+// display; ROWS is computed from the screen height (not a fixed constant)
+// so this doesn't overrun the Apply button in landscape's shorter 240px
+// height.
 static void systemShowTimezone() {
   const int y0 = 34, rowH = 22, gap = 3;
-  const int PAGEROW_H = 26, TOGGLE_H = 28, APPLY_H = 34, STACK_GAP = 6, BOTTOM_MARGIN = 8;
+  // BOTTOM_MARGIN clears the full status bar -- see the comment on
+  // pickAccentColor()'s copy of this same constant.
+  const int PAGEROW_H = 26, TOGGLE_H = 28, APPLY_H = 34, STACK_GAP = 6, BOTTOM_MARGIN = UI_STATUSBAR_H + 4;
   const int MAX_ROWS = 10;
   // Two toggle rows now (12h/24h and Auto DST) between the pager and Apply.
   int stackTop = tft.height() - BOTTOM_MARGIN - APPLY_H - STACK_GAP
@@ -395,6 +400,7 @@ static void systemShowTimezone() {
 
   for (;;) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
     if (t.pressed && uiTouchInButton(t, applyBtn)) {
       uiWaitForRelease();
@@ -455,11 +461,12 @@ void systemShowRotationPicker() {
     // double-exposed text (confirmed report, not a photo artifact).
     tft.drawRect(cells[i].x, cells[i].y, cells[i].w, cells[i].h, ILI9341_WHITE);
     uiDrawRotatedText(cells[i].x + cells[i].w / 2, cells[i].y + cells[i].h / 2,
-                       kLabels[i], i, 2, thLabel());
+                       kLabels[i], i, 2, accentLabel());
   }
 
   while (true) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (!t.pressed) { delay(15); continue; }
     for (int i = 0; i < 4; i++) {
       if (uiTouchInButton(t, cells[i])) {
@@ -495,6 +502,7 @@ void systemShowVolumePicker() {
 
   while (true) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (!t.pressed) { delay(15); continue; }
     if (uiTouchInBackButton(t)) { uiWaitForRelease(); beepHold(false); return; }
     if (uiTouchInButton(t, minusBtn)) {
@@ -571,12 +579,16 @@ static bool confirmFormat() {
   tft.print("folder on the SD card. This");
   tft.setCursor(10, 132);
   tft.print("cannot be undone.");
-  Btn confirmBtn = {10, tft.height() - 90, tft.width() - 20, 36, "type ERASE to confirm"};
-  Btn cancelBtn = {10, tft.height() - 44, tft.width() - 20, 36, "cancel"};
+  // cancelBtn's bottom edge must clear UI_STATUSBAR_H (+ a small gap) --
+  // it used to sit at height-44 (bottom = height-8), inside the status bar.
+  const int cancelY = tft.height() - UI_STATUSBAR_H - 4 - 36;
+  Btn confirmBtn = {10, cancelY - 8 - 36, tft.width() - 20, 36, "type ERASE to confirm"};
+  Btn cancelBtn = {10, cancelY, tft.width() - 20, 36, "cancel"};
   uiDrawButton(confirmBtn);
   uiDrawButton(cancelBtn);
   while (true) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (!t.pressed) { delay(15); continue; }
     if (uiTouchInButton(t, confirmBtn)) {
       uiWaitForRelease();
@@ -610,6 +622,7 @@ static void systemShowModules() {
 
   for (;;) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
     for (int i = 0; i < MOD_N; i++) {
       if (t.pressed && uiTouchInButton(t, rows[i])) {
@@ -673,7 +686,7 @@ static void systemShowPins() {
       tft.setCursor(8, yy);
       tft.print(pincfgName(i));
       int g = pincfgGet(i), d = pincfgDefault(i);
-      tft.setTextColor(dim ? 0x8410 : thLabel());
+      tft.setTextColor(dim ? 0x8410 : accentLabel());
       tft.setCursor(98, yy);
       if (g < 0) tft.print("none"); else tft.printf("GPIO %d", g);
       if (d >= 0) {
@@ -697,6 +710,7 @@ static void systemShowPins() {
 
   for (;;) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (!t.pressed) { delay(15); continue; }
     if (uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
 
@@ -757,6 +771,7 @@ static void systemSubPage(const char *title, const SysItem *items, int n) {
   draw();
   for (;;) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
     for (int i = 0; i < n; i++) {
       if (t.pressed && uiTouchInButton(t, rows[i])) {
@@ -778,7 +793,7 @@ static const char *splashLbl()  { return splashEnabled() ? "Boot splash (on)"
 static void systemShowDisplayMenu() {
   static const SysItem items[] = {
     {"Screen orientation", systemShowRotationPicker, nullptr},
-    {"Themes",             systemShowThemes,         nullptr},
+    {"Theme & Color",      systemShowThemeColor,     nullptr},
     {"Timezone",           systemShowTimezone,       nullptr},
     {"Recalibrate touch",  uiRunCalibration,         nullptr},
     {nullptr,              sysToggleSplash,          splashLbl},
@@ -821,6 +836,7 @@ static void systemShowBatteryCal() {
   uint32_t lastLive = millis();
   while (true) {
     TouchPoint t = uiReadTouch();
+    uiServiceChrome();
     if (!t.pressed) {
       if (millis() - lastLive > 800) { drawLive(); lastLive = millis(); }
       delay(15);
