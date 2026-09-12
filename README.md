@@ -47,8 +47,10 @@ learning and for field reconnaissance.
 - GPS wardriving, with optional AES-256-GCM encrypted logs. The GPS module
   also drives the device clock: it retries every 15s from boot until it
   gets a fix-derived UTC time, then resyncs hourly. Every SD log timestamps
-  rows in that UTC clock; the bottom-bar clock shows it in the timezone set
-  under System > Display > Timezone (display only, doesn't affect logs).
+  rows in that UTC clock; the bottom-bar clock shows it in 12h or 24h
+  format, in the timezone set under System > Display > Timezone (display
+  only, doesn't affect logs), with automatic DST compensation for the
+  zones that observe it.
 - Net stats: internet and local-network throughput tests, connection
   information, and a NAT (network address translation) test.
 - Engagement: operator tracking and scan-data protection for authorized

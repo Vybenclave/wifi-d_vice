@@ -266,23 +266,25 @@ static void systemShowThemes() {
   }
 }
 
-// Display-only UTC offset + 12h/24h format for the bottom-bar clock (tz.h)
-// -- never touches devtime.h or any SD log, which always stay UTC. Same
-// tap-then-Apply pattern as systemShowThemes(), paged since the offset
-// list is too long for one page on this display. ROWS is computed from
-// the screen height (not a fixed constant) so this doesn't overrun the
-// Apply button in landscape's shorter 240px height.
+// Display-only UTC offset + 12h/24h format + auto-DST for the bottom-bar
+// clock (tz.h) -- never touches devtime.h or any SD log, which always stay
+// UTC. Same tap-then-Apply pattern as systemShowThemes(), paged since the
+// offset list is too long for one page on this display. ROWS is computed
+// from the screen height (not a fixed constant) so this doesn't overrun
+// the Apply button in landscape's shorter 240px height.
 static void systemShowTimezone() {
   const int y0 = 34, rowH = 22, gap = 3;
   const int PAGEROW_H = 26, TOGGLE_H = 28, APPLY_H = 34, STACK_GAP = 6, BOTTOM_MARGIN = 8;
   const int MAX_ROWS = 10;
-  int stackTop = tft.height() - BOTTOM_MARGIN - APPLY_H - STACK_GAP - TOGGLE_H - STACK_GAP - PAGEROW_H;
+  // Two toggle rows now (12h/24h and Auto DST) between the pager and Apply.
+  int stackTop = tft.height() - BOTTOM_MARGIN - APPLY_H - STACK_GAP
+                 - TOGGLE_H - STACK_GAP - TOGGLE_H - STACK_GAP - PAGEROW_H;
   int ROWS = (stackTop - gap - y0) / (rowH + gap);
   if (ROWS < 3) ROWS = 3;
   if (ROWS > MAX_ROWS) ROWS = MAX_ROWS;
   if (ROWS > tzCount()) ROWS = tzCount();
 
-  Btn items[MAX_ROWS], applyBtn, prevBtn, nextBtn, toggleBtn;
+  Btn items[MAX_ROWS], applyBtn, prevBtn, nextBtn, toggleBtn, dstBtn;
   int sel = tzGetIndex();               // pending selection, starts at the active one
   int page = sel / ROWS;
 
@@ -327,7 +329,19 @@ static void systemShowTimezone() {
                  tzUse24h() ? "24-hour clock" : "12-hour clock"};
     uiDrawMenuButton(toggleBtn);
 
-    applyBtn = {8, py + PAGEROW_H + STACK_GAP + TOGGLE_H + STACK_GAP, tft.width() - 16, APPLY_H,
+    // Status reflects the PENDING selection (sel), not just the applied
+    // zone, so browsing the list previews whether that zone is even
+    // DST-eligible before tapping Apply.
+    static char dstLbl[40];
+    if (!tzAutoDst())            strcpy(dstLbl, "Auto DST: off");
+    else if (!tzZoneHasDst(sel)) strcpy(dstLbl, "Auto DST: on (n/a here)");
+    else if (tzDstActiveFor(sel)) strcpy(dstLbl, "Auto DST: on (+1h now)");
+    else                          strcpy(dstLbl, "Auto DST: on (not active)");
+    dstBtn = {8, py + PAGEROW_H + STACK_GAP + TOGGLE_H + STACK_GAP, tft.width() - 16, TOGGLE_H, dstLbl};
+    uiDrawMenuButton(dstBtn);
+
+    applyBtn = {8, py + PAGEROW_H + STACK_GAP + TOGGLE_H + STACK_GAP + TOGGLE_H + STACK_GAP,
+                tft.width() - 16, APPLY_H,
                 sel == tzGetIndex() ? "Apply (no change)" : "Apply"};
     uiDrawButton(applyBtn);
   };
@@ -344,6 +358,12 @@ static void systemShowTimezone() {
     if (t.pressed && uiTouchInButton(t, toggleBtn)) {
       uiWaitForRelease();
       tzSet24h(!tzUse24h());
+      drawPicker();
+      continue;
+    }
+    if (t.pressed && uiTouchInButton(t, dstBtn)) {
+      uiWaitForRelease();
+      tzSetAutoDst(!tzAutoDst());
       drawPicker();
       continue;
     }
