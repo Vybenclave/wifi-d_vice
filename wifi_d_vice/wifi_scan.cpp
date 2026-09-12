@@ -122,31 +122,37 @@ static void drawList() {
 }
 
 static void drawDetail() {
-  uiClearBelow(29);
+  // Action row, not a bottom-pinned footer -- matches drawList() and
+  // drawLocateChrome() in this same file (and the UI rule in ui.h: a
+  // per-screen button belongs in the action row, not floating wherever).
+  // This used to sit at tft.height()-44, which put it right under a short
+  // 5-line info block on a short (landscape) screen but stranded it far
+  // below a big empty gap in portrait -- looked like the button had
+  // "fallen" to the bottom of the screen.
+  uiClearBelow(UI_ACTIONROW_Y);
+  Btn row[2] = {{0, 0, 0, 0, "Connect"}, {0, 0, 0, 0, "Track"}};
+  uiDrawActionRow(row, 2);
+  connectBtn = row[0];
+  trackBtn   = row[1];
+
   const ApInfo &r = rows[selected];
   char macStr[18];
   snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
            r.bssid[0], r.bssid[1], r.bssid[2], r.bssid[3], r.bssid[4], r.bssid[5]);
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(4, 34);  tft.printf("SSID: %s", r.ssid.c_str());
-  tft.setCursor(4, 50);  tft.printf("BSSID: %s", macStr);
-  tft.setCursor(4, 66);  tft.printf("Vendor: %s", macVendorTag(r.bssid).c_str());
-  tft.setCursor(4, 82);  tft.printf("Channel: %d   Security: %s", r.channel, encName(r.enc));
-  tft.setCursor(4, 98);  tft.printf("RSSI: %d dBm", r.rssi);
+  int y = UI_CONTENT_Y + 4;
+  tft.setCursor(4, y);       tft.printf("SSID: %s", r.ssid.c_str());          y += 16;
+  tft.setCursor(4, y);       tft.printf("BSSID: %s", macStr);                 y += 16;
+  tft.setCursor(4, y);       tft.printf("Vendor: %s", macVendorTag(r.bssid).c_str()); y += 16;
+  tft.setCursor(4, y);       tft.printf("Channel: %d   Security: %s", r.channel, encName(r.enc)); y += 16;
+  tft.setCursor(4, y);       tft.printf("RSSI: %d dBm", r.rssi);              y += 18;
 
   if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == r.ssid) {
     tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(4, 116);
+    tft.setCursor(4, y);
     tft.print("connected  "); tft.print(WiFi.localIP());
   }
-
-  int by = tft.height() - 44;
-  int halfW = (tft.width() - 12) / 2;
-  connectBtn = {4, by, halfW, 36, "Connect"};
-  trackBtn   = {8 + halfW, by, tft.width() - 12 - halfW, 36, "Track"};
-  uiDrawMenuButton(connectBtn);
-  uiDrawMenuButton(trackBtn);
 }
 
 // Blocking join flow (modal, like the on-screen keyboard it calls): prompt

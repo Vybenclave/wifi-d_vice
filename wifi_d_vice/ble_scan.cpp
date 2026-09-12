@@ -152,17 +152,23 @@ static void drawRows() {
 }
 
 static void drawDetail() {
-  uiClearBelow(29);
+  // Action row, not a bottom-pinned footer -- matches drawLocateChrome()
+  // below (and the UI rule in ui.h). This used to sit at tft.height()-44,
+  // stranded far below this short 4-line info block on a tall screen --
+  // looked like the button had "fallen" to the bottom of the screen.
+  uiClearBelow(UI_ACTIONROW_Y);
+  Btn row[1] = {{0, 0, 0, 0, "Track"}};
+  uiDrawActionRow(row, 1);
+  trackBtn = row[0];
+
   const BleRow &r = rows[selected];
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_CYAN);
-  tft.setCursor(4, 34);  tft.printf("Name: %s", r.name.c_str());
-  tft.setCursor(4, 50);  tft.printf("MAC:  %s", r.macStr.c_str());
-  tft.setCursor(4, 66);  tft.printf("Vendor: %s", macVendorTag(r.mac).c_str());
-  tft.setCursor(4, 82);  tft.printf("RSSI: %d dBm", r.rssi);
-
-  trackBtn = {4, tft.height() - 44, tft.width() - 8, 36, "Track"};
-  uiDrawMenuButton(trackBtn);
+  int y = UI_CONTENT_Y + 4;
+  tft.setCursor(4, y);  tft.printf("Name: %s", r.name.c_str());               y += 16;
+  tft.setCursor(4, y);  tft.printf("MAC:  %s", r.macStr.c_str());             y += 16;
+  tft.setCursor(4, y);  tft.printf("Vendor: %s", macVendorTag(r.mac).c_str()); y += 16;
+  tft.setCursor(4, y);  tft.printf("RSSI: %d dBm", r.rssi);
 }
 
 static void drawLocateChrome() {
