@@ -1,4 +1,4 @@
-<img src="docs/vice.9_portrait.jpeg" width="360" alt="WIFI D_VICE">
+<img src="docs/vice.9_portrait.jpeg" width="480" alt="WIFI D_VICE">
 
 # WIFI D_VICE
 
