@@ -105,7 +105,7 @@ static void drawClientRow(int y) {
   tft.setCursor(clientPlusBtn.x + 7, clientPlusBtn.y + (ROW_H - 8) / 2);
   tft.print("+");
   int cx = clientPlusBtn.x - 12, cy = clientBtn.y + ROW_H / 2;
-  tft.fillTriangle(cx - 5, cy - 3, cx + 5, cy - 3, cx, cy + 4, ILI9341_CYAN);
+  tft.fillTriangle(cx - 5, cy - 3, cx + 5, cy - 3, cx, cy + 4, accentLabel());   // pull-down arrow -- universal accent
 
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(clientBtn.x + 90, clientBtn.y + (ROW_H - 8) / 2);

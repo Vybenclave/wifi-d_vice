@@ -215,9 +215,10 @@ void  uiBatterySetCalFromActual(int actualMv);   // factor = actualMv / rawMv
 // colours when below 15%. uiDrawTopBar() forces a repaint on a screen
 // change.
 void uiDrawBatteryIndicator();
-// Both of the above, one call. main loop() calls them directly (see the
-// .ino); any OTHER blocking touch-poll loop (a settings sub-page, a modal
-// wait) needs to call this itself once per iteration, or the clock and
-// battery glyph just go dark for as long as that loop owns the CPU --
-// they're normally only alive because loop() keeps running.
+// The clock, the battery glyph, and the toast ticker's next scroll step
+// (see uiToast()) -- one call. main loop() calls this every iteration
+// (see the .ino); any OTHER blocking touch-poll loop (a settings
+// sub-page, a modal wait) needs to call this itself once per iteration,
+// or all three just go dark/stop scrolling for as long as that loop owns
+// the CPU -- they're normally only alive because loop() keeps running.
 void uiServiceChrome();

@@ -485,11 +485,11 @@ void loop() {
                 currentScreen == PROBE_WATCH || currentScreen == CLIENT_MAP ||
                 currentScreen == CAMERA_DET || currentScreen == DRONE_DET ||
                 currentScreen == BLE_SPAM);
-  uiDrawClock();           // bottom-right clock, every screen (note: doesn't
+  uiServiceChrome();       // bottom-right clock + battery glyph + the toast ticker's
+                           // next scroll step, every screen (note: doesn't
                            // appear during modal sub-loops like the
                            // keyboard, calibration, or BLE pairing wait -- those
                            // don't return to this loop() until they finish)
-  uiDrawBatteryIndicator();   // bottom-right battery glyph + %, same caveat
   TouchPoint t = uiReadTouch();
 
   // Back button: a quick tap steps up one level (per-screen HandleBack
