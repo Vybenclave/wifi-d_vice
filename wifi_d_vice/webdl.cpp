@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "pins.h"
 #include "sd_bus.h"
+#include "theme.h"
 
 static WebServer server(80);
 static DNSServer dns;
@@ -145,7 +146,7 @@ void webDownloadRun() {
   tft.setTextSize(1);
   int y = 40;
   auto row = [&](uint16_t col, const char *k, const String &v) {
-    tft.setTextColor(ILI9341_CYAN);  tft.setCursor(6, y);  tft.print(k);
+    tft.setTextColor(thLabel());  tft.setCursor(6, y);  tft.print(k);
     tft.setTextColor(col);           tft.setCursor(94, y); tft.print(v);
     y += 16;
   };

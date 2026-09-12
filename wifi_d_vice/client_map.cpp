@@ -13,6 +13,7 @@
 #include "ui.h"
 #include "wifi_ids.h"
 #include "mac_vendor.h"
+#include "theme.h"
 
 struct Sta {
   uint8_t  mac[6];
@@ -89,7 +90,7 @@ static void draw() {
   for (int k = 0; k < m && y + 12 <= tft.height() - UI_STATUSBAR_H; k++) {
     const Sta &s = st[idx[k]];
     bool fresh = millis() - s.seen < 8000;
-    tft.setTextColor(s.rand ? ILI9341_DARKGREY : (fresh ? ILI9341_YELLOW : ILI9341_CYAN));
+    tft.setTextColor(s.rand ? ILI9341_DARKGREY : (fresh ? ILI9341_YELLOW : thLabel()));
     tft.setCursor(4, y);
     bool haveAp = memcmp(s.ap, "\0\0\0\0\0\0", 6) != 0;
     tft.printf("%02X%02X%02X %-14.14s %c%02X%02X %ddBm x%u",

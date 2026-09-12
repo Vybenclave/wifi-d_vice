@@ -107,7 +107,7 @@ static void drawAbout() {
     };
 
     int y = s_qrBottom + 12;
-    centerLine(y, ILI9341_CYAN,   "WIFI D_VICE  v0.9"); y += 15;
+    centerLine(y, thLabel(),      "WIFI D_VICE  v0.9"); y += 15;
     centerLine(y, ILI9341_WHITE,  "MIT license");                   y += 13;
     centerLine(y, ILI9341_WHITE,  "github.com/Vybenclave/wifi-d_vice"); y += 16;
     char batl[32];
@@ -170,7 +170,7 @@ static void systemTestGps() {
       tft.setTextSize(1);
       int y = 36;
       auto line = [&](uint16_t col, const char *k, const String &v) {
-        tft.setTextColor(ILI9341_CYAN);  tft.setCursor(4, y);   tft.print(k);
+        tft.setTextColor(thLabel());  tft.setCursor(4, y);   tft.print(k);
         tft.setTextColor(col);           tft.setCursor(100, y); tft.print(v);
         y += 15;
       };
@@ -419,7 +419,7 @@ void systemShowRotationPicker() {
     // double-exposed text (confirmed report, not a photo artifact).
     tft.drawRect(cells[i].x, cells[i].y, cells[i].w, cells[i].h, ILI9341_WHITE);
     uiDrawRotatedText(cells[i].x + cells[i].w / 2, cells[i].y + cells[i].h / 2,
-                       kLabels[i], i, 2, ILI9341_CYAN);
+                       kLabels[i], i, 2, thLabel());
   }
 
   while (true) {
@@ -637,7 +637,7 @@ static void systemShowPins() {
       tft.setCursor(8, yy);
       tft.print(pincfgName(i));
       int g = pincfgGet(i), d = pincfgDefault(i);
-      tft.setTextColor(dim ? 0x8410 : ILI9341_CYAN);
+      tft.setTextColor(dim ? 0x8410 : thLabel());
       tft.setCursor(98, yy);
       if (g < 0) tft.print("none"); else tft.printf("GPIO %d", g);
       if (d >= 0) {

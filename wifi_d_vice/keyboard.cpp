@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "ui.h"
+#include "theme.h"
 
 struct KeyRect { int x, y, w, h; char c; };
 static KeyRect keys[80];
@@ -90,7 +91,7 @@ String uiTextInput(const char *prompt, const String &initial, bool mask) {
   Btn showBtn = {tft.width() - 76, 16, 74, 22, "show"};
 
   uiClearBelow(0);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   tft.setTextSize(1);
   tft.setCursor(4, 4);
   tft.print(prompt);

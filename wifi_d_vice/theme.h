@@ -3,11 +3,11 @@
 
 // Two UI families. "Basic" = the original flat black + white-rect buttons.
 // "Vice" = synthwave: pill buttons, a purple gradient behind the home
-// menu, cyan accents -- now split into four color schemes that recolor
-// just the buttons and the title bar (everything else -- the gradient,
-// the accent stripe, the button label color -- stays the same across all
-// four, since that's the shared "Vice" identity). Persisted to NVS
-// ("theme" key).
+// menu -- now split into four color schemes that recolor the buttons,
+// the title bar, and every screen's field-label/heading text (thLabel(),
+// below) together. The gradient background and the button label color
+// stay the same across all four -- that's the shared "Vice" identity, not
+// per-scheme. Persisted to NVS ("theme" key).
 enum {
   THEME_BASIC      = 0,
   THEME_VICE_CYAN  = 1,   // the original scheme -- teal buttons, navy title bar
@@ -23,15 +23,21 @@ int         themeGet();
 const char *themeName(int id);
 bool        themeIsVice();          // true for any THEME_VICE_* scheme
 
-// Vice palette (RGB565); Basic doesn't use any of this. The button fill /
-// edge / highlight / label-emboss and the title-bar fill vary by the
-// active color scheme (see theme.cpp) -- everything else below is shared
-// across all four schemes.
+// Vice palette (RGB565); Basic doesn't use any of this except thLabel().
+// The button fill/edge/highlight/label-emboss, the title-bar fill, and
+// the field-label text color all vary by the active color scheme (see
+// theme.cpp) -- everything else below is shared across all four schemes.
 uint16_t thBtnFill();
 uint16_t thBtnEdge();
 uint16_t thBtnBevel();
 uint16_t thBtnEmboss();   // 1px light offset behind the button label
 uint16_t thTitleBar();    // top-bar fill (ILI9341_NAVY for the cyan scheme)
+// The app-wide "field label / heading" text color -- SSID:, MAC:, section
+// headers, and the like. ILI9341_CYAN for Basic and the cyan Vice scheme
+// (unchanged from before this existed); the active scheme's own hue
+// otherwise, so a screen written with thLabel() retheme automatically
+// instead of needing per-scheme special-casing.
+uint16_t thLabel();
 static const uint16_t TH_BTN_TEXT  = 0x2965;   // dark grey label, all schemes
 static const uint16_t TH_ACCENT    = 0x5F1A;   // cyan accent, all schemes
 static const uint16_t TH_GRAD_TOP  = 0x0844;   // deep indigo, all schemes

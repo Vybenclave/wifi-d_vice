@@ -942,7 +942,7 @@ String uiNumpadInput(const char *prompt, const String &initial) {
 
   uiClearBelow(0);
   tft.setTextWrap(false);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   tft.setTextSize(1);
   tft.setCursor(4, 4);
   tft.print(prompt);

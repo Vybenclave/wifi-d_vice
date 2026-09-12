@@ -6,6 +6,7 @@
 #include "wlog.h"
 #include "known_signatures.h"
 #include "devtime.h"
+#include "theme.h"
 
 enum SubMode { LIST, DETAIL, LOCATE };
 static SubMode subMode = LIST;
@@ -129,7 +130,7 @@ static void drawRows() {
     snprintf(nm, sizeof(nm), "%-13.13s", rows[i].name.c_str());
     tft.print(nm);
     tft.setTextSize(1);
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(thLabel());
     tft.setCursor(4 + 13 * 12 + 4, y + 5);
     if (cls != BC_NONE) tft.printf("%-7s %ddBm", bleClassLabel(cls), rows[i].rssi);
     else                tft.printf("%s %ddBm", macVendorTag(rows[i].mac).c_str(), rows[i].rssi);
@@ -163,7 +164,7 @@ static void drawDetail() {
 
   const BleRow &r = rows[selected];
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   int y = UI_CONTENT_Y + 4;
   tft.setCursor(4, y);  tft.printf("Name: %s", r.name.c_str());               y += 16;
   tft.setCursor(4, y);  tft.printf("MAC:  %s", r.macStr.c_str());             y += 16;
@@ -176,7 +177,7 @@ static void drawLocateChrome() {
   Btn row[1] = {{0,0,0,0, muted ? "unmute" : "mute"}};
   uiDrawActionRow(row, 1);
   muteBtn = row[0];
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   tft.setTextSize(2);
   tft.setCursor(4, UI_CONTENT_Y + 6);
   tft.print(rows[selected].name);
@@ -201,7 +202,7 @@ static void updateLocate() {
   if (rssi != lastRssiShown) {
     lastRssiShown = rssi;
     tft.fillRect(4, UI_CONTENT_Y + 36, tft.width() - 8, 34, ILI9341_BLACK);
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(thLabel());
     tft.setTextSize(3);
     tft.setCursor(4, UI_CONTENT_Y + 36);
     tft.printf("%4d dBm", rssi);

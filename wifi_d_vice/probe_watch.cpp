@@ -10,6 +10,7 @@
 #include <string.h>
 #include "ui.h"
 #include "wifi_ids.h"
+#include "theme.h"
 
 struct Probe {
   char     ssid[24];
@@ -97,7 +98,7 @@ static void draw() {
   for (int k = 0; k < n && y + 12 <= tft.height() - UI_STATUSBAR_H; k++) {
     const Probe &p = pw[idx[k]];
     bool fresh = millis() - p.seen < 8000;
-    tft.setTextColor(fresh ? ILI9341_YELLOW : ILI9341_CYAN);
+    tft.setTextColor(fresh ? ILI9341_YELLOW : thLabel());
     tft.setCursor(4, y);
     tft.printf("%-20.20s %dd %ddBm x%u", p.ssid, p.devN, p.rssi, p.hits);
     y += 12;

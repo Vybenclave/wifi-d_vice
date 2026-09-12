@@ -14,6 +14,7 @@
 #include <string.h>
 #include <math.h>
 #include "ui.h"
+#include "theme.h"
 
 static BLEScan *pScan = nullptr;
 static bool running = false;
@@ -103,7 +104,7 @@ static void draw() {
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(2, 30);
   tft.printf("adv/s %lu   distinct addr ~%d", (unsigned long)vRate, vAddr);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   tft.setCursor(2, 44);
   tft.printf("Apple popup-spam frames: %lu", (unsigned long)vCont);
   tft.setCursor(2, 56);

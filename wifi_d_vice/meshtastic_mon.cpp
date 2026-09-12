@@ -376,7 +376,7 @@ static void drawBody() {
 
   int y = BODY_Y + (linkUp ? 4 : 18);
   if (view == 0) {
-    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextColor(thLabel());
     tft.setCursor(4, y);
     tft.printf("my !%06x   nodes: %d", (unsigned)(myNum & 0xFFFFFF), nodeN);
     y += 14;
@@ -453,7 +453,7 @@ static void stopScan() {
 static void drawScanning() {
   tft.fillRect(0, 30, tft.width(), 44, ILI9341_BLACK);
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   tft.setCursor(6, 40);
   uint32_t el = millis() - scanStartMs;
   uint32_t left = el >= SCAN_MS ? 0 : (SCAN_MS - el) / 1000 + 1;
@@ -477,7 +477,7 @@ static void drawPick() {
     uiDrawMenuButton(forgetBtn);
     return;
   }
-  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextColor(thLabel());
   tft.setCursor(6, 34);
   tft.print("Pick a node:");
   int y = 50;
