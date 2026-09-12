@@ -44,8 +44,9 @@ learning and for field reconnaissance.
 - CC1101 sub-GHz sweep (315, 433, 868, and 915 MHz).
 - Meshtastic mesh monitor over BLE. It links to a Meshtastic node and shows
   the traffic that the node hears.
-- GPS wardriving, with optional AES-256-GCM encrypted logs. The GPS module
-  also drives the device clock: it retries every 15s from boot until it
+- GPS wardriving, with Log
+- Optional AES-256-GCM encrypted logs. *see engagement section*
+- The GPS module drives the device clock: it retries every 15s from boot until it
   gets a fix-derived UTC time, then resyncs hourly. Every SD log timestamps
   rows in that UTC clock; the bottom-bar clock shows it in 12h or 24h
   format, in the timezone set under System > Display > Timezone (display
