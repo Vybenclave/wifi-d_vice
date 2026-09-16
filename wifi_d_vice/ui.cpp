@@ -560,7 +560,15 @@ bool uiTouchInButton(const TouchPoint &t, const Btn &b) {
 // competing for CPU/SPI time with whatever scan the active screen is
 // running. A few characters advancing a few times a second still reads
 // unmistakably as a ticker.
-static String   s_toastMsg;
+// Fixed buffers, not String -- this used to build a String (heap alloc)
+// plus another String grown one character at a time (repeated realloc)
+// every TOAST_STEP_MS while a long message was scrolling. Individually
+// tiny, but that's exactly the kind of steady small alloc/free churn that
+// fragments heap over a long uptime, on a chip where WiFi/BLE already
+// fight for contiguous DRAM (see [[wroom32-wifi-ble-ram]]) -- worth
+// cutting outright rather than accepting it as a rounding error.
+static const int TOAST_MSG_CAP = 80;   // generous for any message this app sends
+static char     s_toastMsg[TOAST_MSG_CAP] = "";
 static bool     s_toastScrolling = false;
 static int      s_toastCharsFit = 0;
 static int      s_toastOffset = 0;
@@ -568,7 +576,7 @@ static uint32_t s_toastLastStep = 0;
 static const uint32_t TOAST_STEP_MS = 350;
 static const char *TOAST_LOOP_GAP = "     ";   // separates the end from the restart
 
-static void toastDrawWindow(const String &window) {
+static void toastDrawWindow(const char *window) {
   int y = tft.height() - UI_STATUSBAR_H + 1;
   int w = tft.width() - UI_RIGHTZONE_W;   // clock (uiDrawClock) + battery glyph live past here
   tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
@@ -581,18 +589,24 @@ static void toastDrawWindow(const String &window) {
 
 void uiToast(const char *msg) {
   int w = tft.width() - UI_RIGHTZONE_W;
-  s_toastMsg = msg;
+  strncpy(s_toastMsg, msg, sizeof(s_toastMsg) - 1);
+  s_toastMsg[sizeof(s_toastMsg) - 1] = 0;
   s_toastCharsFit = (w - 4) / 6;   // default font: 6px advance/char at text size 1
   if (s_toastCharsFit < 1) s_toastCharsFit = 1;
+  if (s_toastCharsFit > TOAST_MSG_CAP - 1) s_toastCharsFit = TOAST_MSG_CAP - 1;
 
-  if ((int)s_toastMsg.length() <= s_toastCharsFit) {
+  int len = (int)strlen(s_toastMsg);
+  if (len <= s_toastCharsFit) {
     s_toastScrolling = false;
     toastDrawWindow(s_toastMsg);
   } else {
     s_toastScrolling = true;
     s_toastOffset = 0;
     s_toastLastStep = millis();
-    toastDrawWindow(s_toastMsg.substring(0, s_toastCharsFit));
+    char win[TOAST_MSG_CAP];
+    memcpy(win, s_toastMsg, s_toastCharsFit);
+    win[s_toastCharsFit] = 0;
+    toastDrawWindow(win);
   }
 }
 
@@ -603,7 +617,7 @@ void uiClearToast() {
   // whatever the next screen puts in the status bar, forever, since
   // nothing else ever tells it to stop.
   s_toastScrolling = false;
-  s_toastMsg = "";
+  s_toastMsg[0] = 0;
   int y = tft.height() - UI_STATUSBAR_H + 1;
   int w = tft.width() - UI_RIGHTZONE_W;
   tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
@@ -618,12 +632,16 @@ static void uiTickToast() {
   if (now - s_toastLastStep < TOAST_STEP_MS) return;
   s_toastLastStep = now;
 
-  String loopMsg = s_toastMsg + TOAST_LOOP_GAP;
-  int total = loopMsg.length();
+  char loopMsg[TOAST_MSG_CAP + 8];
+  snprintf(loopMsg, sizeof(loopMsg), "%s%s", s_toastMsg, TOAST_LOOP_GAP);
+  int total = (int)strlen(loopMsg);
   s_toastOffset = (s_toastOffset + 1) % total;
 
-  String window;
-  for (int i = 0; i < s_toastCharsFit; i++) window += loopMsg[(s_toastOffset + i) % total];
+  char window[TOAST_MSG_CAP];
+  int n = s_toastCharsFit;
+  if (n > (int)sizeof(window) - 1) n = sizeof(window) - 1;
+  for (int i = 0; i < n; i++) window[i] = loopMsg[(s_toastOffset + i) % total];
+  window[n] = 0;
   toastDrawWindow(window);
 }
 
