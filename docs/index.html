@@ -1,0 +1,228 @@
+<!doctype html>
+<title>D_VICE Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@600;800&family=Sora:wght@400;500;600;700&family=VT323&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0b0a14;
+  --panel:#151228;
+  --panel-2:#1b1730;
+  --ink:#eef0fa;
+  --ink-dim:#9b96bd;
+  --ink-faint:#6a6690;
+  --hot:#ff2fb0;
+  --cool:#31e1e8;
+  --line:#2a2545;
+  --shell:#232041;
+  --shell-dark:#131022;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg);
+  color:var(--ink);
+  font-family:'Sora',system-ui,sans-serif;
+  padding:0 16px;
+  padding-block:48px 64px;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:36px;
+  min-height:100vh;
+  overflow-x:hidden;
+}
+.glow-bg{
+  position:fixed; inset:0; z-index:-1; pointer-events:none;
+  background:
+    radial-gradient(60vw 40vh at 18% -5%, rgba(255,47,176,.16), transparent 60%),
+    radial-gradient(60vw 40vh at 88% 8%, rgba(49,225,232,.10), transparent 60%),
+    var(--bg);
+}
+header{
+  text-align:center;
+  max-width:640px;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:14px;
+}
+.eyebrow{
+  font-family:'VT323',monospace;
+  font-size:19px;
+  letter-spacing:.25em;
+  color:var(--cool);
+  text-transform:uppercase;
+}
+h1{
+  font-family:'Orbitron',sans-serif;
+  font-weight:800;
+  font-size:clamp(28px,6vw,44px);
+  letter-spacing:.02em;
+  margin:0;
+  text-wrap:balance;
+  background:linear-gradient(90deg,#ffe2f6,var(--hot) 55%,var(--cool));
+  -webkit-background-clip:text;
+  background-clip:text;
+  color:transparent;
+}
+header p{
+  margin:0;
+  color:var(--ink-dim);
+  font-size:15px;
+  line-height:1.6;
+  max-width:52ch;
+}
+header p a{color:var(--cool)}
+header p a:hover{color:var(--hot)}
+
+.stage{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  gap:18px;
+}
+
+/* device shell */
+.device{
+  --sw: 320px; /* logical screen width, swapped for portrait by JS */
+  --sh: 240px;
+  position:relative;
+  padding:22px 22px 46px;
+  border-radius:34px;
+  background:
+    linear-gradient(155deg,#2b2750,var(--shell) 40%,var(--shell-dark) 100%);
+  box-shadow:
+    0 1px 0 rgba(255,255,255,.06) inset,
+    0 40px 80px -30px rgba(0,0,0,.7),
+    0 0 0 1px rgba(255,255,255,.04);
+}
+.device .screen-well{
+  position:relative;
+  border-radius:10px;
+  background:#000;
+  padding:8px;
+  box-shadow:0 0 0 2px #000, 0 0 30px rgba(255,47,176,.15), inset 0 0 18px rgba(0,0,0,.8);
+}
+.device canvas{
+  display:block;
+  border-radius:3px;
+  cursor:pointer;
+  image-rendering:auto;
+}
+.device .cam{
+  position:absolute; top:9px; left:50%; transform:translateX(-50%);
+  width:6px;height:6px;border-radius:50%;
+  background:#000; box-shadow:0 0 0 2px #2f2a52, inset 0 0 2px #444;
+}
+.device .home-btn{
+  position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
+  width:26px;height:8px;border-radius:5px;
+  background:linear-gradient(180deg,#3a3564,#221f3d);
+  box-shadow:0 1px 0 rgba(255,255,255,.08) inset;
+}
+.device .led{
+  position:absolute; top:11px; right:20px;
+  width:6px;height:6px;border-radius:50%;
+  background:#132; box-shadow:0 0 0 1px #000;
+  transition:background .15s, box-shadow .15s;
+}
+.device .led.on{background:#3cff6b; box-shadow:0 0 6px 2px rgba(60,255,107,.8), 0 0 0 1px #000;}
+
+.hint-row{
+  display:flex; flex-wrap:wrap; justify-content:center; gap:10px;
+  font-family:'VT323',monospace; font-size:16px; color:var(--ink-faint);
+  letter-spacing:.03em;
+}
+.hint-row kbd{
+  border:1px solid var(--line); border-radius:4px; padding:1px 7px;
+  color:var(--ink-dim); background:var(--panel);
+}
+
+.panel{
+  width:100%; max-width:640px;
+  background:var(--panel);
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:20px 22px;
+  display:flex; flex-direction:column; gap:10px;
+}
+.panel h2{
+  margin:0; font-family:'Orbitron',sans-serif; font-size:13px; letter-spacing:.12em;
+  text-transform:uppercase; color:var(--cool);
+}
+.panel p{margin:0; color:var(--ink-dim); font-size:14px; line-height:1.65}
+.panel p strong{color:var(--ink); font-weight:600}
+.badge-row{display:flex; flex-wrap:wrap; gap:8px; margin-top:4px}
+.badge{
+  font-family:'VT323',monospace; font-size:15px; letter-spacing:.02em;
+  border:1px solid var(--line); border-radius:999px; padding:3px 12px;
+  color:var(--ink-dim);
+}
+
+footer{
+  color:var(--ink-faint); font-size:13px; text-align:center;
+  display:flex; flex-direction:column; gap:4px; align-items:center;
+}
+footer a{color:var(--ink-dim)}
+footer a:hover{color:var(--cool)}
+
+@media (max-width:460px){
+  .device{padding:16px 16px 36px; border-radius:26px}
+}
+</style>
+
+<div class="glow-bg"></div>
+
+<header>
+  <div class="eyebrow">// passive recon toolkit</div>
+  <h1>WIFI D_VICE — Interface Simulator</h1>
+  <p>
+    A click-through simulation of the real device's touchscreen firmware, running
+    in your browser with fabricated sample data standing in for live radio scans.
+    Every screen and menu is here — tap around exactly like you would on the
+    hardware. Source: <a href="https://github.com/Vybenclave/wifi-d_vice" target="_blank" rel="noopener">github.com/Vybenclave/wifi-d_vice</a>
+  </p>
+</header>
+
+<div class="stage">
+  <div class="device" id="device">
+    <div class="cam"></div>
+    <div class="led" id="statusLed"></div>
+    <div class="screen-well">
+      <canvas id="tft" width="320" height="240"></canvas>
+    </div>
+    <div class="home-btn"></div>
+  </div>
+  <div class="hint-row">
+    <span><kbd>tap</kbd> the screen to use it</span>
+    <span>·</span>
+    <span>gear icon = System settings</span>
+    <span>·</span>
+    <span>top-left <kbd>&lt;&lt;&lt;</kbd> = back (hold ~0.6s = home)</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>What you're looking at</h2>
+  <p>
+    <strong>This is a UI simulation, not the firmware.</strong> Every screen, menu,
+    and setting is real and navigable, but WiFi/BLE/sub-GHz data is generated
+    locally to demonstrate what a session looks like — nothing here scans real
+    airspace. Alerts, detections and drift happen on a timer so the device feels
+    alive as you explore it.
+  </p>
+  <div class="badge-row">
+    <span class="badge">28 screens</span>
+    <span class="badge">Basic / Vice themes</span>
+    <span class="badge">16 accent colors</span>
+    <span class="badge">landscape + portrait</span>
+  </div>
+</div>
+
+<footer>
+  <div>WIFI D_VICE is a passive radio-monitoring build for the ESP32 "Cheap Yellow Display."</div>
+  <div><a href="https://github.com/Vybenclave/wifi-d_vice" target="_blank" rel="noopener">View the firmware source →</a></div>
+</footer>
+
+<script src="app.js"></script>

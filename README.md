@@ -6,6 +6,10 @@ WIFI D_VICE is a passive radio-monitoring tool for the 2.8-inch ESP32
 "Cheap Yellow Display" (CYD). It receives and shows WiFi, Bluetooth Low
 Energy (BLE), and sub-GHz radio activity.
 
+**[Try the interface in your browser →](https://vybenclave.github.io/wifi-d_vice/)**
+A click-through simulation of the touchscreen firmware (`docs/`) -- every
+screen and menu, with fabricated data standing in for live radio scans.
+
 ## About the project
 
 Other CYD tools, such as Marauder and Bruce, showed that this low-cost
