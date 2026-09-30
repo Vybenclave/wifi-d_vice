@@ -31,7 +31,15 @@ detectors with traffic from other equipment.
 Passive analysis screens added for Marauder / Wireless Wizard / Flipper
 feature parity:
 
-- Probe-request watch -- the SSIDs nearby clients are directed-probing for.
+- Probe-request watch -- the SSIDs nearby clients are directed-probing for,
+  cross-checked against beacons seen in the same hop sweep. A probed SSID
+  with no matching beacon nearby is flagged "ABSENT" in red: the device is
+  leaking a preferred-network-list entry for a network that is not actually
+  present here (out of range, powered off, or hidden) -- the gap a KARMA /
+  "answer every SSID" rogue AP is built to exploit. A cloaked AP (blank SSID
+  in its beacon) is unmasked when it answers a directed probe with its real
+  SSID in the probe response; that correlation flags the row magenta as
+  "HIDDEN-AP" instead of ABSENT.
 - Client / station map -- client devices in the air, from management
   frames (probe / assoc / auth): MAC, OUI vendor, last AP, RSSI, frames.
 - WiFi camera detector -- beacon BSSID OUI against a camera-vendor table,
@@ -146,6 +154,35 @@ The most reliable alerts come from evidence that agrees across radios:
 
 Guardian mode is the place for these checks. It has the output of every
 monitor.
+
+### 5. WiFi Pineapple Pager feature parity
+
+The Hak5 WiFi Pineapple Pager's *detection* side (Recon dashboard, Alert
+Payloads, Handshake Collection) has passive equivalents worth porting; its
+offensive side (PineAP impersonation / Evil WPA / SSID Pool, forced-deauth
+handshake capture, `DEAUTH_CLIENT`) does not fit this tool and stays out per
+"Out of scope" below. Planned, in no particular order:
+
+- Recon live graph -- a rolling view of packets/sec, AP count, and client
+  count (data already tallied in `wifi_ids.cpp` / `wifi_scan.cpp`; needs a
+  screen, not new capture logic).
+- Per-entry "Examine" drill-down -- tap an AP or client in `wifi_scan.cpp` /
+  `client_map.cpp` for a detail view: encryption, RSSI history, packet
+  counts, associated clients/SSIDs.
+- A unified alert framework -- the direct equivalent of Alert Payloads:
+  per-category enable/disable (deauth flood, rogue AP, tracker, camera,
+  drone, BLE skimmer, absent-SSID probe) with a configurable action
+  (on-screen banner, tone, LED). This is the same thing as Guardian mode
+  above; Guardian mode is the umbrella, this is its alert-config piece.
+- Passive EAPOL handshake detection/logging -- log the WPA 4-way handshake
+  as it happens naturally (client join, or the ~5-minute rekey), without
+  forcing it via deauth. Store as pcap evidence only ("this handshake was
+  capturable by a passive listener"); do not convert to a crackable format
+  (hashcat hcapx etc.) -- that step is attack tooling, not detection.
+- Raw WiFi PCAP logging to SD -- same idea as the sub-GHz raw OOK capture
+  (`subghz_cc1101.cpp`), for 802.11 frames from the shared `wifi_ids` core.
+- Recon view filters -- filter `client_map.cpp` / `wifi_scan.cpp` lists by
+  vendor/OUI (`mac_vendor.cpp` already has the table) or by SSID substring.
 
 ## Out of scope
 

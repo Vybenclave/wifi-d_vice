@@ -6,6 +6,22 @@
 // device's preferred-network list, and it is the surface a KARMA / "answer
 // every SSID" rogue AP feeds on.
 //
+// Also tracks BEACON SSIDs seen in the same hop sweep, and flags any probed
+// SSID that has no matching beacon nearby: the device is announcing a known
+// network that is not actually present here -- either out of range, powered
+// off, or a hidden (non-broadcasting) AP the device still remembers. That is
+// the strongest form of the PNL leak, and it is exactly the gap a rogue AP
+// answering "every SSID" (KARMA) is built to fill.
+//
+// A cloaked AP sends beacons with a blank SSID, but still answers a client's
+// DIRECTED probe with a normal PROBE_RESP that carries its real SSID in the
+// clear -- cloaking hides the name from a casual scan, not from a device
+// that already knows it. This module records which BSSIDs are currently
+// beaconing hidden, then watches probe responses from those same BSSIDs to
+// unmask the SSID they carry. An unmasked hidden AP also counts as
+// "broadcasting nearby" for the ABSENT check above, and is called out with
+// its own tag ('H') so a hidden hit reads differently from an ordinary one.
+//
 // PASSIVE ONLY -- wifi_ids receives; nothing here transmits.
 #include <string.h>
 #include "ui.h"
@@ -24,9 +40,80 @@ static const int PW_N = 16;
 static Probe pw[PW_N];
 static uint32_t gReqs, gBroadcast;
 static int handle = -1;
+static int beaconHandle = -1;
+static int probeRespHandle = -1;
 static bool running = false;
 static uint32_t lastDraw;
 static bool dirty = true;
+
+// SSIDs seen in beacons (or unmasked via a probe response, see below) during
+// this session, so a probed SSID can be marked "not broadcasting nearby"
+// when it has no recent match here.
+struct BeaconSsid {
+  char     ssid[24];
+  uint32_t seen;
+  bool     hidden;   // learned by unmasking a cloaked AP's probe response, not its beacon
+};
+static const int BC_N = 24;
+static const uint32_t BC_STALE_MS = 15000;  // beacons repeat ~10x/sec typ.; 15s covers a full hop cycle
+static BeaconSsid bc[BC_N];
+
+// BSSIDs currently seen beaconing with a blank (cloaked) SSID. A probe
+// response from one of these, naming the real SSID, is an unmask.
+struct HiddenBssid {
+  uint8_t  bssid[6];
+  uint32_t seen;
+};
+static const int HB_N = 8;
+static HiddenBssid hb[HB_N];
+
+static BeaconSsid *bcFind(const char *s) {
+  for (int i = 0; i < BC_N; i++)
+    if (bc[i].seen && strcmp(bc[i].ssid, s) == 0) return &bc[i];
+  return nullptr;
+}
+static BeaconSsid *bcSlot() {
+  int lru = 0;
+  for (int i = 1; i < BC_N; i++) {
+    if (!bc[i].seen) return &bc[i];
+    if (bc[i].seen < bc[lru].seen) lru = i;
+  }
+  return &bc[lru];
+}
+// Record `s` as currently present. `viaHidden` marks it as learned by
+// unmasking a cloaked AP rather than from an ordinary open beacon; once an
+// SSID is flagged hidden it stays flagged (a later ordinary sighting does
+// not erase the "this AP cloaks" fact).
+static void bcRecord(const char *s, bool viaHidden) {
+  BeaconSsid *b = bcFind(s);
+  if (!b) { b = bcSlot(); memset(b, 0, sizeof(*b)); strncpy(b->ssid, s, 23); }
+  b->seen = millis();
+  b->hidden = b->hidden || viaHidden;
+}
+static bool broadcastingNearby(const char *s) {
+  BeaconSsid *b = bcFind(s);
+  return b && (millis() - b->seen) < BC_STALE_MS;
+}
+// nullptr if not present at all; else true/false for whether the presence
+// came from unmasking a cloaked AP.
+static const BeaconSsid *presenceInfo(const char *s) {
+  BeaconSsid *b = bcFind(s);
+  return (b && (millis() - b->seen) < BC_STALE_MS) ? b : nullptr;
+}
+
+static HiddenBssid *hbFind(const uint8_t *bssid) {
+  for (int i = 0; i < HB_N; i++)
+    if (hb[i].seen && !memcmp(hb[i].bssid, bssid, 6)) return &hb[i];
+  return nullptr;
+}
+static HiddenBssid *hbSlot() {
+  int lru = 0;
+  for (int i = 1; i < HB_N; i++) {
+    if (!hb[i].seen) return &hb[i];
+    if (hb[i].seen < hb[lru].seen) lru = i;
+  }
+  return &hb[lru];
+}
 
 static Probe *pwFind(const char *s) {
   for (int i = 0; i < PW_N; i++)
@@ -72,6 +159,51 @@ static void onProbeReq(const WifiIdsFrame &f, void *) {
   dirty = true;
 }
 
+// Beacon fixed params are 12 bytes (timestamp 8 + interval 2 + capability 2),
+// so the IE list starts at raw+24+12 -- unlike the 24-byte header subtypes,
+// see the WifiIdsFrame layout note in wifi_ids.h.
+static void onBeacon(const WifiIdsFrame &f, void *) {
+  if (f.rawLen < 38) return;
+  const uint8_t *ie = f.raw + 36;
+  if (ie[0] != 0) return;                       // first IE must be SSID
+  uint8_t l = ie[1];
+  if (l == 0 || 38 + l > f.rawLen) {             // hidden (blank) SSID -- remember the BSSID
+    HiddenBssid *hbb = hbFind(f.addr3);
+    if (!hbb) { hbb = hbSlot(); memset(hbb, 0, sizeof(*hbb)); memcpy(hbb->bssid, f.addr3, 6); }
+    hbb->seen = millis();
+    return;
+  }
+  if (l > 23) l = 23;
+
+  char s[24];
+  memcpy(s, ie + 2, l); s[l] = 0;
+  for (int i = 0; i < l; i++) if (s[i] < 0x20 || s[i] > 0x7E) s[i] = '.';
+
+  bcRecord(s, false);
+  dirty = true;
+}
+
+// A cloaked AP still answers a directed probe with its real SSID -- correlate
+// against the hidden-BSSID set gathered from beacons above to confirm this is
+// an unmask, not just an ordinary AP being asked its name.
+static void onProbeResp(const WifiIdsFrame &f, void *) {
+  if (f.rawLen < 38) return;
+  const uint8_t *ie = f.raw + 36;
+  if (ie[0] != 0) return;                       // first IE must be SSID
+  uint8_t l = ie[1];
+  if (l == 0 || 38 + l > f.rawLen) return;       // no SSID in this response -- nothing to unmask
+  if (l > 23) l = 23;
+
+  char s[24];
+  memcpy(s, ie + 2, l); s[l] = 0;
+  for (int i = 0; i < l; i++) if (s[i] < 0x20 || s[i] > 0x7E) s[i] = '.';
+
+  HiddenBssid *hbb = hbFind(f.addr3);
+  bool wasHidden = hbb && (millis() - hbb->seen) < BC_STALE_MS;
+  bcRecord(s, wasHidden);
+  dirty = true;
+}
+
 static void draw() {
   dirty = false;
   uiClearBelow(UI_CONTENT_Y_PLAIN);
@@ -98,9 +230,12 @@ static void draw() {
   for (int k = 0; k < n && y + 12 <= tft.height() - UI_STATUSBAR_H; k++) {
     const Probe &p = pw[idx[k]];
     bool fresh = millis() - p.seen < 8000;
-    tft.setTextColor(fresh ? ILI9341_YELLOW : accentLabel());
+    const BeaconSsid *b = presenceInfo(p.ssid);
+    char flag = !b ? '!' : (b->hidden ? 'H' : ' ');
+    const char *tag = !b ? " ABSENT" : (b->hidden ? " HIDDEN-AP" : "");
+    tft.setTextColor(!b ? ILI9341_RED : (b->hidden ? ILI9341_MAGENTA : (fresh ? ILI9341_YELLOW : accentLabel())));
     tft.setCursor(4, y);
-    tft.printf("%-20.20s %dd %ddBm x%u", p.ssid, p.devN, p.rssi, p.hits);
+    tft.printf("%c%-15.15s %dd %ddBm x%u%s", flag, p.ssid, p.devN, p.rssi, p.hits, tag);
     y += 12;
   }
 }
@@ -108,11 +243,15 @@ static void draw() {
 void probeWatchEnter() {
   uiDrawTopBar("Probe Watch");
   memset(pw, 0, sizeof pw);
+  memset(bc, 0, sizeof bc);
+  memset(hb, 0, sizeof hb);
   gReqs = gBroadcast = 0;
   dirty = true;
   wifiIdsBegin();
   wifiIdsSetDwell(250);
   handle = wifiIdsRegister(&onProbeReq, nullptr, WIDS_BIT(WIDS_PROBE_REQ));
+  beaconHandle = wifiIdsRegister(&onBeacon, nullptr, WIDS_BIT(WIDS_BEACON));
+  probeRespHandle = wifiIdsRegister(&onProbeResp, nullptr, WIDS_BIT(WIDS_PROBE_RESP));
   running = true;
   lastDraw = 0;
   draw();
@@ -128,6 +267,8 @@ void probeWatchLoop() {
 void probeWatchTouch(const TouchPoint &t) {
   if (!t.isNewPress || t.y < UI_CONTENT_Y_PLAIN) return;
   memset(pw, 0, sizeof pw);
+  memset(bc, 0, sizeof bc);
+  memset(hb, 0, sizeof hb);
   gReqs = gBroadcast = 0;
   draw();
   uiWaitForRelease();
@@ -138,5 +279,9 @@ void probeWatchExit() {
   running = false;
   wifiIdsUnregister(handle);
   handle = -1;
+  wifiIdsUnregister(beaconHandle);
+  beaconHandle = -1;
+  wifiIdsUnregister(probeRespHandle);
+  probeRespHandle = -1;
   wifiIdsEnd();
 }

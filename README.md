@@ -126,6 +126,11 @@ arduino-cli upload  -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32:PartitionScheme=hug
 - Guardian mode: one "on watch" mode that runs a selected set of monitors
   together and sends every alert to one screen.
 - A 2.4 GHz energy and jamming watch with the nRF24L01+ or a CC2500.
+- WiFi Pineapple Pager detection-feature parity: a Recon live graph
+  (packets/sec, AP and client counts), a per-entry drill-down view, a
+  unified per-category alert framework (Guardian mode's alert-config piece),
+  passive EAPOL handshake logging (no forced deauth), raw WiFi PCAP logging
+  to SD, and vendor/SSID filters on the Recon list screens.
 - Wider engagement coverage: more of the tool's output under the armed-mode
   protection, and fuller operator and job tracking.
 
