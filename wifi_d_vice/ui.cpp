@@ -46,6 +46,24 @@ static bool s_clockForce = false; // uiDrawStatusBar() -> uiDrawClock() repaint 
 static int s_batPct = -2;         // -2 = never read
 static int  s_bgMode  = UI_BG_BLACK;
 void uiSetBgMode(int m) { s_bgMode = m; }
+
+// Cached in RAM (like themeGet()) rather than read from NVS -- uiDrawTopBar()
+// checks this on every screen draw, not just once at Enter().
+static bool s_listBg = false;
+static void loadListBg() {
+  Preferences p;
+  p.begin("disp", true);
+  s_listBg = p.getBool("listbg", false);
+  p.end();
+}
+bool uiListBgEnabled() { return s_listBg; }
+void uiSetListBgEnabled(bool on) {
+  s_listBg = on;
+  Preferences p;
+  p.begin("disp", false);
+  p.putBool("listbg", on);
+  p.end();
+}
 static void loadBeepVolume();   // defined below beep(); forward-declared for uiInit()
 static void ledBusyTask(void *); // defined below ledSet(); forward-declared for uiInit()
 
@@ -288,6 +306,7 @@ void uiInit() {
 
   loadBeepVolume();
   uiBatteryCalLoad();
+  loadListBg();
   dacInit();
   xTaskCreatePinnedToCore(ledBusyTask, "ledbusy", 1536, nullptr, 1, nullptr, 0);
 }
@@ -315,6 +334,38 @@ static const uint16_t *bgSrc(int &sw, int &sh) {
   sw = 120; sh = 160; return BG_PORTRAIT;
 }
 
+static inline uint16_t avg565(uint16_t a, uint16_t b) {
+  uint16_t r = (((a >> 11) & 31) + ((b >> 11) & 31)) / 2;
+  uint16_t g = (((a >> 5)  & 63) + ((b >> 5)  & 63)) / 2;
+  uint16_t bl = ((a & 31) + (b & 31)) / 2;
+  return (r << 11) | (g << 5) | bl;
+}
+static inline uint16_t avg565_4(uint16_t a, uint16_t b, uint16_t c, uint16_t d) {
+  uint16_t r = (((a >> 11) & 31) + ((b >> 11) & 31) + ((c >> 11) & 31) + ((d >> 11) & 31)) / 4;
+  uint16_t g = (((a >> 5)  & 63) + ((b >> 5)  & 63) + ((c >> 5)  & 63) + ((d >> 5)  & 63)) / 4;
+  uint16_t bl = ((a & 31) + (b & 31) + (c & 31) + (d & 31)) / 4;
+  return (r << 11) | (g << 5) | bl;
+}
+
+// Softened 2x upscale of the half-res scene art -- plain nearest-neighbor
+// (sx=xx>>1) reads blocky at this scale; blend toward the next source texel
+// on the "far" half of each 2x2 output block instead, on both axes, so the
+// background reads as a blurred photo rather than pixel art. Cheap (at most
+// 4 PROGMEM reads, integer-only) since the source is already tiny.
+static uint16_t bgSample(const uint16_t *img, int sw, int sh, int xx, int yy) {
+  int sx = xx >> 1; if (sx >= sw) sx = sw - 1; if (sx < 0) sx = 0;
+  int sy = yy >> 1; if (sy >= sh) sy = sh - 1; if (sy < 0) sy = 0;
+  bool blendX = xx & 1, blendY = yy & 1;
+  uint16_t p00 = pgm_read_word(&img[sy * sw + sx]);
+  if (!blendX && !blendY) return p00;
+  int sxN = sx + 1; if (sxN >= sw) sxN = sw - 1;
+  int syN = sy + 1; if (syN >= sh) syN = sh - 1;
+  if (blendX && !blendY) return avg565(p00, pgm_read_word(&img[sy * sw + sxN]));
+  if (!blendX && blendY) return avg565(p00, pgm_read_word(&img[syN * sw + sx]));
+  return avg565_4(p00, pgm_read_word(&img[sy * sw + sxN]),
+                   pgm_read_word(&img[syN * sw + sx]), pgm_read_word(&img[syN * sw + sxN]));
+}
+
 void uiClearRect(int x, int y, int w, int h) {
   if (!themeIsVice()) { tft.fillRect(x, y, w, h, ILI9341_BLACK); return; }
 
@@ -324,13 +375,9 @@ void uiClearRect(int x, int y, int w, int h) {
     static uint16_t line[320];
     tft.startWrite();
     for (int yy = y; yy < y + h; yy++) {
-      int sy = yy >> 1; if (sy >= sh) sy = sh - 1; if (sy < 0) sy = 0;
-      const uint16_t *srow = img + sy * sw;
       int n = 0;
-      for (int xx = x; xx < x + w && n < 320; xx++, n++) {
-        int sx = xx >> 1; if (sx >= sw) sx = sw - 1; if (sx < 0) sx = 0;
-        line[n] = pgm_read_word(&srow[sx]);
-      }
+      for (int xx = x; xx < x + w && n < 320; xx++, n++)
+        line[n] = bgSample(img, sw, sh, xx, yy);
       tft.setAddrWindow(x, yy, n, 1);
       tft.writePixels(line, n, true, false);
     }
@@ -358,7 +405,10 @@ void uiClearBelow(int y0) {
 }
 
 void uiDrawTopBar(const char *title) {
-  s_bgMode = UI_BG_BLACK;   // opt-in per screen; default back to plain
+  // Default per-screen: plain gradient, unless the user opted list/live-data
+  // screens into the scene image too (System > Display > Theme & Color). A
+  // menu screen overriding to UI_BG_IMAGE right after is then a no-op.
+  s_bgMode = uiListBgEnabled() ? UI_BG_IMAGE : UI_BG_BLACK;
   tft.fillRect(0, 0, tft.width(), 28, accentTitleBar());   // universal -- Basic used a fixed navy before
   tft.drawFastHLine(0, 28, tft.width(), ILI9341_WHITE);
   uiDrawStatusBar();

@@ -307,7 +307,7 @@ static int pickAccentColor(int current) {
 // applies immediately and closes the dropdown, so there's no separate
 // Apply step or pending-vs-active distinction to track here.
 static void systemShowThemeColor() {
-  Btn themeBtn, accentBtn;
+  Btn themeBtn, accentBtn, listBgBtn;
   auto draw = [&]() {
     uiDrawTopBar("Theme & Color");
     uiClearBelow(29);
@@ -316,8 +316,15 @@ static void systemShowThemeColor() {
     snprintf(albl, sizeof(albl), "Accent: %s", accentName(accentGet()));
     themeBtn  = {8, 40, tft.width() - 16, 40, tlbl};
     accentBtn = {8, 88, tft.width() - 16, 40, albl};
+    // Vice-only (uiListBgEnabled() has no effect under Basic, same as the
+    // menu screens' existing scene background); shown either way so the
+    // setting is discoverable and simply does nothing yet under Basic.
+    listBgBtn = {8, 136, tft.width() - 16, 40,
+                 uiListBgEnabled() ? "List screens: blurred scene bg"
+                                   : "List screens: gradient bg"};
     uiDrawButton(themeBtn);
     uiDrawButton(accentBtn);
+    uiDrawButton(listBgBtn);
     // A live swatch of the current accent next to its row, in the active
     // theme's own style (see pickAccentColor()'s swatches for why).
     int sw = 24;
@@ -346,6 +353,12 @@ static void systemShowThemeColor() {
       uiWaitForRelease();
       int chosen = pickAccentColor(accentGet());
       if (chosen != accentGet()) { accentSet(chosen); uiClearBelow(0); }
+      draw();
+      continue;
+    }
+    if (uiTouchInButton(t, listBgBtn)) {
+      uiWaitForRelease();
+      uiSetListBgEnabled(!uiListBgEnabled());
       draw();
       continue;
     }

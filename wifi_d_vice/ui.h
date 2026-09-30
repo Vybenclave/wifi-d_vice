@@ -46,14 +46,26 @@ uint16_t uiBgColor(int y);
 void uiClearRect(int x, int y, int w, int h);
 void uiClearBelow(int y0);   // (0, y0) .. bottom-right
 
-// Content-area background for menu / button screens: the dimmed Vice scene
-// image instead of the flat gradient. UI_BG_BLACK (flat black / gradient) is
-// the default and is restored by every uiDrawTopBar(); a button screen opts
-// in by calling uiSetBgMode(UI_BG_IMAGE) right after its top bar (or before
-// its first uiClearBelow, for the home menu which has no top bar). List and
-// live-data screens leave it alone -> black. No effect in the Basic theme.
+// Content-area background for menu / button screens: the dimmed, softened
+// Vice scene image instead of the flat gradient. UI_BG_BLACK (flat black /
+// gradient) is the default and is restored by every uiDrawTopBar() UNLESS
+// uiListBgEnabled() is on, in which case the default is UI_BG_IMAGE instead
+// -- that's what lets list / live-data screens (which never call
+// uiSetBgMode() themselves) pick up the scene image too. A button screen
+// still opts in explicitly by calling uiSetBgMode(UI_BG_IMAGE) right after
+// its top bar (or before its first uiClearBelow, for the home menu which has
+// no top bar) -- harmless no-op when the default is already UI_BG_IMAGE. No
+// effect in the Basic theme.
 enum { UI_BG_BLACK = 0, UI_BG_IMAGE = 1 };
 void uiSetBgMode(int mode);
+
+// Whether list / live-data screens (which don't call uiSetBgMode()
+// themselves) default to the scene image instead of the gradient. Persisted
+// in NVS ("disp"/"listbg", same namespace as splashEnabled()). Off by
+// default -- preserves the existing plain-gradient look on text-heavy
+// screens unless the user opts in from System > Display > Theme & Color.
+bool uiListBgEnabled();
+void uiSetListBgEnabled(bool on);
 
 // Persistent bottom chrome: a solid black strip UI_STATUSBAR_H tall with a
 // 1px white rule along its top edge, holding the toast line, the clock and
