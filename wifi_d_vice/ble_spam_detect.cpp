@@ -95,7 +95,7 @@ static void computeWindow() {
 }
 
 static uint16_t sevCol(uint8_t s) {
-  return s == SV_ALERT ? ILI9341_RED : s == SV_WATCH ? ILI9341_YELLOW : ILI9341_GREEN;
+  return uiSevColor(s);   // shared OK/WATCH/ALERT color convention, see ui.h
 }
 
 static void draw() {

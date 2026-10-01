@@ -15,7 +15,11 @@ detectors with traffic from other equipment.
 - BLE scan and a tracker detector (AirTag, SmartTag, Tile, Chipolo, and the
   Google Find My Device network).
 - Deauthentication / disassociation flood detector, plus beacon-flood and
-  auth/assoc-flood detectors, on one shared promiscuous core.
+  auth/assoc-flood detectors, on one shared promiscuous core. The same core
+  also carries KARMA detection, channel-switch-announcement abuse, and --
+  via a narrow, opt-in widening to EAPOL/WPS-carrying data frames --
+  handshake-theft correlation, PMKID-harvest detection, KRACK detection, and
+  WPS brute-force detection. See section 3 for all of these.
 - Flock Safety camera detection.
 - BLE skimmer detection (module names + the 0xFFD0 UART-bridge service).
 - Flipper Zero and Meta / Ray-Ban glasses tagging in the BLE scan.
@@ -125,21 +129,82 @@ core.
   failure raises a "ROGUE-AP" alert in the WiFi IDS view. Not done yet: a
   check for a well-known brand SSID on a locally administered BSSID; a
   per-BSSID RSSI range instead of one typical value.
-- Beacon flood — a rise in the count of unique SSIDs or in the beacon rate,
-  above a moving baseline; random-character SSIDs; sequential or random
-  BSSID MAC addresses.
-- Authentication and association flood — a high rate of authentication or
-  association requests to one BSSID, from many different (and often
-  invalid) source MAC addresses, in a short time.
-- Deauthentication detector, version 2 — add disassociation frames, reason
-  codes, and spoof detection. A spoof is a deauthentication that claims to
-  come from a BSSID, but the sequence number or the RSSI does not match the
-  real beacons of that BSSID.
+- Beacon flood — DONE. `wifi_ids_screen.cpp`'s `onBeacon()` / `sevBeacon()`.
+  A Bloom-filter distinct-BSSID estimate over a 5 s window, random/binary
+  SSID detection, locally-administered (randomized) BSSID MAC detection, and
+  near-sequential BSSID detection (the mdk4 / aireplay beacon-spam
+  signature).
+- Authentication and association flood — DONE. `onAuthAssoc()` /
+  `sevAuth()`. A Bloom-filter distinct-source-MAC estimate, a
+  locally-administered source-MAC flag, and a per-BSSID target-hit table,
+  over the same 5 s window.
+- Deauthentication detector, version 2 — DONE. `onDeauthFamily()` /
+  `sevDeauth()`. Disassociation frames, reason codes, and spoof detection: a
+  deauth/disassoc that claims to come from a BSSID's own beacon baseline
+  (learned live from `onBeacon()`) but whose channel, RSSI, or sequence
+  number don't match.
+- Pwnagotchi presence — DONE. `onBeacon()`: fixed-MAC match
+  (`de:ad:be:ef:de:ad`) plus JSON name extraction from the beacon SSID. Not
+  an attack in itself; surfaced as a WATCH-tier note, not an alert.
+- KARMA detection — DONE. One BSSID answering probe requests for several
+  different SSIDs. Management-frame only (`WIDS_PROBE_RESP`), no capture-core
+  change needed.
+- Channel-switch-announcement (CSA) abuse — DONE. An off-regulatory-domain
+  target channel (hard violation, immediate alert), or a CSA re-announced /
+  re-targeted without a real channel switch ever happening (the mdk4-style
+  disruption signature). Management-frame only (action frames, subtype
+  `0xD`, same precedent `drone_detect.cpp` already uses for Remote ID), no
+  capture-core change needed.
+- Handshake-theft correlation — DONE. A deauth for client X, then an EAPOL
+  4-way handshake (message 2) for X on the same BSSID within 10 seconds.
+  Needed widening the shared promiscuous core (`wifi_ids.cpp`) to admit
+  EAPOL-carrying data frames — see below.
+- PMKID-harvest detection — DONE. An EAPOL message-1 with no matching
+  recent real association for that (STA, BSSID) pair — the clientless
+  direct-association PMKID-grab signature (hcxdumptool-style). Framed as
+  suspicion (WATCH), escalating to ALERT only with corroboration (2+
+  distinct targeted STAs, or a message-1 that never saw a message-2 reply).
+- KRACK detection — DONE. The same EAPOL message-3 replay counter seen
+  twice for one (STA, BSSID) pair (the 2017 Vanhoef key-reinstallation
+  signature). Rides the same EAPOL classification handshake-theft needed, no
+  additional capture-core work.
+- WPS brute-force detection — DONE. WSC (WiFi Simple Config) EAP-Packet
+  attempt rate per BSSID, in the same 5 s window the flood detectors use
+  (the Reaver/Bully PIN-brute-force signature). Needed a second
+  capture-core admission path (802.1X EAP-Packet / Expanded-Type / WFA
+  vendor id, alongside the EAPOL-Key path above) — see below. Alert
+  thresholds are a starting point, not yet tuned against real Reaver/Bully
+  traffic on hardware.
 
-Later work (separate notes): correlation of handshake theft (a
-deauthentication, then an EAPOL 4-way handshake for the same client within
-seconds); a PMKID-harvest pattern; the presence of a Pwnagotchi; KARMA (one
-BSSID that answers with many ESSIDs); channel-switch-announcement abuse.
+**EAPOL/WPS capture-core widening** (`wifi_ids.cpp`, `wifi_ids.h`): the
+capture core was management-frame-only, twice over (the driver's own
+promiscuous filter, and a second check in the RX callback). Handshake-theft,
+PMKID-harvest, KRACK, and WPS brute-force all need to see EAPOL (WPA 4-way
+handshake) or WSC (WPS) traffic, which rides on 802.11 DATA frames. Both are
+themselves unencrypted (they ARE the key exchange / provisioning handshake),
+so this is still fully passive — no PSK needed, nothing transmitted.
+`wifiIdsWantEapol(true)` widens the filter to admit data frames; a cheap,
+cascading admission filter in the RX callback (frame-type check → 802.11
+header-length arithmetic from ToDS/FromDS/QoS/Order → LLC/SNAP + ethertype
+`0x888E` → 802.1X packet type) rejects the non-EAPOL data-frame majority
+(encrypted IP traffic) before any real parsing, and is opt-in per consumer
+so a screen that never calls it pays zero extra per-packet cost. See
+`wifi_ids.h`'s `WifiIdsEapol`/`WifiIdsWps` structs and
+`wifiIdsRegisterEapol()`/`wifiIdsRegisterWps()`.
+
+**Not done, deferred pending a feasibility probe (not a hardware gap):**
+control-frame-based detection — a virtual carrier-sense / NAV-duration DoS
+(bogus RTS/CTS with an inflated NAV field making other stations defer
+transmission indefinitely) and PS-Poll spoofing (desyncing a client's
+power-save buffered-frame delivery). Unlike the EAPOL case, there's no cheap
+late-stage filter to reject most control-frame traffic before real parsing
+(the two things worth inspecting — NAV duration, PS-Poll — sit in the very
+frames you'd capture), control frames are typically the *highest*-rate
+frame family on a busy channel, and ESP32 promiscuous-mode control-frame
+delivery reliability is unverified from here. Needs a short isolated
+hardware probe (flip on `WIFI_PROMIS_FILTER_MASK_CTRL`, watch
+`wifiIdsDropped()` on a busy channel) before it's worth designing detector
+logic for.
 
 ### 4. Cross-radio correlation
 
@@ -150,7 +215,11 @@ The most reliable alerts come from evidence that agrees across radios:
   only a strange sweep result.
 - A deauthentication burst for client X, AND an EAPOL 4-way handshake for
   client X on the same channel within seconds. This is a handshake theft in
-  progress.
+  progress. The single-radio version of this check (WiFi IDS screen only, no
+  cross-radio evidence) is DONE — see section 3's handshake-theft
+  correlator. Guardian mode's job here is to factor in BLE/sub-GHz evidence
+  on top when deciding how loudly to alert, not to reimplement the
+  correlation.
 
 Guardian mode is the place for these checks. It has the output of every
 monitor.

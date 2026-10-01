@@ -22,6 +22,13 @@ static const int UI_DAC_HZ = 22050;
 dac_continuous_handle_t uiDac() { return g_dac; }
 int uiDacRate() { return UI_DAC_HZ; }
 
+uint16_t uiSevColor(uint8_t sev) {
+  return sev == UI_SEV_ALERT ? ILI9341_RED : (sev == UI_SEV_WATCH ? ILI9341_YELLOW : ILI9341_GREEN);
+}
+const char *uiSevTag(uint8_t sev) {
+  return sev == UI_SEV_ALERT ? "ALERT" : (sev == UI_SEV_WATCH ? "watch" : "ok");
+}
+
 static void dacInit() {
   dac_continuous_config_t dc = {};
   dc.chan_mask = DAC_CHANNEL_MASK_CH1;   // GPIO26

@@ -117,6 +117,12 @@ static const uint8_t WIFI_IDS_CHAN_MIN = 1;
 static const uint8_t WIFI_IDS_CHAN_MAX = 13;   // 12/13 are set-channel no-ops on an 11-channel regdomain; harmless
 void    wifiIdsSetDwell(uint32_t dwellMs);
 void    wifiIdsHopPin(uint8_t channel);
+
+// Cycle ONLY these channels (1-3), dwelling s_dwellMs on each before moving
+// to the next -- for locking onto a specific SSID that spans more than one
+// channel (mesh/dual-band). count is clamped to 3. Clears any pin.
+// wifiIdsHopResume() reverts to the full default 1..13 behavior.
+void    wifiIdsHopSet(const uint8_t *channels, uint8_t count);
 void    wifiIdsHopResume();
 uint8_t wifiIdsChannel();     // channel the capture is currently parked on
 
@@ -124,3 +130,86 @@ uint8_t wifiIdsChannel();     // channel the capture is currently parked on
 // drain). Cumulative since the last wifiIdsBegin() from zero. Detectors may
 // read this as extra "we are being flooded" signal.
 uint32_t wifiIdsDropped();
+
+// ---- EAPOL / WPS: the one data-frame exception -----------------------
+//
+// Everything above is management frames only. This section widens the
+// capture to a narrow, specific slice of DATA frames: 802.1X (EAPOL)
+// traffic -- the WPA 4-way handshake (EAPOL-Key, 802.1X packet type 3) and
+// WPS/WiFi-Simple-Config negotiation (EAP-Packet, type 0, carrying the WFA
+// vendor-specific Expanded EAP type). Both are themselves UNENCRYPTED (they
+// ARE the key exchange / provisioning handshake), so this is still fully
+// passive -- no PSK needed, nothing transmitted.
+//
+// This is NOT general data-frame access: widsRxCb() admits a data frame
+// only as far as it takes to confirm LLC/SNAP + ethertype 0x888E (EAPOL),
+// then classifies it as EAPOL-Key or WPS/EAP-Packet or discards it. A
+// detector never sees raw data-frame bytes, only the two small structs
+// below. See wifi_ids.cpp for the exact admission-filter arithmetic (it is
+// deliberately front-loaded with cheap integer checks, since on a busy
+// channel data frames vastly outnumber management frames).
+//
+// wifiIdsWantEapol(true) widens esp_wifi_set_promiscuous_filter() to admit
+// WIFI_PROMIS_FILTER_MASK_DATA alongside the existing MGMT mask. It is
+// opt-in and ref-counted independently of wifiIdsRegister()/Unregister() --
+// a screen that never calls it pays zero extra per-packet cost; the filter
+// itself keeps non-EAPOL data frames from ever reaching widsRxCb.
+
+// EAPOL-Key message classification (Key Information field bits, IEEE
+// 802.11-2020 Figure 12-35 / the conventional WPA 4-way-handshake numbering):
+//   M1: ACK=1 MIC=0                  (AP -> STA, ANonce)
+//   M2: ACK=0 MIC=1 Install=0 Secure=0  (STA -> AP, SNonce)
+//   M3: ACK=1 MIC=1 Install=1        (AP -> STA)
+//   M4: ACK=0 MIC=1 Secure=1         (STA -> AP)
+enum WifiIdsEapolMsg : uint8_t {
+  WIDS_EAPOL_OTHER = 0,
+  WIDS_EAPOL_M1    = 1,
+  WIDS_EAPOL_M2    = 2,
+  WIDS_EAPOL_M3    = 3,
+  WIDS_EAPOL_M4    = 4,
+};
+
+// One classified EAPOL-Key sighting. Deliberately NOT a WifiIdsFrame: the
+// data-frame header's address-field ROLES (not just values) depend on
+// ToDS/FromDS, and the body-start offset varies with QoS/Order bits -- a
+// management-frame-shaped struct (raw+24/raw+36 IE-walk convention) would
+// be actively misleading here. bssid/sta are already resolved from
+// ToDS/FromDS by the capture core; a detector never does that arithmetic.
+struct WifiIdsEapol {
+  uint8_t  bssid[6];          // the AP side of the pair
+  uint8_t  sta[6];            // the non-AP side of the pair
+  uint8_t  channel;
+  int8_t   rssi;
+  uint16_t seq;
+  WifiIdsEapolMsg msg;
+  uint16_t replayCounterHi;   // top 16 bits of the 64-bit EAPOL replay counter --
+                               // enough to notice "same handshake continuing" /
+                               // a KRACK-style message-3 replay, without carrying
+                               // all 8 bytes through the ring
+};
+typedef void (*WifiIdsEapolFn)(const WifiIdsEapol &e, void *ctx);
+int  wifiIdsRegisterEapol(WifiIdsEapolFn fn, void *ctx);
+void wifiIdsUnregisterEapol(int handle);
+
+// One WPS/WiFi-Simple-Config EAP-Packet sighting -- identified via the
+// Expanded EAP type (254) carrying the WFA vendor id (00:37:2A) and
+// vendor-type 1 (SimpleConfig). Only enough to RATE-track registration
+// attempts (Reaver/Bully-style PIN brute force); the WSC TLV payload itself
+// is not parsed.
+struct WifiIdsWps {
+  uint8_t bssid[6];
+  uint8_t sta[6];
+  uint8_t channel;
+  int8_t  rssi;
+  uint8_t eapCode;   // RFC 3748: 1 = Request, 2 = Response
+};
+typedef void (*WifiIdsWpsFn)(const WifiIdsWps &w, void *ctx);
+int  wifiIdsRegisterWps(WifiIdsWpsFn fn, void *ctx);
+void wifiIdsUnregisterWps(int handle);
+
+// Ref-counted independently of wifiIdsBegin()/End(): call before Begin() (or
+// any time after) to widen the filter for the EAPOL/WPS paths above; call
+// with false (or just stop registering EAPOL/WPS detectors) when no longer
+// needed. Safe to call whether or not the core is currently running -- if it
+// is, the filter is re-applied immediately.
+void wifiIdsWantEapol(bool on);

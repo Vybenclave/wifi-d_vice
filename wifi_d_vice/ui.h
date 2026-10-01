@@ -172,6 +172,17 @@ void uiShowLoading(const char *msg);
 // cardinal angles, not arbitrary rotation.
 void uiDrawRotatedText(int cx, int cy, const char *text, uint8_t rotSteps, uint8_t textSize, uint16_t color);
 
+// Shared 3-tier severity convention (OK/WATCH/ALERT) for anomaly-detector
+// screens -- wifi_ids_screen.cpp and ble_spam_detect.cpp each had their own
+// identical copy of this; factored here so a third/fourth consumer doesn't
+// add a third/fourth copy. Values match what both files already used
+// locally (SEV_OK=0/SEV_WATCH=1/SEV_ALERT=2 or SV_OK/SV_WATCH/SV_ALERT) --
+// a file's own local enum can keep its own names as long as the numeric
+// values line up, no call-site renames required beyond the color/tag calls.
+enum { UI_SEV_OK = 0, UI_SEV_WATCH = 1, UI_SEV_ALERT = 2 };
+uint16_t uiSevColor(uint8_t sev);     // ILI9341_GREEN/YELLOW/RED
+const char *uiSevTag(uint8_t sev);    // "ok"/"watch"/"ALERT"
+
 void ledSet(bool on);      // red channel
 void ledGreen(bool on);    // green channel (wardrive new-contact blip, etc.)
 // Blue "working" heartbeat (50ms on / 25ms off) for the duration of a
