@@ -175,7 +175,7 @@ static void resetTraces() {
 
 // ---------------------------- speed test -------------------------
 static void drawChrome(const char *btnLabel) {
-  tft.fillRect(0, UI_ACTIONROW_Y, tft.width(), UI_ACTIONROW_H, ILI9341_BLACK);
+  uiClearRect(0, UI_ACTIONROW_Y, tft.width(), UI_ACTIONROW_H);
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_WHITE);
   if (WiFi.status() == WL_CONNECTED) {
@@ -210,7 +210,7 @@ static void drawLegend() {
 
 // Just the caption line (clears only its own strip, left of the legend).
 static void drawCaption(const char *cap) {
-  tft.fillRect(0, UI_CONTENT_Y, tft.width() - 84, gY - UI_CONTENT_Y, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width() - 84, gY - UI_CONTENT_Y);
   tft.setTextSize(1);
   tft.setTextColor(accentLabel());
   tft.setCursor(4, UI_CONTENT_Y + 2);
@@ -280,7 +280,7 @@ static void renderGraph() {
 // Full repaint of the caption strip + legend + graph -- idle / done /
 // stopped / error. The live run uses drawCaption() + renderGraph() only.
 static void drawGraph(const char *cap) {
-  tft.fillRect(0, UI_CONTENT_Y, tft.width(), gY - UI_CONTENT_Y, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width(), gY - UI_CONTENT_Y);
   drawCaption(cap);
   drawLegend();
   graphAlloc();
@@ -288,19 +288,32 @@ static void drawGraph(const char *cap) {
   renderGraph();
 }
 
+// "What's currently drawn" per line -- see uiDrawFieldIfChanged() in ui.h.
+// enterSpeed() does a one-time clear + reset of these (see below) so a
+// fresh visit doesn't inherit stale text from whatever this screen showed
+// last time, or from the screen shown before it.
+static char prevDown[48] = "", prevUp[48] = "";
+static bool summaryHintDrawn = false;
+
+static void resetSummaryFields() {
+  prevDown[0] = '\0';
+  prevUp[0] = '\0';
+  summaryHintDrawn = false;
+}
+
 static void drawSummary() {
   int y = gY + gH + 4;
-  tft.fillRect(0, y, tft.width(), tft.height() - y - 2, ILI9341_BLACK);
   tft.setTextSize(1);
-  tft.setTextColor(NS_DOWN);
-  tft.setCursor(4, y);
-  tft.printf("Download %6.2f Mbps  peak %.1f", avgDown, peakDown);
-  tft.setTextColor(NS_UP);
-  tft.setCursor(4, y + 12);
-  tft.printf("Upload   %6.2f Mbps  peak %.1f", avgUp, peakUp);
-  tft.setTextColor(NS_LABEL);
-  tft.setCursor(4, y + 26);
-  tft.print("max on this ESP32's WiFi is ~30 Mbps");
+  uiDrawFieldIfChanged(4, y, tft.width() - 8, 12, NS_DOWN, 1, prevDown, sizeof(prevDown),
+                        "Download %6.2f Mbps  peak %.1f", avgDown, peakDown);
+  uiDrawFieldIfChanged(4, y + 12, tft.width() - 8, 12, NS_UP, 1, prevUp, sizeof(prevUp),
+                        "Upload   %6.2f Mbps  peak %.1f", avgUp, peakUp);
+  if (!summaryHintDrawn) {
+    summaryHintDrawn = true;
+    tft.setTextColor(NS_LABEL);
+    tft.setCursor(4, y + 26);
+    tft.print("max on this ESP32's WiFi is ~30 Mbps");
+  }
 }
 
 // One tick: bytes since the last tick -> Mbps for each direction, stored
@@ -454,6 +467,9 @@ static void enterSpeed() {
   uiDrawTopBar("Speed Test");
   drawChrome("Start");
   drawGraph("idle");
+  int sy = gY + gH + 4;
+  uiClearRect(0, sy, tft.width(), tft.height() - sy - 2);   // wipe whatever this screen (or the previous one) last left here
+  resetSummaryFields();
   drawSummary();
 }
 
@@ -564,7 +580,7 @@ static void drawLanConfig() {
 
 static void drawLanSummary() {
   int y = gY + gH + 4;
-  tft.fillRect(0, y, tft.width(), tft.height() - y - 2, ILI9341_BLACK);
+  uiClearRect(0, y, tft.width(), tft.height() - y - 2);
   tft.setTextSize(1);
   tft.setTextColor(NS_DOWN);
   tft.setCursor(4, y);      tft.printf("Down %7.2f Mbps  peak %.1f", avgDown, peakDown);
@@ -799,7 +815,7 @@ static bool stunOnce(WiFiUDP &udp, const char *host, uint16_t port,
 }
 
 static void drawConnChrome() {
-  tft.fillRect(0, UI_ACTIONROW_Y, tft.width(), UI_ACTIONROW_H, ILI9341_BLACK);
+  uiClearRect(0, UI_ACTIONROW_Y, tft.width(), UI_ACTIONROW_H);
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(4, UI_ACTIONROW_Y + 9);
@@ -810,7 +826,7 @@ static void drawConnChrome() {
 
 static void drawConnCard() {
   tft.setTextWrap(false);
-  tft.fillRect(0, UI_CONTENT_Y, tft.width(), tft.height() - UI_CONTENT_Y - 18, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width(), tft.height() - UI_CONTENT_Y - 18);
   tft.setTextSize(1);
   const int VX = 86;                       // value column
   int y = UI_CONTENT_Y + 1;
@@ -863,9 +879,9 @@ static void drawConnCard() {
 static void runConnQuery() {
   ci = ConnInfo();
   ledBusy(true);
-  tft.fillRect(0, UI_CONTENT_Y, tft.width(), tft.height() - UI_CONTENT_Y - 18, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width(), tft.height() - UI_CONTENT_Y - 18);
   auto prog = [&](const char *msg) {
-    tft.fillRect(0, UI_CONTENT_Y, tft.width(), 14, ILI9341_BLACK);
+    uiClearRect(0, UI_CONTENT_Y, tft.width(), 14);
     tft.setTextSize(1);
     tft.setTextColor(ILI9341_YELLOW);
     tft.setCursor(4, UI_CONTENT_Y + 2);

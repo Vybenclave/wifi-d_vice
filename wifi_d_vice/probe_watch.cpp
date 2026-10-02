@@ -204,14 +204,27 @@ static void onProbeResp(const WifiIdsFrame &f, void *) {
   dirty = true;
 }
 
+// "What's currently drawn" signatures for the header line, the row list and
+// the empty-state message -- see uiDrawListIfChanged()/uiFieldChanged() in
+// ui.h. probeWatchEnter() does a one-time uiClearBelow() + resets these.
+static char prevRow[PW_N][UI_LIST_SIG_LEN];
+static char prevHeader[48] = "";
+static char prevEmpty[48] = "";
+static const int ROW_H = 12;
+
 static void draw() {
   dirty = false;
-  uiClearBelow(UI_CONTENT_Y_PLAIN);
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(2, UI_CONTENT_Y_PLAIN);
-  tft.printf("ch%2d  %lu req  %lu wildcard", wifiIdsChannel(),
-             (unsigned long)gReqs, (unsigned long)gBroadcast);
+
+  char hdr[48];
+  snprintf(hdr, sizeof(hdr), "ch%2d  %lu req  %lu wildcard", wifiIdsChannel(),
+           (unsigned long)gReqs, (unsigned long)gBroadcast);
+  if (uiFieldChanged(prevHeader, sizeof(prevHeader), hdr)) {
+    uiClearRect(0, UI_CONTENT_Y_PLAIN, tft.width(), ROW_H);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setCursor(2, UI_CONTENT_Y_PLAIN);
+    tft.print(hdr);
+  }
 
   // recency order
   int idx[PW_N], n = 0;
@@ -220,24 +233,44 @@ static void draw() {
     for (int b = a + 1; b < n; b++)
       if (pw[idx[b]].seen > pw[idx[a]].seen) { int t = idx[a]; idx[a] = idx[b]; idx[b] = t; }
 
-  int y = UI_CONTENT_Y_PLAIN + 14;
+  int y0 = UI_CONTENT_Y_PLAIN + 14;
   if (n == 0) {
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(4, y + 4);
-    tft.print("no directed probe requests yet");
+    uiDrawListIfChanged(0, y0, tft.width(), ROW_H, 0, PW_N, prevRow,
+      [](int, char *, size_t) {}, [](int) {});   // just clears any rows left from before
+    if (uiFieldChanged(prevEmpty, sizeof(prevEmpty), "empty")) {
+      uiClearRect(4, y0 + 4, tft.width() - 4, ROW_H);
+      tft.setTextColor(ILI9341_GREEN);
+      tft.setCursor(4, y0 + 4);
+      tft.print("no directed probe requests yet");
+    }
     return;
   }
-  for (int k = 0; k < n && y + 12 <= tft.height() - UI_STATUSBAR_H; k++) {
-    const Probe &p = pw[idx[k]];
-    bool fresh = millis() - p.seen < 8000;
-    const BeaconSsid *b = presenceInfo(p.ssid);
-    char flag = !b ? '!' : (b->hidden ? 'H' : ' ');
-    const char *tag = !b ? " ABSENT" : (b->hidden ? " HIDDEN-AP" : "");
-    tft.setTextColor(!b ? ILI9341_RED : (b->hidden ? ILI9341_MAGENTA : (fresh ? ILI9341_YELLOW : accentLabel())));
-    tft.setCursor(4, y);
-    tft.printf("%c%-15.15s %dd %ddBm x%u%s", flag, p.ssid, p.devN, p.rssi, p.hits, tag);
-    y += 12;
-  }
+  prevEmpty[0] = '\0';   // forget it so the message reprints if the list empties out again later
+
+  int maxVisible = (tft.height() - UI_STATUSBAR_H - y0) / ROW_H;
+  if (maxVisible > PW_N) maxVisible = PW_N;
+  if (maxVisible < 0) maxVisible = 0;
+  int shown = min(n, maxVisible);
+
+  uiDrawListIfChanged(0, y0, tft.width(), ROW_H, shown, maxVisible, prevRow,
+    [&](int k, char *sig, size_t cap) {
+      const Probe &p = pw[idx[k]];
+      bool fresh = millis() - p.seen < 8000;
+      const BeaconSsid *b = presenceInfo(p.ssid);
+      char flag = !b ? '!' : (b->hidden ? 'H' : ' ');
+      const char *tag = !b ? " ABSENT" : (b->hidden ? " HIDDEN-AP" : "");
+      snprintf(sig, cap, "%c|%-15.15s|%d|%d|%u|%s|%d", flag, p.ssid, p.devN, p.rssi, p.hits, tag, fresh);
+    },
+    [&](int k) {
+      const Probe &p = pw[idx[k]];
+      bool fresh = millis() - p.seen < 8000;
+      const BeaconSsid *b = presenceInfo(p.ssid);
+      char flag = !b ? '!' : (b->hidden ? 'H' : ' ');
+      const char *tag = !b ? " ABSENT" : (b->hidden ? " HIDDEN-AP" : "");
+      tft.setTextColor(!b ? ILI9341_RED : (b->hidden ? ILI9341_MAGENTA : (fresh ? ILI9341_YELLOW : accentLabel())));
+      tft.setCursor(4, y0 + k * ROW_H);
+      tft.printf("%c%-15.15s %dd %ddBm x%u%s", flag, p.ssid, p.devN, p.rssi, p.hits, tag);
+    });
 }
 
 void probeWatchEnter() {
@@ -247,6 +280,10 @@ void probeWatchEnter() {
   memset(hb, 0, sizeof hb);
   gReqs = gBroadcast = 0;
   dirty = true;
+  uiClearBelow(UI_CONTENT_Y_PLAIN);   // wipe whatever the previous screen left here
+  memset(prevRow, 0, sizeof(prevRow));
+  prevHeader[0] = '\0';
+  prevEmpty[0] = '\0';
   wifiIdsBegin();
   wifiIdsSetDwell(250);
   handle = wifiIdsRegister(&onProbeReq, nullptr, WIDS_BIT(WIDS_PROBE_REQ));

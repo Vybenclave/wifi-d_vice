@@ -1,6 +1,7 @@
 #pragma once
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <functional>
 #include "driver/dac_continuous.h"
 #include "pins.h"
 
@@ -46,6 +47,47 @@ uint16_t uiBgColor(int y);
 void uiClearRect(int x, int y, int w, int h);
 void uiClearBelow(int y0);   // (0, y0) .. bottom-right
 
+// --- flicker-free value / list redraw ------------------------------------
+// Shared "diff against what was last drawn, only touch what changed"
+// primitives -- the pattern this app already reinvented ad hoc per screen
+// (uiDrawClock's `last[]`, uiDrawBatteryIndicator's `s_batSig`, the old
+// per-screen `lastRssiShown`/dirty-flag variables), after the technique in
+// Kasprzak's FlickerFreePrint library. Every live-updating value or row
+// list in the app goes through one of these instead of its own static
+// "last shown" variable, so a shrinking/growing region and the Vice
+// gradient / scene-image background (uiClearRect) are handled consistently
+// everywhere.
+
+// Compares newText against prevBuf, copies it in, and returns true iff it
+// differed -- the bare "should I redraw at all" gate, for callers that do
+// their own erase/draw sequence (a glyph, a bar, a multi-part layout).
+bool uiFieldChanged(char *prevBuf, size_t prevBufSz, const char *newText);
+
+// Formats fmt/... and, only if it differs from what's stored in prevBuf,
+// erases (x,y,w,h) via uiClearRect() and prints it at `sz` in `fg`. Returns
+// true iff it redrew -- a caller with secondary drawing tied to the same
+// value (e.g. a signal-strength bar next to the number) gates on that
+// instead of keeping its own duplicate change check.
+bool uiDrawFieldIfChanged(int x, int y, int w, int h, uint16_t fg, uint8_t sz,
+                          char *prevBuf, size_t prevBufSz, const char *fmt, ...);
+
+// Max bytes of a row's comparison signature for uiDrawListIfChanged() --
+// big enough for a combined "name + a couple of numeric fields" row; the
+// signature is just for change detection, it's never printed verbatim.
+static const int UI_LIST_SIG_LEN = 64;
+
+// Fixed-slot row list (the pattern tracker_detect.cpp proved out): for each
+// slot i in [0, maxRows), rowSignature(i, ...) builds a comparable text
+// signature for that row's current content. A slot whose signature differs
+// from prevBufs[i] gets its rect erased (uiClearRect) and drawRow(i) called
+// to do the actual per-column tft.print() calls; unchanged rows are left
+// untouched. Slots in [count, maxRows) are treated as blank, so a list that
+// shrinks clears its leftover rows instead of leaving them stale.
+void uiDrawListIfChanged(int x, int rowY0, int rowW, int rowH, int count, int maxRows,
+                         char prevBufs[][UI_LIST_SIG_LEN],
+                         const std::function<void(int i, char *sigOut, size_t sigCap)> &rowSignature,
+                         const std::function<void(int i)> &drawRow);
+
 // Content-area background for menu / button screens: the dimmed, softened
 // Vice scene image instead of the flat gradient. UI_BG_BLACK (flat black /
 // gradient) is the default and is restored by every uiDrawTopBar() UNLESS
@@ -61,9 +103,9 @@ void uiSetBgMode(int mode);
 
 // Whether list / live-data screens (which don't call uiSetBgMode()
 // themselves) default to the scene image instead of the gradient. Persisted
-// in NVS ("disp"/"listbg", same namespace as splashEnabled()). Off by
-// default -- preserves the existing plain-gradient look on text-heavy
-// screens unless the user opts in from System > Display > Theme & Color.
+// in NVS ("disp"/"listbg", same namespace as splashEnabled()). On by
+// default under the Vice theme; the user can switch back to the plain
+// gradient from System > Display > Theme & Color.
 bool uiListBgEnabled();
 void uiSetListBgEnabled(bool on);
 
@@ -124,6 +166,26 @@ void uiDrawActionRow(Btn *btns, int count);
 // instead of jumping around depending on item count.
 static const int UI_PAGER_H = 26;
 void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn);
+// Computes page geometry for a paged list/grid screen: how many rows of
+// height rowH (+gap between rows) fit between y0 and the pager -- which
+// itself sits pagerGap below the last row slot, with bottomMargin reserved
+// below IT (status bar, plus any fixed-height controls stacked under the
+// pager -- pass just the status bar margin if there are none). Capped to
+// hardCap rows (an array-sizing safety net, not usually the binding
+// constraint). `cols` multiplies rows into items-per-page for a grid (pass
+// 1 for a plain list). The row capacity itself is NOT clamped to `count` --
+// only the returned itemsPerPage/pages are -- so the pager sits in the same
+// place across pages and on a short list instead of creeping toward the
+// content. Returns rowsPerPage (the row capacity), for a caller that needs
+// it separately from itemsPerPage (e.g. to size cells to fill the available
+// height). Every paged list/grid screen in the app should call this instead
+// of hand-rolling this math -- see uiDropdownPick() below for the shape of
+// a caller: page = clamp(...) once up front, then each redraw does
+// base = page*itemsPerPage; n = min(itemsPerPage, count-base); and slices
+// items [base, base+n) onto the page.
+int uiPagerLayout(int y0, int rowH, int gap, int bottomMargin, int pagerGap,
+                  int count, int hardCap, int cols,
+                  int &itemsPerPage, int &pages, int &pagerY);
 // Pull-down-menu picker: opens a full list of `count` text options
 // (itemLabel(i) supplies each one) below the top bar, paged if it doesn't
 // fit; tapping a row selects it and returns immediately (no separate
@@ -171,6 +233,30 @@ void uiShowLoading(const char *msg);
 // Adafruit_GFX has no built-in rotated text, and we only need the four
 // cardinal angles, not arbitrary rotation.
 void uiDrawRotatedText(int cx, int cy, const char *text, uint8_t rotSteps, uint8_t textSize, uint16_t color);
+
+// Draws the RSSI-number + signal-bar readout shared by every locate /
+// direction-finding sub-screen (WiFi Scan's and BLE Scan's "Track" mode,
+// Camera Detect, Tracker Detect, ...): a big dBm number above a bar
+// colored green/yellow/red by signal strength. `(x,y,w)` is the top-left
+// and width of the block; the bar is drawn directly below the number at a
+// fixed internal layout. A dimmed "-- lost" replaces the number when
+// `rssi <= -127` (no current reading) -- a caller that always has a real
+// reading (a continuous scan, never a BSSID-presence check) simply never
+// passes that sentinel, so the lost state never triggers. `rssiMin`/
+// `rssiMax` set the bar's 0%/100% points (narrower for a close-range
+// sniff tool, wider for an open WiFi/BLE RSSI scale); the green/yellow/
+// red split is the top/middle/bottom third of that same range, which is
+// within a couple dB of what every one of this pattern's hand-rolled
+// copies already used as fixed thresholds. Erases via uiClearRect() (so
+// the Vice gradient/scene background shows through, not a flat black
+// box -- the bug every one of those copies had) and only when `rssi`
+// differs from `*prevRssi`, a caller-owned static reset to an
+// out-of-range sentinel (e.g. -999) on entering the locate screen to
+// force one draw -- the flicker-free pattern, see uiDrawFieldIfChanged().
+// Returns true iff it redrew (a caller with its own secondary drawing
+// tied to the reading, if any, can gate on that).
+bool uiDrawLocateReading(int x, int y, int w, uint16_t presentColor,
+                         int rssiMin, int rssiMax, int *prevRssi, int rssi);
 
 // Shared 3-tier severity convention (OK/WATCH/ALERT) for anomaly-detector
 // screens -- wifi_ids_screen.cpp and ble_spam_detect.cpp each had their own

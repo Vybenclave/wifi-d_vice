@@ -100,7 +100,7 @@ static void drawLocateChrome() {
   tft.setCursor(6, UI_CONTENT_Y + 24);
   tft.printf("%02X%02X%02X  ch%d  %-.20s", hits[locIdx].bssid[3], hits[locIdx].bssid[4],
              hits[locIdx].bssid[5], hits[locIdx].ch, hits[locIdx].ssid);
-  tft.drawRect(4, UI_CONTENT_Y + 74, tft.width() - 8, 24, ILI9341_WHITE);
+  tft.drawRect(4, UI_CONTENT_Y + 75, tft.width() - 8, 26, ILI9341_WHITE);
   lastShownRssi = -999;
 }
 
@@ -118,18 +118,9 @@ static void updateLocate() {
 
   beepHold(rssi > -127);
   if (rssi > -127) rangeBeep(rssi);
-  if (rssi == lastShownRssi) return;
-  lastShownRssi = rssi;
 
-  tft.fillRect(4, UI_CONTENT_Y + 40, tft.width() - 8, 32, ILI9341_BLACK);
-  tft.setTextSize(3);
-  tft.setTextColor(rssi > -127 ? ILI9341_RED : ILI9341_DARKGREY);
-  tft.setCursor(6, UI_CONTENT_Y + 40);
-  if (rssi > -127) tft.printf("%4d dBm", rssi); else tft.print(" -- lost");
-  int barW = rssi > -127 ? map(constrain(rssi, -95, -35), -95, -35, 0, tft.width() - 10) : 0;
-  tft.fillRect(5, UI_CONTENT_Y + 75, tft.width() - 10, 22, ILI9341_BLACK);
-  tft.fillRect(5, UI_CONTENT_Y + 75, barW, 22,
-               rssi > -55 ? ILI9341_GREEN : (rssi > -75 ? ILI9341_YELLOW : ILI9341_RED));
+  uiDrawLocateReading(4, UI_CONTENT_Y + 38, tft.width() - 8,
+                       ILI9341_RED, -95, -35, &lastShownRssi, rssi);
 }
 
 void cameraEnter() {

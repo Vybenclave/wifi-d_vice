@@ -100,7 +100,7 @@ static uint16_t sevCol(uint8_t s) {
 
 static void draw() {
   tft.setTextSize(1);
-  tft.fillRect(0, 30, tft.width(), 70, ILI9341_BLACK);
+  uiClearRect(0, 30, tft.width(), 70);
   tft.setTextColor(ILI9341_WHITE);
   tft.setCursor(2, 30);
   tft.printf("adv/s %lu   distinct addr ~%d", (unsigned long)vRate, vAddr);
@@ -112,7 +112,8 @@ static void draw() {
 
   if (sev == lastSev) return;
   lastSev = sev;
-  tft.fillRect(4, 104, tft.width() - 8, 46, sev == SV_ALERT ? ILI9341_RED : ILI9341_BLACK);
+  if (sev == SV_ALERT) tft.fillRect(4, 104, tft.width() - 8, 46, ILI9341_RED);
+  else                 uiClearRect(4, 104, tft.width() - 8, 46);
   if (sev == SV_ALERT) {
     tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);

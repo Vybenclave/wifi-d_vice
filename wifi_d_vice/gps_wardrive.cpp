@@ -40,6 +40,7 @@ static bool bssidIsNew(const uint8_t *b) {
 }
 
 static void draw();   // defined below
+static void resetGpsFields();   // defined below
 
 void gpsEnter() {
   uiDrawTopBar("Wardrive");
@@ -59,6 +60,8 @@ void gpsEnter() {
   Btn row[1] = {{0, 0, 0, 0, "start / stop logging"}};
   uiDrawActionRow(row, 1);
   toggleBtn = row[0];
+  uiClearBelow(UI_CONTENT_Y);   // wipe whatever this screen's content area last showed (a previous visit's fields, or another screen if this is the first SD check) so draw()'s per-field diffing starts clean
+  resetGpsFields();
   logging = false;
   rowsLogged = 0;
   seenN = 0;
@@ -69,40 +72,60 @@ void gpsEnter() {
   draw();
 }
 
+// "What's currently drawn" per field -- see uiDrawFieldIfChanged() in ui.h.
+// Each line below only erases + reprints when its own text actually
+// changes, instead of the whole block clearing and reprinting every tick.
+static char prevFix[40] = "", prevLatLon[48] = "", prevSd[24] = "", prevEng[48] = "",
+            prevLogging[24] = "", prevRows[48] = "", prevFail[64] = "";
+static const int GPS_FIELD_H = 14;
+
+static void resetGpsFields() {
+  prevFix[0] = prevLatLon[0] = prevSd[0] = prevEng[0] = prevLogging[0] = prevRows[0] = prevFail[0] = '\0';
+}
+
 static void draw() {
-  uiClearBelow(UI_CONTENT_Y);
   tft.setTextSize(1);
   int y = UI_CONTENT_Y + 4;
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(4, y);
+  int fw = tft.width() - 8;
+
   const char *fixState = gpsShared().location.isValid() ? "yes"
                        : (lastFixMs && millis() - lastFixMs < 15000) ? "yes"
                        : lastFixMs ? "stale" : "none";
-  tft.printf("Fix: %s  sats: %lu", fixState,
-             gpsShared().satellites.isValid() ? (unsigned long)gpsShared().satellites.value() : 0UL);
+  uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_WHITE, 1, prevFix, sizeof(prevFix),
+                        "Fix: %s  sats: %lu", fixState,
+                        gpsShared().satellites.isValid() ? (unsigned long)gpsShared().satellites.value() : 0UL);
   y += 16;
-  tft.setCursor(4, y);
-  if (gpsShared().location.isValid()) tft.printf("lat %.6f  lon %.6f", gpsShared().location.lat(), gpsShared().location.lng());
-  else tft.print("lat --  lon --");
+
+  if (gpsShared().location.isValid())
+    uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_WHITE, 1, prevLatLon, sizeof(prevLatLon),
+                          "lat %.6f  lon %.6f", gpsShared().location.lat(), gpsShared().location.lng());
+  else
+    uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_WHITE, 1, prevLatLon, sizeof(prevLatLon), "lat --  lon --");
   y += 16;
-  tft.setCursor(4, y);
-  tft.printf("SD: %s", sdOk ? "ok" : "not found");
+
+  uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_WHITE, 1, prevSd, sizeof(prevSd),
+                        "SD: %s", sdOk ? "ok" : "not found");
   y += 16;
-  tft.setCursor(4, y);
-  tft.setTextColor(engagementIsArmed() ? ILI9341_GREEN : ILI9341_YELLOW);
-  tft.printf("engagement: %s", engagementIsArmed() ? "armed (encrypting)" : "not armed (plaintext!)");
-  tft.setTextColor(ILI9341_WHITE);
+
+  uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, engagementIsArmed() ? ILI9341_GREEN : ILI9341_YELLOW, 1,
+                        prevEng, sizeof(prevEng),
+                        "engagement: %s", engagementIsArmed() ? "armed (encrypting)" : "not armed (plaintext!)");
   y += 16;
-  tft.setCursor(4, y);
-  tft.printf("logging: %s", logging ? "ON" : "off");
+
+  uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_WHITE, 1, prevLogging, sizeof(prevLogging),
+                        "logging: %s", logging ? "ON" : "off");
   y += 16;
-  tft.setCursor(4, y);
-  tft.printf("%lu rows -> %s", (unsigned long)rowsLogged, logging ? "SD" : "-");
+
+  uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_WHITE, 1, prevRows, sizeof(prevRows),
+                        "%lu rows -> %s", (unsigned long)rowsLogged, logging ? "SD" : "-");
+  y += 16;
+
   if (wlogEncFails()) {
-    y += 16;
-    tft.setTextColor(ILI9341_RED);
-    tft.setCursor(4, y);
-    tft.printf("encrypt failures: %lu (rows dropped)", (unsigned long)wlogEncFails());
+    uiDrawFieldIfChanged(4, y, fw, GPS_FIELD_H, ILI9341_RED, 1, prevFail, sizeof(prevFail),
+                          "encrypt failures: %lu (rows dropped)", (unsigned long)wlogEncFails());
+  } else if (prevFail[0]) {
+    uiClearRect(4, y, fw, GPS_FIELD_H);
+    prevFail[0] = '\0';
   }
 }
 

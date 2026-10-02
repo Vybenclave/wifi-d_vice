@@ -161,7 +161,7 @@ static void newSweep() {
     if (s >= 0 && s < STEPS) isCenter[s] = true;
   }
   stepIdx = 0;
-  tft.fillRect(0, GRAPH_TOP, tft.width(), GRAPH_H, ILI9341_BLACK);
+  uiClearRect(0, GRAPH_TOP, tft.width(), GRAPH_H);
 }
 
 // After each full pass: fold peaks, classify carrier / burst / broadband.
@@ -189,7 +189,7 @@ static void endOfSweep() {
   else
     snprintf(msg, sizeof(msg), "quiet  floor %ddBm", floorR);
 
-  tft.fillRect(0, GRAPH_TOP + GRAPH_H + 2, tft.width(), 12, ILI9341_BLACK);
+  uiClearRect(0, GRAPH_TOP + GRAPH_H + 2, tft.width(), 12);
   tft.setTextSize(1);
   tft.setTextColor(maxConsec >= 8 ? ILI9341_RED : (hot ? ILI9341_YELLOW : ILI9341_GREEN));
   tft.setCursor(4, GRAPH_TOP + GRAPH_H + 3);
@@ -213,7 +213,7 @@ static void sweepLoop() {
 static void newAnalyzer() {
   for (int c = 0; c < NCENTERS; c++) { cRssi[c] = -120; cPeak[c] = -120; }
   anIdx = 0;
-  tft.fillRect(0, LABEL_Y - 2, tft.width(), tft.height() - (LABEL_Y - 2) - UI_STATUSBAR_H, ILI9341_BLACK);
+  uiClearRect(0, LABEL_Y - 2, tft.width(), tft.height() - (LABEL_Y - 2) - UI_STATUSBAR_H);
 }
 
 static void drawAnalyzer() {
@@ -221,7 +221,7 @@ static void drawAnalyzer() {
   for (int c = 1; c < NCENTERS; c++) if (cRssi[c] > cRssi[strongC]) strongC = c;
 
   tft.setTextSize(1);
-  tft.fillRect(0, LABEL_Y - 2, tft.width(), 12, ILI9341_BLACK);
+  uiClearRect(0, LABEL_Y - 2, tft.width(), 12);
   tft.setCursor(4, LABEL_Y);
   if (cRssi[strongC] > -110) {
     tft.setTextColor(cRssi[strongC] > -70 ? ILI9341_RED : ILI9341_YELLOW);
@@ -235,7 +235,7 @@ static void drawAnalyzer() {
   int x0 = 60, barMax = tft.width() - x0 - 40;
   for (int c = 0; c < NCENTERS; c++) {
     int y = GRAPH_TOP + c * rowH;
-    tft.fillRect(0, y, tft.width(), rowH - 1, ILI9341_BLACK);
+    uiClearRect(0, y, tft.width(), rowH - 1);
     tft.setTextColor(c == strongC ? ILI9341_RED : accentLabel());
     tft.setCursor(2, y + (rowH - 8) / 2);
     tft.printf("%.2f", kCenters[c].mhz);
@@ -288,7 +288,7 @@ static void drawRawChrome() {
 }
 
 static void drawRawTrace() {
-  tft.fillRect(0, GRAPH_TOP, tft.width(), GRAPH_H, ILI9341_BLACK);
+  uiClearRect(0, GRAPH_TOP, tft.width(), GRAPH_H);
   if (!rawHave || rawN < 2) return;
 
   uint32_t total = 0;
@@ -313,7 +313,7 @@ static void drawRawTrace() {
 
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_WHITE);
-  tft.fillRect(0, GRAPH_TOP + GRAPH_H + 2, tft.width(), 12, ILI9341_BLACK);
+  uiClearRect(0, GRAPH_TOP + GRAPH_H + 2, tft.width(), 12);
   tft.setCursor(4, GRAPH_TOP + GRAPH_H + 3);
   tft.printf("%d edges  %lu us span", rawN, (unsigned long)total);
 }

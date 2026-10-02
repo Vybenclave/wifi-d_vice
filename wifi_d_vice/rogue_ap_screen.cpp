@@ -52,7 +52,7 @@ static void drawChrome() {
 static int contentBot() { return tft.height() - UI_STATUSBAR_H - 2; }
 
 static void drawView() {
-  tft.fillRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y);
   tft.setTextSize(1);
 
   tft.setTextColor(rogueApLoaded() ? accentLabel() : ILI9341_YELLOW);
@@ -88,7 +88,7 @@ static void drawView() {
 }
 
 static void drawLearn() {
-  tft.fillRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y);
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_YELLOW);
   tft.setCursor(4, UI_CONTENT_Y);
@@ -104,7 +104,7 @@ static void drawLearn() {
 }
 
 static void drawDone() {
-  tft.fillRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y, ILI9341_BLACK);
+  uiClearRect(0, UI_CONTENT_Y, tft.width(), contentBot() - UI_CONTENT_Y);
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_GREEN);
   tft.setCursor(4, UI_CONTENT_Y);

@@ -161,6 +161,18 @@ static void systemTestGps() {
   TinyGPSPlus &gps = gpsShared();
   uint32_t lastDraw = 0;
 
+  // Diagnostic lines, row-diffed via uiDrawListIfChanged() -- the set shown
+  // varies (lat/lon/alt only once there's a fix, UTC only once GPS time is
+  // valid), so this is the row-list case, not a handful of fixed fields.
+  // function-local `static` so these persist across ticks of this screen's
+  // own blocking loop below, reset once per Enter since this function IS
+  // that screen's whole Enter/Loop/Exit lifecycle.
+  static char prevRow[10][UI_LIST_SIG_LEN];
+  static char prevFooter[48];
+  memset(prevRow, 0, sizeof(prevRow));
+  prevFooter[0] = '\0';
+  const int rowY0 = 36, rowH = 15;
+
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
@@ -169,39 +181,49 @@ static void systemTestGps() {
     if (millis() - lastDraw > 400) {
       lastDraw = millis();
       bool anyData = gps.charsProcessed() > 0;
-      tft.fillRect(0, 32, tft.width(), tft.height() - 44, ILI9341_BLACK);
       tft.setTextSize(1);
-      int y = 36;
-      auto line = [&](uint16_t col, const char *k, const String &v) {
-        tft.setTextColor(accentLabel());  tft.setCursor(4, y);   tft.print(k);
-        tft.setTextColor(col);           tft.setCursor(100, y); tft.print(v);
-        y += 15;
-      };
-      line(ILI9341_WHITE, "RX pin", String(GPS_RX));
-      line(anyData ? ILI9341_GREEN : ILI9341_RED, "serial",
-           anyData ? (String(gps.charsProcessed()) + " bytes") : String("no data"));
-      line(gps.sentencesWithFix() ? ILI9341_GREEN : ILI9341_YELLOW, "NMEA ok", String(gps.passedChecksum()));
-      line(gps.satellites.isValid() ? ILI9341_GREEN : ILI9341_YELLOW, "sats",
-           gps.satellites.isValid() ? String(gps.satellites.value()) : String("--"));
-      line(gps.location.isValid() ? ILI9341_GREEN : ILI9341_YELLOW, "fix",
-           gps.location.isValid() ? String("yes") : String("no fix"));
+
+      struct Row { uint16_t col; const char *k; String v; };
+      Row rows[10];
+      int n = 0;
+      rows[n++] = {ILI9341_WHITE, "RX pin", String(GPS_RX)};
+      rows[n++] = {anyData ? ILI9341_GREEN : ILI9341_RED, "serial",
+                   anyData ? (String(gps.charsProcessed()) + " bytes") : String("no data")};
+      rows[n++] = {gps.sentencesWithFix() ? ILI9341_GREEN : ILI9341_YELLOW, "NMEA ok", String(gps.passedChecksum())};
+      rows[n++] = {gps.satellites.isValid() ? ILI9341_GREEN : ILI9341_YELLOW, "sats",
+                   gps.satellites.isValid() ? String(gps.satellites.value()) : String("--")};
+      rows[n++] = {gps.location.isValid() ? ILI9341_GREEN : ILI9341_YELLOW, "fix",
+                   gps.location.isValid() ? String("yes") : String("no fix")};
       if (gps.location.isValid()) {
-        line(ILI9341_WHITE, "lat", String(gps.location.lat(), 6));
-        line(ILI9341_WHITE, "lon", String(gps.location.lng(), 6));
-        line(ILI9341_WHITE, "alt m", gps.altitude.isValid() ? String(gps.altitude.meters(), 1) : String("--"));
+        rows[n++] = {ILI9341_WHITE, "lat", String(gps.location.lat(), 6)};
+        rows[n++] = {ILI9341_WHITE, "lon", String(gps.location.lng(), 6)};
+        rows[n++] = {ILI9341_WHITE, "alt m", gps.altitude.isValid() ? String(gps.altitude.meters(), 1) : String("--")};
       }
-      line(ILI9341_WHITE, "HDOP", gps.hdop.isValid() ? String(gps.hdop.hdop(), 1) : String("--"));
+      rows[n++] = {ILI9341_WHITE, "HDOP", gps.hdop.isValid() ? String(gps.hdop.hdop(), 1) : String("--")};
       if (gps.time.isValid()) {
         char b[16];
         snprintf(b, sizeof(b), "%02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
-        line(ILI9341_WHITE, "UTC", b);
+        rows[n++] = {ILI9341_WHITE, "UTC", String(b)};
       }
-      line(devTimeSynced() ? ILI9341_GREEN : ILI9341_YELLOW, "dev clock",
-           devTimeSynced() ? devTimeNowString() : String("unsynced"));
-      if (!anyData) {
-        tft.setTextColor(ILI9341_YELLOW);
-        tft.setCursor(4, tft.height() - 16);
-        tft.print("no bytes -- GPS TX -> GPIO35, GND, 3V3?");
+      rows[n++] = {devTimeSynced() ? ILI9341_GREEN : ILI9341_YELLOW, "dev clock",
+                   devTimeSynced() ? devTimeNowString() : String("unsynced")};
+
+      uiDrawListIfChanged(0, rowY0, tft.width(), rowH, n, 10, prevRow,
+        [&](int i, char *sig, size_t cap) { snprintf(sig, cap, "%04X|%s|%s", rows[i].col, rows[i].k, rows[i].v.c_str()); },
+        [&](int i) {
+          tft.setTextColor(accentLabel()); tft.setCursor(4, rowY0 + i * rowH);   tft.print(rows[i].k);
+          tft.setTextColor(rows[i].col);   tft.setCursor(100, rowY0 + i * rowH); tft.print(rows[i].v);
+        });
+
+      char footer[48] = "";
+      if (!anyData) snprintf(footer, sizeof(footer), "no bytes -- GPS TX -> GPIO35, GND, 3V3?");
+      if (uiFieldChanged(prevFooter, sizeof(prevFooter), footer)) {
+        uiClearRect(0, tft.height() - 16, tft.width(), 14);
+        if (footer[0]) {
+          tft.setTextColor(ILI9341_YELLOW);
+          tft.setCursor(4, tft.height() - 16);
+          tft.print(footer);
+        }
       }
     }
     delay(5);
@@ -232,13 +254,16 @@ static int pickAccentColor(int current) {
   // recomputed per page -- a short last page (fewer items = fewer rows)
   // just leaves blank space above the pager instead of stretching its
   // cells taller, so the pager sits in the same place on every page.
-  int rowsFit = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0 + gap) / (MIN_CELL_H + gap);
-  if (rowsFit < 1) rowsFit = 1;
+  // hardCap is generous (not MAX_ROWS-style array sizing -- cell[] below is
+  // sized ACCENT_N) since rowsFit itself must stay unclamped by count/page
+  // for that same "pager doesn't move" property. pagerY from the helper
+  // assumes un-stretched MIN_CELL_H rows, so it's not used here -- cellH
+  // gets stretched below to fill the exact budget, and the pager has to
+  // sit snug against THAT, not against the unstretched row height.
+  int perPage, pages, unstretchedPagerY;
+  int rowsFit = uiPagerLayout(y0, MIN_CELL_H, gap, bottomMargin, pagerGap, ACCENT_N, 999, cols, perPage, pages, unstretchedPagerY);
   int cellH = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0 - gap * (rowsFit - 1)) / rowsFit;
   if (cellH > MAX_CELL_H) cellH = MAX_CELL_H;   // stay button-row-sized even with room to spare
-  int perPage = rowsFit * cols;
-  if (perPage > ACCENT_N) perPage = ACCENT_N;
-  int pages = (ACCENT_N + perPage - 1) / perPage;
   int page = (current >= 0 && current < ACCENT_N) ? current / perPage : 0;
   const int pagerY = y0 + rowsFit * (cellH + gap) - gap + pagerGap;
 
@@ -379,12 +404,19 @@ static void systemShowTimezone() {
   const int TOGGLE_H = 28, APPLY_H = 34, STACK_GAP = 6, BOTTOM_MARGIN = UI_STATUSBAR_H + 4;
   const int MAX_ROWS = 10;
   // Two toggle rows now (12h/24h and Auto DST) between the pager and Apply.
+  // stackTop is pinned from the screen bottom (fixed regardless of row
+  // count, so the toggles/Apply never move) and used directly as pagerY
+  // below -- NOT uiPagerLayout()'s own pagerY out-param (that assumes the
+  // pager sits snug against the row stack, not a fixed-from-the-bottom
+  // position), so only its return value (the row capacity) is used here;
+  // `pages` is recomputed locally from ROWS below, as it already was.
   int stackTop = tft.height() - BOTTOM_MARGIN - APPLY_H - STACK_GAP
                  - TOGGLE_H - STACK_GAP - TOGGLE_H - STACK_GAP - UI_PAGER_H;
-  int ROWS = (stackTop - gap - y0) / (rowH + gap);
+  int ignoredItemsPerPage, ignoredPages, ignoredPagerY;
+  int ROWS = uiPagerLayout(y0, rowH, gap,
+               BOTTOM_MARGIN + APPLY_H + STACK_GAP + TOGGLE_H + STACK_GAP + TOGGLE_H + STACK_GAP, gap,
+               tzCount(), MAX_ROWS, 1, ignoredItemsPerPage, ignoredPages, ignoredPagerY);
   if (ROWS < 3) ROWS = 3;
-  if (ROWS > MAX_ROWS) ROWS = MAX_ROWS;
-  if (ROWS > tzCount()) ROWS = tzCount();
 
   Btn items[MAX_ROWS], applyBtn, prevBtn, nextBtn, toggleBtn, dstBtn;
   int sel = tzGetIndex();               // pending selection, starts at the active one
@@ -633,33 +665,57 @@ static bool confirmFormat() {
 }
 
 // Per-module show/hide. Hidden modules drop out of their WiFi/BLE/Privacy
-// submenu; an emptied category hides its top-level button too.
+// submenu; an emptied category hides its top-level button too. Paged with
+// the project's standard pager (uiDrawPager() via uiPagerLayout()) -- at
+// MOD_N=17 modules and a 25px row pitch, more than fit on a 240px-tall
+// screen used to just draw off the bottom of the screen, unreachable by
+// touch.
 static void systemShowModules() {
-  const int y0 = 38, step = 25;
-  Btn rows[MOD_N];
+  const int y0 = 38, rowH = 22, gap = 3, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
+  const int MAX_ROWS = 10;
+  int itemsPerPage, pages, pagerY;
+  uiPagerLayout(y0, rowH, gap, bottomMargin, pagerGap, MOD_N, MAX_ROWS, 1, itemsPerPage, pages, pagerY);
 
-  auto drawRow = [&](int i) {
-    int y = y0 + i * step;
-    rows[i] = {8, y, tft.width() - 16, step - 3, modvisName(i)};
+  Btn rows[MAX_ROWS], prevBtn, nextBtn;
+  int page = 0;
+  int n = 0;   // rows actually drawn on the current page -- read back in the touch loop below
+
+  auto drawRow = [&](int i) {   // i = index into the CURRENT page's rows[], item = base+i
+    int idx = page * itemsPerPage + i;
+    int y = y0 + i * (rowH + gap);
+    rows[i] = {8, y, tft.width() - 16, rowH, modvisName(idx)};
     uiDrawMenuButton(rows[i]);
-    bool hidden = modvisHidden(i);
-    int cx = tft.width() - 26, cy = y + (step - 3) / 2;
+    bool hidden = modvisHidden(idx);
+    int cx = tft.width() - 26, cy = y + rowH / 2;
     tft.fillRect(cx - 8, cy - 8, 16, 16, uiBgColor(cy - 8));
     if (hidden) tft.fillCircle(cx, cy, 2, ILI9341_DARKGREY);      // grey dot
     else        tft.fillCircle(cx, cy, 6, ILI9341_GREEN);         // green circle
   };
 
-  uiDrawTopBar("Modules");
-  uiClearBelow(29);
-  for (int i = 0; i < MOD_N; i++) drawRow(i);
+  auto drawPage = [&]() {
+    uiDrawTopBar("Modules");
+    uiClearBelow(29);
+    int base = page * itemsPerPage;
+    n = min(itemsPerPage, MOD_N - base);
+    for (int i = 0; i < n; i++) drawRow(i);
+    uiDrawPager(pagerY, page, pages, prevBtn, nextBtn);
+  };
+  drawPage();
 
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
-    for (int i = 0; i < MOD_N; i++) {
+    if (t.pressed && uiTouchInButton(t, prevBtn) && page > 0) {
+      uiWaitForRelease(); page--; drawPage(); continue;
+    }
+    if (t.pressed && uiTouchInButton(t, nextBtn) && page < pages - 1) {
+      uiWaitForRelease(); page++; drawPage(); continue;
+    }
+    for (int i = 0; i < n; i++) {
       if (t.pressed && uiTouchInButton(t, rows[i])) {
-        modvisSetHidden(i, !modvisHidden(i));
+        int idx = page * itemsPerPage + i;
+        modvisSetHidden(idx, !modvisHidden(idx));
         drawRow(i);
         uiWaitForRelease();
       }
@@ -847,7 +903,7 @@ static void systemShowBatteryCal() {
     int raw = uiBatteryRawMv();
     int cor = uiBatteryMv();
     int pct = uiBatteryPct();
-    tft.fillRect(0, 32, tft.width(), 44, ILI9341_BLACK);
+    uiClearRect(0, 32, tft.width(), 44);
     tft.setTextSize(1);
     tft.setTextColor(ILI9341_WHITE);
     tft.setCursor(6, 36);  tft.printf("raw:       %4d mV", raw);

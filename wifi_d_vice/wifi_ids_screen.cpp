@@ -78,6 +78,7 @@
 #include "devtime.h"
 #include "keyboard.h"
 #include "accent.h"
+#include "debuglog.h"
 
 // ---- window ------------------------------------------------------------
 //
@@ -253,22 +254,49 @@ static const int HDR_Y    = 30;
 static const int D_Y      = 46;
 static const int B_Y      = 76;
 static const int A_Y      = 104;
-static const int R_Y      = 126;                  // rogue-AP status line
+static const int R_Y      = 126;                   // rogue-AP status line
 static const int N_Y      = R_Y + 11;              // KARMA/CSA/HS/PMKID/KRACK/WPS one-line status
 static const int STATS_H  = (N_Y + 11) - HDR_Y;
 static const int BANNER_Y = N_Y + 15;
 static const int BANNER_H  = 44;
 static const int LOG_Y    = BANNER_Y + BANNER_H + 2;
 
-// Channel-lock entry point: a small bordered "button" drawn right under the
-// top bar's rule line, wrapping the "ch%d ..." readout so it reads as
-// tappable instead of being an invisible gesture on plain text (the first
-// cut of this feature had no visual affordance at all, which made it
-// genuinely undiscoverable -- this box plus widsTouch()'s matching hit-test
-// is the fix). Sized for the worst case "ch13+2 SEARCH!" (~14 chars).
-// Kept clear of the back button's own hit area (x<60, y<28 -- see the .ino's
-// generic back-button handling) by starting at y=28, flush under the rule.
-static const int CL_BTN_X = 1, CL_BTN_Y = 28, CL_BTN_W = 92, CL_BTN_H = 14;
+// The channel readout on the stats header (drawStats()) is plain text --
+// NOT a button. Tried making it double as the channel-lock options
+// trigger three different ways (a bordered box, a tiny gear icon, a real
+// button behind the readout's own severity-colored text) and none of it
+// looked or worked right, so the options entry point is now its own,
+// separate, unambiguous button instead -- see optionsBtnRect() below.
+static const int CHAN_X = 2;
+
+// Bottom-right "Options" button: opens the channel-lock picker
+// (clOpenPicker()). Deliberately separate from the channel readout above
+// (see note there). A real uiDrawButton() at this app's established
+// button size -- h=20 is the minimum that lets its label hit the
+// standard UI_MENU_BTN_MAXSIZE=2 text (uiDrawButton() needs bh <= h-4),
+// w=92 fits "Options" at that size with room to spare, same numbers that
+// already proved out comfortably on this screen's old channel-lock
+// button attempt. Sits in the screen's bottom-right corner, drawn last
+// in drawLog() so it always paints on top of whatever the event log
+// draws underneath -- cheaper and more robust than carving a dedicated
+// row out of the log's already-tight vertical space in landscape
+// (~2 log lines to begin with).
+//
+// Gap from the status bar: confirmed via on-device touch logging that a
+// tight 2px gap (hugging the bar) put the button right at the physical
+// bottom edge, where this resistive touchscreen's accuracy drops off --
+// every real tap landed a few px ABOVE the button, never inside it.
+// Portrait has plenty of spare room below this screen's fixed,
+// landscape-tuned stats/banner/log offsets, so it gets a generous 16px
+// gap there; landscape keeps the original tight 2px since that
+// orientation has (deliberately) almost no room to spare.
+static const int OPT_BTN_W = 92, OPT_BTN_H = 20;
+static Btn optionsBtnRect() {
+  bool portrait = tft.height() > tft.width();
+  int gap = portrait ? 16 : 2;
+  return { tft.width() - OPT_BTN_W - 2, tft.height() - UI_STATUSBAR_H - gap - OPT_BTN_H,
+           OPT_BTN_W, OPT_BTN_H, "Options" };
+}
 
 // ---- SSID helpers -------------------------------------------------
 //
@@ -1342,6 +1370,7 @@ static void clPickSsid() {
 static void drawStats();
 static void drawBanner();
 static void drawLog();
+static void resetStatsFields();
 
 static void clRestoreScreen() {
   uiDrawTopBar("WiFi IDS");
@@ -1349,13 +1378,29 @@ static void clRestoreScreen() {
   lastStatsDraw = 0;
   lastBannerKey = 0xFFFFFFFFu;
   alogDirty = true;
+  // uiClearBelow() just wiped the whole stats band, but drawStats()'s
+  // DEAUTH/BEACON/AUTH/rogue/channel/elapsed lines are each gated by
+  // uiFieldChanged() against their own prevXxx buffer (see the comment
+  // above resetStatsFields()) -- any line whose underlying value hasn't
+  // actually changed since before the picker opened would otherwise be
+  // skipped and stay blank instead of being reprinted onto the now-empty
+  // background. Must reset those buffers here too, not just at
+  // widsEnter(), since clRestoreScreen() also runs after every pick in
+  // the channel-lock picker (clOpenPicker()).
+  resetStatsFields();
   drawStats();
   drawBanner();
   drawLog();
 }
 
 static void clOpenPicker() {
-  int pick = uiDropdownPick("Channel lock", 3, clModeItemLabel, -1);
+  // Highlight whichever mode is actually active right now (green outline,
+  // see uiDropdownPick()) instead of always opening blank -- Auto-hop is
+  // naturally the default/first-listed option already (index 0), and now
+  // it's also shown as the current one whenever that's genuinely the case,
+  // rather than the picker implying nothing is selected.
+  int current = (clMode == CL_AUTO) ? 0 : (clMode == CL_MANUAL) ? 1 : 2;
+  int pick = uiDropdownPick("Channel lock", 3, clModeItemLabel, current);
   if (pick == 0) {
     wifiIdsHopResume();
     clMode = CL_AUTO;
@@ -1545,87 +1590,118 @@ static void wlogVerdictEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uin
   if (wrote) wlogFlush();
 }
 
-// Stats block only (header + 3 detector rows). Redrawn once/second on a
-// bounded fillRect, like the old deauth screen -- never uiClearBelow the
-// whole content area, that flickers. The banner and the log below are
-// redrawn only when they actually change.
+// "What's currently drawn" per line in the stats band -- see
+// uiDrawFieldIfChanged()/uiFieldChanged() in ui.h. This band used to be
+// erased and fully reprinted every second (the old comment here called
+// that out as already bounded, not uiClearBelow -- but still a full
+// reprint every tick); isolating each line means an unchanged DEAUTH /
+// BEACON / AUTH / ROGUE-AP / six-detector block no longer flashes just
+// because the elapsed-time field ticked over. widsEnter() resets all of
+// these alongside lastBannerKey (see resetStatsFields() below).
+static char prevChanLine[32] = "", prevElapsed[48] = "";
+static char prevDeauth1[32] = "", prevDeauth2[40] = "";
+static char prevBeacon1[32] = "", prevBeacon2[48] = "";
+static char prevAuth1[32] = "",  prevAuth2[48] = "";
+static char prevRogueLine[64] = "";
+static char prevDetLine[16] = "";
+
+static void resetStatsFields() {
+  prevChanLine[0] = prevElapsed[0] = '\0';
+  prevDeauth1[0] = prevDeauth2[0] = '\0';
+  prevBeacon1[0] = prevBeacon2[0] = '\0';
+  prevAuth1[0]  = prevAuth2[0]  = '\0';
+  prevRogueLine[0] = '\0';
+  prevDetLine[0] = '\0';
+}
+
 static void drawStats() {
-  uiClearRect(0, HDR_Y, tft.width(), STATS_H);   // theme-aware -- gradient or scene bg, not flat black
   tft.setTextSize(1);
 
   uint32_t el = (millis() - startMs) / 1000;
 
-  // Channel-lock button: bordered box so the "ch%d ..." readout reads as
-  // tappable (tap it to pick Auto-hop / Lock channel / Lock to SSID -- see
-  // widsTouch()). Drawn first so the live text prints on top of it.
-  tft.drawRect(CL_BTN_X, CL_BTN_Y, CL_BTN_W, CL_BTN_H, accentLabel());
-  tft.setTextColor(accentLabel());
-  tft.setCursor(CL_BTN_X + 3, HDR_Y);
-  tft.printf("ch%2d", wifiIdsChannel());
-  // "+N" when more than one channel is being watched (a manual multi-
-  // channel lock, or a mesh SSID lock with more than one node discovered).
-  if (clMode == CL_MANUAL && clManualN > 1) tft.printf("+%d", clManualN - 1);
-  else if ((clMode == CL_SEARCHING || clMode == CL_LOCKED || clMode == CL_REACQUIRING || clMode == CL_DOWN)
-           && clNodeN > 1) tft.printf("+%d", clNodeN - 1);
-  const char *clSfx = "";
-  uint16_t    clCol = accentLabel();
-  switch (clMode) {
-    case CL_AUTO:                                          break;
-    case CL_MANUAL:      clSfx = " LOCK";   clCol = accentLabel();  break;
-    case CL_SEARCHING:   clSfx = " SEARCH"; clCol = ILI9341_YELLOW; break;
-    case CL_LOCKED:      clSfx = " OK";     clCol = ILI9341_GREEN;  break;
-    case CL_REACQUIRING: clSfx = " LOST";   clCol = ILI9341_YELLOW; break;
-    case CL_DOWN:        clSfx = " DOWN";   clCol = ILI9341_RED;    break;
+  // Channel + lock-status readout: plain text, not a button -- see
+  // optionsBtnRect()'s comment above for why the lock picker now has its
+  // own separate button instead of living here.
+  char chanSig[32];
+  snprintf(chanSig, sizeof(chanSig), "%d|%d|%d|%d|%d", wifiIdsChannel(), clMode, clManualN, clNodeN, clAnyNodeDown());
+  if (uiFieldChanged(prevChanLine, sizeof(prevChanLine), chanSig)) {
+    uiClearRect(CHAN_X, HDR_Y, 94, 11);
+    tft.setTextColor(accentLabel());
+    tft.setCursor(CHAN_X, HDR_Y);
+    tft.printf("ch%d", wifiIdsChannel());
+    // "+N" when more than one channel is being watched (a manual multi-
+    // channel lock, or a mesh SSID lock with more than one node discovered).
+    if (clMode == CL_MANUAL && clManualN > 1) {
+      tft.printf("+%d", clManualN - 1);
+    } else if ((clMode == CL_SEARCHING || clMode == CL_LOCKED || clMode == CL_REACQUIRING || clMode == CL_DOWN)
+               && clNodeN > 1) {
+      tft.printf("+%d", clNodeN - 1);
+    }
+    const char *clSfx = "";
+    uint16_t    clCol = accentLabel();
+    switch (clMode) {
+      case CL_AUTO:                                           break;
+      case CL_MANUAL:      clSfx = " LOCK";   clCol = accentLabel();  break;
+      case CL_SEARCHING:   clSfx = " SEARCH"; clCol = ILI9341_YELLOW; break;
+      case CL_LOCKED:      clSfx = " OK";     clCol = ILI9341_GREEN;  break;
+      case CL_REACQUIRING: clSfx = " LOST";   clCol = ILI9341_YELLOW; break;
+      case CL_DOWN:        clSfx = " DOWN";   clCol = ILI9341_RED;    break;
+    }
+    tft.setTextColor(clCol);
+    tft.print(clSfx);
+    if (clMode != CL_DOWN && clAnyNodeDown()) { tft.setTextColor(ILI9341_YELLOW); tft.print(" !"); }
   }
-  tft.setTextColor(clCol);
-  tft.print(clSfx);
-  if (clMode != CL_DOWN && clAnyNodeDown()) { tft.setTextColor(ILI9341_YELLOW); tft.print("!"); }
 
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(CL_BTN_X + CL_BTN_W + 4, HDR_Y);
-  tft.printf("%02lu:%02lu  seen %lu  drop %lu",
-             (unsigned long)(el / 60), (unsigned long)(el % 60),
-             (unsigned long)gSeen, (unsigned long)wifiIdsDropped());
+  int elapsedX = CHAN_X + 94;
+  uiDrawFieldIfChanged(elapsedX, HDR_Y, tft.width() - elapsedX, 11,
+                        ILI9341_WHITE, 1, prevElapsed, sizeof(prevElapsed),
+                        "%02lu:%02lu  seen %lu  drop %lu",
+                        (unsigned long)(el / 60), (unsigned long)(el % 60),
+                        (unsigned long)gSeen, (unsigned long)wifiIdsDropped());
 
-  tft.setTextColor(sevColor(vD.sev));
-  tft.setCursor(2, D_Y);
-  tft.printf("DEAUTH  %s", sevTag(vD.sev));
-  tft.setCursor(2, D_Y + 11);
-  tft.printf(" d%u dis%u  rc%u  spoof%u", vD.a, vD.b, vD.c, vD.d);
+  uiDrawFieldIfChanged(2, D_Y, tft.width() - 4, 11, sevColor(vD.sev), 1, prevDeauth1, sizeof(prevDeauth1),
+                        "DEAUTH  %s", sevTag(vD.sev));
+  uiDrawFieldIfChanged(2, D_Y + 11, tft.width() - 4, 11, sevColor(vD.sev), 1, prevDeauth2, sizeof(prevDeauth2),
+                        " d%u dis%u  rc%u  spoof%u", vD.a, vD.b, vD.c, vD.d);
 
-  tft.setTextColor(sevColor(vB.sev));
-  tft.setCursor(2, B_Y);
-  tft.printf("BEACON  %s", sevTag(vB.sev));
-  tft.setCursor(2, B_Y + 11);
-  tft.printf(" uniq~%u rnd%u laa%u seq%u b%u", vB.a, vB.b, vB.c, vB.d, vB.e);
+  uiDrawFieldIfChanged(2, B_Y, tft.width() - 4, 11, sevColor(vB.sev), 1, prevBeacon1, sizeof(prevBeacon1),
+                        "BEACON  %s", sevTag(vB.sev));
+  uiDrawFieldIfChanged(2, B_Y + 11, tft.width() - 4, 11, sevColor(vB.sev), 1, prevBeacon2, sizeof(prevBeacon2),
+                        " uniq~%u rnd%u laa%u seq%u b%u", vB.a, vB.b, vB.c, vB.d, vB.e);
 
-  tft.setTextColor(sevColor(vA.sev));
-  tft.setCursor(2, A_Y);
-  tft.printf("AUTH/ASSOC  %s", sevTag(vA.sev));
-  tft.setCursor(2, A_Y + 11);
-  tft.printf(" req%u src~%u laa%u ->%02X%02X%02X",
-             vA.a, vA.b, vA.c, vATop[3], vATop[4], vATop[5]);
+  uiDrawFieldIfChanged(2, A_Y, tft.width() - 4, 11, sevColor(vA.sev), 1, prevAuth1, sizeof(prevAuth1),
+                        "AUTH/ASSOC  %s", sevTag(vA.sev));
+  uiDrawFieldIfChanged(2, A_Y + 11, tft.width() - 4, 11, sevColor(vA.sev), 1, prevAuth2, sizeof(prevAuth2),
+                        " req%u src~%u laa%u ->%02X%02X%02X",
+                        vA.a, vA.b, vA.c, vATop[3], vATop[4], vATop[5]);
 
-  tft.setCursor(2, R_Y);
   if (!rogueOn) {
-    tft.setTextColor(ILI9341_YELLOW);
-    tft.print("ROGUE-AP  no baseline, run Rogue AP");
+    uiDrawFieldIfChanged(2, R_Y, tft.width() - 4, 11, ILI9341_YELLOW, 1, prevRogueLine, sizeof(prevRogueLine),
+                          "ROGUE-AP  no baseline, run Rogue AP");
   } else {
-    tft.setTextColor(vRogue ? ILI9341_RED : ILI9341_GREEN);
-    tft.printf("ROGUE-AP  %s  (baseline %d)", vRogue ? "HIT" : "watching", rogueApCount());
+    uiDrawFieldIfChanged(2, R_Y, tft.width() - 4, 11, vRogue ? ILI9341_RED : ILI9341_GREEN, 1,
+                          prevRogueLine, sizeof(prevRogueLine),
+                          "ROGUE-AP  %s  (baseline %d)", vRogue ? "HIT" : "watching", rogueApCount());
   }
 
   // One compact line for the six newer detectors -- color conveys severity
   // (no room here for a text tag per item the way the three blocks above
   // get one); same technique ble_scan.cpp's "Flipper:N  Glasses:N" summary
-  // line uses (sequential setTextColor+print, not one printf).
-  tft.setCursor(2, N_Y);
-  tft.setTextColor(sevColor(sevKarma()));                     tft.print("KARMA ");
-  tft.setTextColor(sevColor(sevCsa()));                       tft.print("CSA ");
-  tft.setTextColor(sevColor(vHsTheft ? SEV_ALERT : SEV_OK));  tft.print("HS ");
-  tft.setTextColor(sevColor(sevPmkid()));                     tft.print("PMKID ");
-  tft.setTextColor(sevColor(vKrack ? SEV_ALERT : SEV_OK));    tft.print("KRACK ");
-  tft.setTextColor(sevColor(sevWps()));                       tft.print("WPS");
+  // line uses (sequential setTextColor+print, not one printf). Six colors
+  // on one line, so like the channel readout above this is a gate-only
+  // field.
+  char detSig[16];
+  snprintf(detSig, sizeof(detSig), "%d%d%d%d%d%d", sevKarma(), sevCsa(), vHsTheft, sevPmkid(), vKrack, sevWps());
+  if (uiFieldChanged(prevDetLine, sizeof(prevDetLine), detSig)) {
+    uiClearRect(0, N_Y, tft.width(), 11);
+    tft.setCursor(2, N_Y);
+    tft.setTextColor(sevColor(sevKarma()));                     tft.print("KARMA ");
+    tft.setTextColor(sevColor(sevCsa()));                       tft.print("CSA ");
+    tft.setTextColor(sevColor(vHsTheft ? SEV_ALERT : SEV_OK));  tft.print("HS ");
+    tft.setTextColor(sevColor(sevPmkid()));                     tft.print("PMKID ");
+    tft.setTextColor(sevColor(vKrack ? SEV_ALERT : SEV_OK));    tft.print("KRACK ");
+    tft.setTextColor(sevColor(sevWps()));                       tft.print("WPS");
+  }
 }
 
 static uint32_t bannerKey() {
@@ -1722,7 +1798,14 @@ static void drawBanner() {
 static void drawLog() {
   if (!alogDirty) return;
   alogDirty = false;
-  uiClearRect(0, LOG_Y, tft.width(), tft.height() - LOG_Y);   // theme-aware, not flat black
+  // Stop clear above UI_STATUSBAR_H -- clearing all the way to tft.height()
+  // wiped the persistent status-bar strip (background + white separator
+  // line) without restoring it, since that's drawn once by uiDrawStatusBar()
+  // and otherwise only repainted piecemeal (clock/battery glyphs) by
+  // uiServiceChrome(), not as a whole strip -- this is why the bar used to
+  // vanish on every log update, leaving only the clock/battery floating
+  // with no strip under them.
+  uiClearRect(0, LOG_Y, tft.width(), tft.height() - UI_STATUSBAR_H - LOG_Y);   // theme-aware, not flat black
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_RED);
   // Clamp to however many lines actually fit above the status bar, rather
@@ -1737,6 +1820,10 @@ static void drawLog() {
     tft.setCursor(2, LOG_Y + i * 12);
     tft.print(alog[i]);
   }
+  // Drawn last so it always paints on top of any log text underneath --
+  // see optionsBtnRect()'s comment for why this isn't given its own
+  // reserved row instead.
+  uiDrawButton(optionsBtnRect());
 }
 
 // ---- lifecycle ----------------------------------------------------
@@ -1785,6 +1872,7 @@ void widsEnter() {
   gSeen = 0;
   dLastReason = 0;
   lastBannerKey = 0xFFFF;
+  resetStatsFields();
   alerted = false;
 
   // KARMA / CSA-abuse / handshake-theft / PMKID-harvest / KRACK / WPS --
@@ -1838,6 +1926,12 @@ void widsEnter() {
 
   drawStats();
   drawBanner();
+  // drawLog() is normally only entered when alogDirty is set by a new
+  // event -- force one pass now so the Options button (drawn at the end
+  // of drawLog(), see its comment) actually appears on screen entry
+  // instead of staying invisible until the first log event or dismiss tap.
+  alogDirty = true;
+  drawLog();
 }
 
 void widsLoop() {
@@ -1882,13 +1976,16 @@ void widsLoop() {
 
 void widsTouch(const TouchPoint &t) {
   if (!t.isNewPress) return;
-  // Channel-lock button (the bordered "ch%d ..." box drawn in drawStats()):
-  // tap opens the lock picker. A few px of slop added below/right of the
-  // drawn box for a fat-finger tap on the resistive panel; checked first
-  // since it sits well above the banner and would otherwise be swallowed by
-  // the "taps land on the banner/log area" guard right below.
-  if (t.x >= CL_BTN_X && t.x < CL_BTN_X + CL_BTN_W + 8 &&
-      t.y >= CL_BTN_Y && t.y < CL_BTN_Y + CL_BTN_H + 8) {
+  // "Options" button (drawn bottom-right, see optionsBtnRect()): opens
+  // the channel-lock picker. Checked first since it sits inside the
+  // banner/log tap area below and would otherwise be swallowed by the
+  // "dismiss alert" fallthrough right after this. A few px of slop on
+  // every side for a fat-finger tap on the resistive panel, same idea as
+  // this screen's old channel-lock button hit test.
+  Btn ob = optionsBtnRect();
+  bool hitOpt = (t.x >= ob.x - 4 && t.x < ob.x + ob.w + 4 && t.y >= ob.y - 6 && t.y < ob.y + ob.h + 6);
+  DLOG("wids", "tap x=%d y=%d optBtn x=%d y=%d w=%d h=%d hit=%d", t.x, t.y, ob.x, ob.y, ob.w, ob.h, (int)hitOpt);
+  if (hitOpt) {
     uiWaitForRelease();
     clOpenPicker();
     return;

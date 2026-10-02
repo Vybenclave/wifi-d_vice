@@ -38,6 +38,13 @@ void droneEnter();      void droneLoop();      void droneTouch(const TouchPoint 
 void bleSpamEnter();    void bleSpamLoop();    void bleSpamTouch(const TouchPoint &t);    void bleSpamExit();
 void meshEnter();      void meshLoop();      void meshTouch(const TouchPoint &t);      void meshExit();
 bool meshHandleBack();
+// Whether a "<code> ids on" Meshtastic alert-channel command last left WiFi
+// IDS background capture armed (persisted -- survives a "<code> reboot").
+// loop() checks this every iteration (see wifi_d_vice.ino), independent of
+// meshEnter()/meshExit() -- the mesh BLE link itself is screen-bound, but
+// an armed background capture outlives leaving the Meshtastic screen.
+bool meshIdsArmed();
+void meshAlertLoad();  // call once from setup(), before the first meshIdsArmed() check
 void gpsEnter();       void gpsLoop();       void gpsTouch(const TouchPoint &t);       void gpsExit();
 void engagementEnter(); void engagementLoop(); void engagementTouch(const TouchPoint &t); void engagementExit();
 void rogueEnter();    void rogueLoop();    void rogueTouch(const TouchPoint &t);    void rogueExit();

@@ -99,7 +99,7 @@ String uiTextInput(const char *prompt, const String &initial, bool mask) {
 
   auto redrawField = [&]() {
     int fieldW = tft.width() - 4 - (mask ? (showBtn.w + 4) : 0);
-    tft.fillRect(2, 16, tft.width() - 4, 24, ILI9341_BLACK);
+    uiClearRect(2, 16, tft.width() - 4, 24);
     tft.drawRect(2, 16, fieldW, 24, ILI9341_WHITE);
     tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);
@@ -109,7 +109,7 @@ String uiTextInput(const char *prompt, const String &initial, bool mask) {
     if (mask) {
       const int s = 16;
       int cbx = showBtn.x, cby = showBtn.y + 2;
-      tft.fillRect(cbx, cby, s, s, ILI9341_BLACK);
+      uiClearRect(cbx, cby, s, s);
       tft.drawRect(cbx, cby, s, s, ILI9341_WHITE);
       if (revealed) {
         tft.drawLine(cbx + 3, cby + 8, cbx + 6, cby + 12, ILI9341_GREEN);

@@ -172,7 +172,7 @@ void webDownloadRun() {
     uint32_t nc = WiFi.softAPgetStationNum();
     if (nc != lastClients || hits != lastShown) {
       lastClients = nc; lastShown = hits;
-      tft.fillRect(6, y + 34, tft.width() - 12, 12, ILI9341_BLACK);
+      uiClearRect(6, y + 34, tft.width() - 12, 12);
       tft.setTextColor(ILI9341_DARKGREY);
       tft.setCursor(6, y + 34);
       tft.printf("clients: %u   served: %u", (unsigned)nc, (unsigned)hits);

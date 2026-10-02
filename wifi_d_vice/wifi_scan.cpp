@@ -100,25 +100,39 @@ static void harvestListScan(int n) {
 // toggle in the action row -- see the UI rule in ui.h.
 static const int LIST_Y0 = UI_CONTENT_Y + 2, LIST_STEP = 20;
 
+// Per-row "what's currently drawn" signature for uiDrawListIfChanged() --
+// uiDrawActionRow() already self-clears its own band, so drawList() no
+// longer needs a uiClearBelow() up front; only rows whose signature changed
+// get erased and reprinted.
+static char prevRow[MAX_ROWS][UI_LIST_SIG_LEN];
+
 static void drawList() {
-  uiClearBelow(29);
   Btn row[1] = {{0, 0, 0, 0, logging ? "log: on" : "log: off"}};
   uiDrawActionRow(row, 1);
   logBtn = row[0];
-  int y = LIST_Y0;
-  for (int i = 0; i < rowCount && y + 16 <= tft.height() - 2; i++) {
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(4, y);
-    char nm[14];
-    snprintf(nm, sizeof(nm), "%-13.13s", rows[i].ssid.c_str());
-    tft.print(nm);
-    tft.setTextSize(1);
-    tft.setTextColor(accentLabel());
-    tft.setCursor(4 + 13 * 12 + 4, y + 5);
-    tft.printf("c%-3d %ddBm", rows[i].channel, rows[i].rssi);
-    y += LIST_STEP;
-  }
+
+  int maxVisible = (tft.height() - 18 - LIST_Y0) / LIST_STEP + 1;
+  if (maxVisible > MAX_ROWS) maxVisible = MAX_ROWS;
+  if (maxVisible < 0) maxVisible = 0;
+  int shown = min(rowCount, maxVisible);
+
+  uiDrawListIfChanged(4, LIST_Y0, tft.width() - 4, LIST_STEP, shown, maxVisible, prevRow,
+    [](int i, char *sig, size_t cap) {
+      snprintf(sig, cap, "%-13.13s c%-3d %ddBm", rows[i].ssid.c_str(), rows[i].channel, rows[i].rssi);
+    },
+    [](int i) {
+      int y = LIST_Y0 + i * LIST_STEP;
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setTextSize(2);
+      tft.setCursor(4, y);
+      char nm[14];
+      snprintf(nm, sizeof(nm), "%-13.13s", rows[i].ssid.c_str());
+      tft.print(nm);
+      tft.setTextSize(1);
+      tft.setTextColor(accentLabel());
+      tft.setCursor(4 + 13 * 12 + 4, y + 5);
+      tft.printf("c%-3d %ddBm", rows[i].channel, rows[i].rssi);
+    });
   tft.setTextSize(1);
 }
 
@@ -210,7 +224,7 @@ static void doConnectFlow() {
 
   auto drawChecks = [&]() {
     auto box = [&](const Btn &b, bool on, const char *label) {
-      tft.fillRect(b.x, b.y, b.w, b.h, ILI9341_BLACK);
+      uiClearRect(b.x, b.y, b.w, b.h);
       tft.drawRect(b.x, b.y + 1, 14, 14, ILI9341_WHITE);
       if (on) {
         tft.drawLine(b.x + 2, b.y + 8, b.x + 5, b.y + 12, ILI9341_GREEN);
@@ -286,7 +300,7 @@ static void doConnectFlow() {
 // flicker and left touch getting checked far too rarely, which also broke
 // the back button in this mode.
 static const uint32_t LOCATE_UPDATE_MS = 400;
-static int lastRssiShown = -1000;
+static int lastRssiShown = -999;
 
 static void drawLocateChrome() {
   uiClearBelow(UI_ACTIONROW_Y);
@@ -297,23 +311,13 @@ static void drawLocateChrome() {
   tft.setTextSize(2);
   tft.setCursor(4, UI_CONTENT_Y + 6);
   tft.print(rows[selected].ssid);
-  tft.drawRect(4, UI_CONTENT_Y + 70, tft.width() - 8, 30, ILI9341_WHITE);
-  lastRssiShown = -1000;   // force the dynamic region to redraw once
+  tft.drawRect(4, UI_CONTENT_Y + 73, tft.width() - 8, 26, ILI9341_WHITE);
+  lastRssiShown = -999;   // force the dynamic region to redraw once
 }
 
 static void applyLocateReading(int rssi) {
-  if (rssi != lastRssiShown) {
-    lastRssiShown = rssi;
-    tft.fillRect(4, UI_CONTENT_Y + 36, tft.width() - 8, 34, ILI9341_BLACK);
-    tft.setTextColor(accentLabel());
-    tft.setTextSize(3);
-    tft.setCursor(4, UI_CONTENT_Y + 36);
-    tft.printf("%4d dBm", rssi);
-
-    int barW = map(constrain(rssi, -90, -30), -90, -30, 0, tft.width() - 8);
-    tft.fillRect(5, UI_CONTENT_Y + 71, tft.width() - 10, 28, ILI9341_BLACK);
-    tft.fillRect(5, UI_CONTENT_Y + 71, barW, 28, rssi > -55 ? ILI9341_GREEN : (rssi > -75 ? ILI9341_YELLOW : ILI9341_RED));
-  }
+  uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8,
+                       accentLabel(), -90, -30, &lastRssiShown, rssi);
 
   beepHold(!muted);              // keep the amp warm so short chirps aren't swallowed
   if (!muted) rangeBeep(rssi);   // rate + pitch scale with signal as a range proxy
@@ -343,6 +347,7 @@ static void updateLocate() {
 void wifiScanEnter() {
   subMode = LIST;
   logging = false;   // fresh each entry; the file is closed in wifiScanExit()
+  memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawList() thinks is on screen
   uiDrawTopBar("WiFi Scan");
   uiShowLoading("Scanning...");
   WiFi.mode(WIFI_STA);
@@ -436,6 +441,7 @@ bool wifiScanHandleBack() {
   beepHold(false);
   locateScanPending = false;   // abandon any in-flight locate scan
   subMode = LIST;
+  memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawList() thinks is on screen
   uiDrawTopBar("WiFi Scan");
   uiShowLoading("Scanning...");
   startListScan();

@@ -55,7 +55,7 @@ static int nFlipper = 0, nGlasses = 0;
 static int selected = -1;
 static Btn trackBtn, muteBtn;
 static bool muted = false;
-static int lastRssiShown = -1000;
+static int lastRssiShown = -999;
 // LIST-mode SD logging: an action-row toggle (default off). While on, every
 // completed scan writes one row per device via the shared wlog. Opened on
 // toggle-on, closed on toggle-off and on bleScanExit().
@@ -106,49 +106,76 @@ static void doScan() {
   pBLEScan->clearResults();
 }
 
-// Bigger list: name at text size 2, vendor/RSSI in a size-1 tail. Content
-// starts at UI_CONTENT_Y (not the plain 29) to leave room for the log
-// toggle in the action row -- see the UI rule in ui.h. The last visible
-// row is held back to LIST_BOTTOM so the notable-device summary line has a
-// fixed home just above the status bar.
-static const int LIST_Y0 = UI_CONTENT_Y + 2, LIST_STEP = 20;
+// Bigger list: name at text size 2, vendor/RSSI in a size-1 line below it --
+// the vendor tag (up to 23 chars, see macVendorTag()) plus RSSI ran off the
+// right edge of the screen when squeezed onto the same line as the name, so
+// it gets its own line and the full row width instead. Content starts at
+// UI_CONTENT_Y (not the plain 29) to leave room for the log toggle in the
+// action row -- see the UI rule in ui.h. The last visible row is held back
+// to LIST_BOTTOM so the notable-device summary line has a fixed home just
+// above the status bar.
+static const int LIST_Y0 = UI_CONTENT_Y + 2, LIST_STEP = 30;
 static const int LIST_BOTTOM = 204;   // rows stop here; 206..220 is the summary line
 
+// Per-row / summary "what's currently drawn" signatures for
+// uiDrawListIfChanged() / uiFieldChanged() -- uiDrawActionRow() already
+// self-clears its own band, so drawRows() no longer needs a uiClearBelow()
+// up front; only rows (and the summary line) whose content changed get
+// erased and reprinted.
+static char prevRow[MAX_ROWS][UI_LIST_SIG_LEN];
+static char prevSummary[48] = "";
+
 static void drawRows() {
-  uiClearBelow(29);
   Btn row[1] = {{0, 0, 0, 0, logging ? "log: on" : "log: off"}};
   uiDrawActionRow(row, 1);
   logBtn = row[0];
-  int y = LIST_Y0;
-  for (int i = 0; i < rowCount && y + LIST_STEP <= LIST_BOTTOM; i++) {
-    BleClass cls = rows[i].cls;
-    if (cls != BC_NONE) tft.fillRect(0, y, 3, 16, bleClassColor(cls));   // left edge marker
-    tft.setTextColor(cls != BC_NONE ? bleClassColor(cls) : ILI9341_WHITE);
-    tft.setTextSize(2);
-    tft.setCursor(6, y);
-    char nm[14];
-    snprintf(nm, sizeof(nm), "%-13.13s", rows[i].name.c_str());
-    tft.print(nm);
-    tft.setTextSize(1);
-    tft.setTextColor(accentLabel());
-    tft.setCursor(4 + 13 * 12 + 4, y + 5);
-    if (cls != BC_NONE) tft.printf("%-7s %ddBm", bleClassLabel(cls), rows[i].rssi);
-    else                tft.printf("%s %ddBm", macVendorTag(rows[i].mac).c_str(), rows[i].rssi);
-    y += LIST_STEP;
-  }
+
+  int maxVisible = (LIST_BOTTOM - LIST_Y0) / LIST_STEP;
+  if (maxVisible > MAX_ROWS) maxVisible = MAX_ROWS;
+  if (maxVisible < 0) maxVisible = 0;
+  int shown = min(rowCount, maxVisible);
+
+  uiDrawListIfChanged(0, LIST_Y0, tft.width(), LIST_STEP, shown, maxVisible, prevRow,
+    [](int i, char *sig, size_t cap) {
+      BleClass cls = rows[i].cls;
+      if (cls != BC_NONE) snprintf(sig, cap, "%d|%-13.13s|%-7s|%d", cls, rows[i].name.c_str(), bleClassLabel(cls), rows[i].rssi);
+      else                snprintf(sig, cap, "%d|%-13.13s|%s|%d", cls, rows[i].name.c_str(), macVendorTag(rows[i].mac).c_str(), rows[i].rssi);
+    },
+    [](int i) {
+      int y = LIST_Y0 + i * LIST_STEP;
+      BleClass cls = rows[i].cls;
+      if (cls != BC_NONE) tft.fillRect(0, y, 3, LIST_STEP - 6, bleClassColor(cls));   // left edge marker, spans both lines
+      tft.setTextColor(cls != BC_NONE ? bleClassColor(cls) : ILI9341_WHITE);
+      tft.setTextSize(2);
+      tft.setCursor(6, y);
+      char nm[14];
+      snprintf(nm, sizeof(nm), "%-13.13s", rows[i].name.c_str());
+      tft.print(nm);
+      tft.setTextSize(1);
+      tft.setTextColor(accentLabel());
+      tft.setCursor(6, y + 18);
+      if (cls != BC_NONE) tft.printf("%-7s %ddBm", bleClassLabel(cls), rows[i].rssi);
+      else                tft.printf("%s %ddBm", macVendorTag(rows[i].mac).c_str(), rows[i].rssi);
+    });
   tft.setTextSize(1);
-  // Notable-device summary -- always drawn (green "none" when clear) so a
+
+  // Notable-device summary -- always shown (green "none" when clear) so a
   // Flipper/glasses appearing is unmistakable without hunting the list.
-  tft.fillRect(0, 206, tft.width(), 14, ILI9341_BLACK);
-  tft.setCursor(4, 208);
-  if (nFlipper == 0 && nGlasses == 0) {
-    tft.setTextColor(ILI9341_GREEN);
-    tft.print("no Flipper / glasses seen");
-  } else {
-    tft.setTextColor(ILI9341_MAGENTA);
-    tft.printf("Flipper:%d  ", nFlipper);
-    tft.setTextColor(ILI9341_ORANGE);
-    tft.printf("Glasses:%d", nGlasses);
+  char sum[48];
+  if (nFlipper == 0 && nGlasses == 0) snprintf(sum, sizeof(sum), "none");
+  else                                snprintf(sum, sizeof(sum), "Flipper:%d Glasses:%d", nFlipper, nGlasses);
+  if (uiFieldChanged(prevSummary, sizeof(prevSummary), sum)) {
+    uiClearRect(0, 206, tft.width(), 14);
+    tft.setCursor(4, 208);
+    if (nFlipper == 0 && nGlasses == 0) {
+      tft.setTextColor(ILI9341_GREEN);
+      tft.print("no Flipper / glasses seen");
+    } else {
+      tft.setTextColor(ILI9341_MAGENTA);
+      tft.printf("Flipper:%d  ", nFlipper);
+      tft.setTextColor(ILI9341_ORANGE);
+      tft.printf("Glasses:%d", nGlasses);
+    }
   }
 }
 
@@ -181,8 +208,8 @@ static void drawLocateChrome() {
   tft.setTextSize(2);
   tft.setCursor(4, UI_CONTENT_Y + 6);
   tft.print(rows[selected].name);
-  tft.drawRect(4, UI_CONTENT_Y + 70, tft.width() - 8, 30, ILI9341_WHITE);
-  lastRssiShown = -1000;
+  tft.drawRect(4, UI_CONTENT_Y + 73, tft.width() - 8, 26, ILI9341_WHITE);
+  lastRssiShown = -999;
 }
 
 static void updateLocate() {
@@ -199,18 +226,8 @@ static void updateLocate() {
   }
   pBLEScan->clearResults();
 
-  if (rssi != lastRssiShown) {
-    lastRssiShown = rssi;
-    tft.fillRect(4, UI_CONTENT_Y + 36, tft.width() - 8, 34, ILI9341_BLACK);
-    tft.setTextColor(accentLabel());
-    tft.setTextSize(3);
-    tft.setCursor(4, UI_CONTENT_Y + 36);
-    tft.printf("%4d dBm", rssi);
-
-    int barW = map(constrain(rssi, -95, -40), -95, -40, 0, tft.width() - 8);
-    tft.fillRect(5, UI_CONTENT_Y + 71, tft.width() - 10, 28, ILI9341_BLACK);
-    tft.fillRect(5, UI_CONTENT_Y + 71, barW, 28, rssi > -60 ? ILI9341_GREEN : (rssi > -80 ? ILI9341_YELLOW : ILI9341_RED));
-  }
+  uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8,
+                       accentLabel(), -95, -40, &lastRssiShown, rssi);
 
   beepHold(!muted);              // keep the amp warm so short chirps aren't swallowed
   if (!muted) rangeBeep(rssi);   // rate + pitch scale with signal as a range proxy
@@ -219,6 +236,8 @@ static void updateLocate() {
 void bleScanEnter() {
   subMode = LIST;
   logging = false;   // fresh each entry; the file is closed in bleScanExit()
+  memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawRows() thinks is on screen
+  prevSummary[0] = '\0';
   uiDrawTopBar("BLE Scan");
   uiShowLoading("Initializing radio...");
   if (!pBLEScan) {
@@ -303,6 +322,8 @@ bool bleScanHandleBack() {
   if (subMode == LIST) return false;
   beepHold(false);
   subMode = LIST;
+  memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawRows() thinks is on screen
+  prevSummary[0] = '\0';
   uiDrawTopBar("BLE Scan");
   uiShowLoading("Scanning...");
   doScan();

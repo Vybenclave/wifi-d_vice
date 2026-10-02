@@ -206,10 +206,19 @@ static int slotY(int slot) { return UI_CONTENT_Y + 2 + slot * SLOT_H; }
 static uint8_t slotForClass[TK_N];   // TK_N sentinel = not shown
 static uint8_t activeSig = 0xFF;     // bitmask of classes shown last full layout
 
+// Per-slot "what's currently drawn" signature for uiDrawListIfChanged() --
+// see ui.h. A class's row now only erases + reprints when its own content
+// (RSSI / dwell / mac count / follow flag) actually changes, instead of
+// every active row unconditionally redrawing on every ~1.2s refresh.
+static char prevRow[MAX_SLOTS][UI_LIST_SIG_LEN];
+static char prevEmpty[48] = "";
+
 // Static chrome: action row. Drawn once on enter / on return from locate,
 // NOT in the 1.2s refresh -- redrawing it there was the flicker.
 static void drawListChrome() {
-  uiClearBelow(UI_ACTIONROW_Y);
+  uiClearBelow(UI_ACTIONROW_Y);   // wipes the row area too -- reset what drawListRows() thinks is on screen so it doesn't skip redrawing into the now-blank area
+  memset(prevRow, 0, sizeof(prevRow));
+  prevEmpty[0] = '\0';
   Btn r[1] = {{0, 0, 0, 0, "reset dwell timers"}};
   uiDrawActionRow(r, 1);
   resetBtn = r[0];
@@ -217,9 +226,12 @@ static void drawListChrome() {
 
 static void drawListRows() {
   // Recompute the packed slot assignment only when the set of active
-  // classes changes; a change triggers one full list-area repaint, and
-  // between changes each surviving row repaints in the same slot (the
-  // anti-flicker point of the original fixed-slot layout).
+  // classes changes. uiDrawListIfChanged() below is still per-slot content
+  // diffed afterwards -- its signature includes the class id (idx[i]), so
+  // a slot whose occupant changed (or emptied out) redraws/clears on its
+  // own without needing a forced full reset here; a slot that keeps the
+  // same class in place just keeps diffing its RSSI/dwell/mac-count as
+  // usual -- the anti-flicker point of the original fixed-slot layout.
   uint8_t sig = 0;
   for (int k = 0; k < TK_N; k++) if (classActive(k)) sig |= (1u << k);
   if (sig != activeSig) {
@@ -227,36 +239,54 @@ static void drawListRows() {
     int slot = 0;
     for (int k = 0; k < TK_N; k++)
       slotForClass[k] = (classActive(k) && slot < MAX_SLOTS) ? (uint8_t)slot++ : (uint8_t)TK_N;
-    uiClearBelow(UI_CONTENT_Y);
   }
 
-  int shown = 0;
+  // rows[k] (touch hit-boxes, indexed by CLASS not slot) is kept up to date
+  // every call regardless of whether anything redraws -- cheap, and
+  // trackerDetectTouch() needs it live even for an unchanged row.
+  int idx[TK_N], shown = 0;
   for (int k = 0; k < TK_N; k++) {
     if (!classActive(k) || slotForClass[k] >= (uint8_t)TK_N) { rows[k] = {0, 0, 0, 0, ""}; continue; }
     int y = slotY(slotForClass[k]);
-    uiClearRect(4, y, tft.width() - 8, SLOT_H);
-    const ClassStat &c = cs[k];
-    bool foll = classFollow(k);
     rows[k] = {4, y, tft.width() - 8, SLOT_H - 4, ""};
-    tft.drawRect(rows[k].x, rows[k].y, rows[k].w, rows[k].h, foll ? ILI9341_RED : ILI9341_WHITE);
-    tft.setTextSize(2);
-    tft.setTextColor(foll ? ILI9341_RED : ILI9341_WHITE);
-    tft.setCursor(8, y + 2);
-    tft.print(KIND_NAME[k]);
-    tft.setTextSize(1);
-    tft.setTextColor(foll ? ILI9341_RED : accentLabel());
-    uint32_t d = (millis() - c.firstSeen) / 1000;
-    tft.setCursor(8, y + 19);
-    tft.printf("%ddBm  %lum%02lus  %dmac%s", c.rssiSmooth, (unsigned long)(d / 60),
-               (unsigned long)(d % 60), c.macN,
-               foll ? "  << FOLLOW" : (c.separated ? "  separated" : ""));
-    shown++;
+    idx[shown++] = k;
   }
+
+  uiDrawListIfChanged(4, UI_CONTENT_Y + 2, tft.width() - 8, SLOT_H, shown, MAX_SLOTS, prevRow,
+    [&](int i, char *sigOut, size_t cap) {
+      const ClassStat &c = cs[idx[i]];
+      uint32_t d = (millis() - c.firstSeen) / 1000;
+      snprintf(sigOut, cap, "%d|%d|%lu|%d|%d|%d", idx[i], c.rssiSmooth, (unsigned long)d, c.macN,
+               classFollow(idx[i]), c.separated);
+    },
+    [&](int i) {
+      int k = idx[i];
+      int y = slotY(i);
+      const ClassStat &c = cs[k];
+      bool foll = classFollow(k);
+      tft.drawRect(4, y, tft.width() - 8, SLOT_H - 4, foll ? ILI9341_RED : ILI9341_WHITE);
+      tft.setTextSize(2);
+      tft.setTextColor(foll ? ILI9341_RED : ILI9341_WHITE);
+      tft.setCursor(8, y + 2);
+      tft.print(KIND_NAME[k]);
+      tft.setTextSize(1);
+      tft.setTextColor(foll ? ILI9341_RED : accentLabel());
+      uint32_t d = (millis() - c.firstSeen) / 1000;
+      tft.setCursor(8, y + 19);
+      tft.printf("%ddBm  %lum%02lus  %dmac%s", c.rssiSmooth, (unsigned long)(d / 60),
+                 (unsigned long)(d % 60), c.macN,
+                 foll ? "  << FOLLOW" : (c.separated ? "  separated" : ""));
+    });
   tft.setTextSize(1);
+
   if (shown == 0) {
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(6, slotY(0) + 10);
-    tft.print("No trackers in range.");
+    if (uiFieldChanged(prevEmpty, sizeof(prevEmpty), "empty")) {
+      tft.setTextColor(ILI9341_GREEN);
+      tft.setCursor(6, slotY(0) + 10);
+      tft.print("No trackers in range.");
+    }
+  } else {
+    prevEmpty[0] = '\0';   // forget it so the message reprints if the list empties out again later
   }
 }
 
@@ -271,7 +301,7 @@ static void drawLocateChrome() {
   tft.setTextColor(accentLabel());
   tft.setCursor(6, UI_CONTENT_Y + 6);
   tft.print(KIND_NAME[locKind]);
-  tft.drawRect(4, UI_CONTENT_Y + 74, tft.width() - 8, 24, ILI9341_WHITE);
+  tft.drawRect(4, UI_CONTENT_Y + 73, tft.width() - 8, 26, ILI9341_WHITE);
   lastShownRssi = -999;
 }
 
@@ -281,19 +311,9 @@ static void updateLocate() {
   int rssi = liveRssiFor(locKind);
   beepHold(rssi > -127);
   if (rssi > -127) rangeBeep(rssi);
-  if (rssi == lastShownRssi) return;
-  lastShownRssi = rssi;
 
-  tft.fillRect(4, UI_CONTENT_Y + 34, tft.width() - 8, 34, ILI9341_BLACK);
-  tft.setTextSize(3);
-  tft.setTextColor(rssi > -127 ? accentLabel() : ILI9341_DARKGREY);
-  tft.setCursor(6, UI_CONTENT_Y + 34);
-  if (rssi > -127) tft.printf("%4d dBm", rssi); else tft.print(" -- lost");
-
-  int barW = rssi > -127 ? map(constrain(rssi, -95, -35), -95, -35, 0, tft.width() - 10) : 0;
-  tft.fillRect(5, UI_CONTENT_Y + 75, tft.width() - 10, 22, ILI9341_BLACK);
-  tft.fillRect(5, UI_CONTENT_Y + 75, barW, 22,
-               rssi > -55 ? ILI9341_GREEN : (rssi > -75 ? ILI9341_YELLOW : ILI9341_RED));
+  uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8,
+                       accentLabel(), -95, -35, &lastShownRssi, rssi);
 }
 
 void trackerEnter() {

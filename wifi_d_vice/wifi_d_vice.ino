@@ -50,7 +50,9 @@
 #include "devtime.h"
 #include "tz.h"
 #include "gps_shared.h"
+#include "wifi_ids.h"
 #include "engagement.h"
+#include "debuglog.h"
 #include "engstore.h"
 #include "theme.h"
 #include "accent.h"
@@ -423,6 +425,12 @@ void setup() {
   // screen is up; the Wardrive screen and the Hardware > Test GPS page
   // both just read the same live fix instead of opening their own UART.
   gpsSharedBegin();
+  meshAlertLoad();            // load the alert-channel/code/armed state before the check below reads it
+  // A "<code> ids on" Meshtastic alert-channel command arms this (see
+  // meshtastic_mon.cpp) and it's persisted, so a reboot (remote "<code>
+  // reboot" included) needs to restore the held wifiIdsBegin() ref here --
+  // same reasoning as gpsSharedBegin() above, just conditional.
+  if (meshIdsArmed()) wifiIdsBegin();
   showSplash(2600);           // WIFI D_VICE splash, tap to skip
   onboardingRunIfNeeded();
   drawMenu();
@@ -460,6 +468,7 @@ static void checkBootHoldRecalibrate() {
   if (bootHeldSince == 0) bootHeldSince = millis();
   if (!bootHoldFired && millis() - bootHeldSince > BOOT_HOLD_MS) {
     bootHoldFired = true;
+    DLOG("cal", "checkBootHoldRecalibrate fired -- BOOT_KEY held continuously >1.5s during runtime");
     uiRunCalibration();
     if (currentScreen == MENU) drawMenu();
     else enterScreen(currentScreen);   // redraw whatever screen was up
@@ -467,6 +476,7 @@ static void checkBootHoldRecalibrate() {
 }
 
 void loop() {
+  dlogPoll();              // "log on/off <tag>" typed into the serial console, any time
   checkBootHoldRecalibrate();
   if (bootWifiPending && WiFi.status() == WL_CONNECTED) {
     bootWifiPending = false;
@@ -474,6 +484,15 @@ void loop() {
   }
   devTimePoll();           // promote to synced once an SNTP reply lands
   gpsSharedLoop();         // drain the GPS UART + run its own 15s/1hr time-sync schedule
+  // Background WiFi IDS raw capture, armed by a Meshtastic "<code> ids on"
+  // command (meshIdsArmed()) independent of whatever screen is up -- the
+  // WIFI_IDS guard skips this when that screen is itself open and already
+  // draining the same ring every frame via its own widsLoop() call, so the
+  // two never double-pump. This is raw capture only (wifi_ids.cpp's
+  // promiscuous sniffer + ring); the deauth/beacon/karma/etc. detectors
+  // and alerting still live entirely in wifi_ids_screen.cpp, so they only
+  // run while that screen is the one on screen -- same as today.
+  if (meshIdsArmed() && currentScreen != WIFI_IDS) wifiIdsLoop();
   serviceArmedLed();       // 250ms/1250ms pulse while an engagement is armed
 
   // Blue "working" heartbeat on the continuously-scanning screens. The

@@ -4,11 +4,13 @@
 #include <math.h>
 #include <time.h>
 #include <string.h>
+#include <stdarg.h>
 #include "driver/dac_continuous.h"
 #include "devtime.h"
 #include "tz.h"
 #include "theme.h"
 #include "accent.h"
+#include "debuglog.h"
 #include "bg_landscape.h"   // BG_LANDSCAPE[19200]  160x120, upscaled x2
 #include "bg_portrait.h"    // BG_PORTRAIT[19200]   120x160
 
@@ -56,11 +58,11 @@ void uiSetBgMode(int m) { s_bgMode = m; }
 
 // Cached in RAM (like themeGet()) rather than read from NVS -- uiDrawTopBar()
 // checks this on every screen draw, not just once at Enter().
-static bool s_listBg = false;
+static bool s_listBg = true;
 static void loadListBg() {
   Preferences p;
   p.begin("disp", true);
-  s_listBg = p.getBool("listbg", false);
+  s_listBg = p.getBool("listbg", true);
   p.end();
 }
 bool uiListBgEnabled() { return s_listBg; }
@@ -174,6 +176,7 @@ void uiSetRotation(uint8_t r) {
   p.end();
   tft.setRotation(displayRotation);
   loadCalFor(displayRotation);
+  DLOG("cal", "uiSetRotation rot=%u valid=%d", displayRotation, (int)cal[displayRotation].valid);
   if (!cal[displayRotation].valid) uiRunCalibration();   // this orientation's never been calibrated
 }
 
@@ -309,6 +312,7 @@ void uiInit() {
   tft.fillScreen(ILI9341_BLACK);
 
   loadCalFor(displayRotation);
+  DLOG("cal", "uiInit rot=%u valid=%d", displayRotation, (int)cal[displayRotation].valid);
   if (!cal[displayRotation].valid) uiRunCalibration();
 
   loadBeepVolume();
@@ -409,6 +413,43 @@ void uiDrawStatusBar() {
 void uiClearBelow(int y0) {
   uiClearRect(0, y0, tft.width(), tft.height() - y0);
   uiDrawStatusBar();
+}
+
+bool uiFieldChanged(char *prevBuf, size_t prevBufSz, const char *newText) {
+  if (strncmp(prevBuf, newText, prevBufSz) == 0) return false;
+  strncpy(prevBuf, newText, prevBufSz - 1);
+  prevBuf[prevBufSz - 1] = '\0';
+  return true;
+}
+
+bool uiDrawFieldIfChanged(int x, int y, int w, int h, uint16_t fg, uint8_t sz,
+                          char *prevBuf, size_t prevBufSz, const char *fmt, ...) {
+  char buf[96];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (!uiFieldChanged(prevBuf, prevBufSz, buf)) return false;
+  uiClearRect(x, y, w, h);
+  tft.setTextColor(fg);
+  tft.setTextSize(sz);
+  tft.setCursor(x, y);
+  tft.print(buf);
+  return true;
+}
+
+void uiDrawListIfChanged(int x, int rowY0, int rowW, int rowH, int count, int maxRows,
+                         char prevBufs[][UI_LIST_SIG_LEN],
+                         const std::function<void(int i, char *sigOut, size_t sigCap)> &rowSignature,
+                         const std::function<void(int i)> &drawRow) {
+  char sig[UI_LIST_SIG_LEN];
+  for (int i = 0; i < maxRows; i++) {
+    if (i < count) rowSignature(i, sig, sizeof(sig));
+    else sig[0] = '\0';   // slot no longer in use -- treat as a blank row
+    if (!uiFieldChanged(prevBufs[i], UI_LIST_SIG_LEN, sig)) continue;
+    uiClearRect(x, rowY0 + i * rowH, rowW, rowH);
+    if (i < count) drawRow(i);
+  }
 }
 
 void uiDrawTopBar(const char *title) {
@@ -544,6 +585,19 @@ void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn) {
   tft.print(pg);
 }
 
+int uiPagerLayout(int y0, int rowH, int gap, int bottomMargin, int pagerGap,
+                  int count, int hardCap, int cols,
+                  int &itemsPerPage, int &pages, int &pagerY) {
+  int rowsPerPage = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0 + gap) / (rowH + gap);
+  if (rowsPerPage < 1) rowsPerPage = 1;
+  if (rowsPerPage > hardCap) rowsPerPage = hardCap;
+  itemsPerPage = rowsPerPage * cols;
+  if (count > 0 && itemsPerPage > count) itemsPerPage = count;
+  pages = count > 0 ? (count + itemsPerPage - 1) / itemsPerPage : 1;
+  pagerY = y0 + rowsPerPage * (rowH + gap) - gap + pagerGap;
+  return rowsPerPage;
+}
+
 int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current) {
   if (count <= 0) return current;
   const int MAX_ROWS = 10;
@@ -551,13 +605,9 @@ int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), 
   // Room is always reserved for the pager row -- see uiDrawPager()'s
   // comment on why it's drawn even at one page, rather than the layout
   // changing shape depending on whether paging is actually needed.
-  int maxRows = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0) / (rowH + gap);
-  if (maxRows < 1) maxRows = 1;
-  if (maxRows > MAX_ROWS) maxRows = MAX_ROWS;
-  if (maxRows > count) maxRows = count;
-  int pages = (count + maxRows - 1) / maxRows;
+  int maxRows, pages, pagerY;
+  uiPagerLayout(y0, rowH, gap, bottomMargin, pagerGap, count, MAX_ROWS, 1, maxRows, pages, pagerY);
   int page = (current >= 0 && current < count) ? current / maxRows : 0;
-  const int pagerY = y0 + maxRows * (rowH + gap) - gap + pagerGap;
 
   Btn items[MAX_ROWS], prevBtn, nextBtn;
   int n = 0;   // rows actually drawn on the current page -- read back in the touch loop below
@@ -728,9 +778,9 @@ void uiDrawClock() {
       snprintf(buf, sizeof(buf), "%d:%02d%c", h12, t.tm_min, t.tm_hour < 12 ? 'a' : 'p');
     }
   }
-  if (!s_clockForce && strcmp(buf, last) == 0) return;
+  bool changed = uiFieldChanged(last, sizeof(last), buf);
+  if (!s_clockForce && !changed) return;
   s_clockForce = false;
-  strcpy(last, buf);
 
   const int rightEdge = tft.width() - 55 - 4;   // 4px gap before the battery label
   const int textW = 6 * 6;                       // widest case, "12:34p", at text size 1
@@ -780,6 +830,29 @@ void uiDrawRotatedText(int cx, int cy, const char *text, uint8_t rotSteps, uint8
       tft.drawPixel(ox + dx, oy + dy, color);
     }
   }
+}
+
+bool uiDrawLocateReading(int x, int y, int w, uint16_t presentColor,
+                         int rssiMin, int rssiMax, int *prevRssi, int rssi) {
+  if (rssi == *prevRssi) return false;
+  *prevRssi = rssi;
+  bool present = rssi > -127;
+  const int numH = 34, gap = 4, barH = 24;
+
+  uiClearRect(x, y, w, numH);
+  tft.setTextSize(3);
+  tft.setTextColor(present ? presentColor : ILI9341_DARKGREY);
+  tft.setCursor(x + 2, y);
+  if (present) tft.printf("%4d dBm", rssi); else tft.print(" -- lost");
+
+  int barY = y + numH + gap;
+  int barW = present ? map(constrain(rssi, rssiMin, rssiMax), rssiMin, rssiMax, 0, w - 2) : 0;
+  uiClearRect(x + 1, barY, w - 2, barH);
+  int third = (rssiMax - rssiMin) / 3;
+  uint16_t barCol = rssi > rssiMax - third      ? ILI9341_GREEN :
+                    rssi > rssiMax - 2 * third  ? ILI9341_YELLOW : ILI9341_RED;
+  if (barW > 0) tft.fillRect(x + 1, barY, barW, barH, barCol);
+  return true;
 }
 
 void ledSet(bool on)   { digitalWrite(LED_STATUS, on ? LOW : HIGH); }   // red, active low
@@ -1047,7 +1120,7 @@ int uiBatteryPct() { return battPct(uiBatteryMv()); }
 
 static uint32_t s_batReadAt = 0, s_batPaintAt = 0;
 static int s_batMv = 0;                 // s_batPct itself lives up top -- see the comment there
-static int s_batSig = -9999;            // last-painted {pct, pulse-colour}
+static char s_batSig[8] = "";           // last-painted {pct, pulse-colour}
 
 // Bottom-right corner, rightmost. The clock (uiDrawClock) sits just to its
 // left. Drawn from loop() every iteration like the clock -- only the ADC
@@ -1074,10 +1147,11 @@ void uiDrawBatteryIndicator() {
   // every loop() strobed the icon. Force one on a screen change, and one
   // at least every 1.5s so a screen that clears this corner every frame
   // (wardrive) gets the glyph back.
-  int sig = s_batPct * 16 + (low ? cycIdx : 8);
-  if (!s_batForce && sig == s_batSig && now - s_batPaintAt < 1500) return;
+  char sig[8];
+  snprintf(sig, sizeof(sig), "%d", s_batPct * 16 + (low ? cycIdx : 8));
+  bool changed = uiFieldChanged(s_batSig, sizeof(s_batSig), sig);
+  if (!s_batForce && !changed && now - s_batPaintAt < 1500) return;
   s_batForce = false;
-  s_batSig = sig;
   s_batPaintAt = now;
 
   const int nubW = 2, bodyW = 20, bodyH = 10;
@@ -1152,7 +1226,7 @@ String uiNumpadInput(const char *prompt, const String &initial) {
   for (int i = 0; i < 14; i++) uiDrawButton(k[i].b);
 
   auto redrawField = [&]() {
-    tft.fillRect(2, 16, tft.width() - 4, 26, ILI9341_BLACK);
+    uiClearRect(2, 16, tft.width() - 4, 26);
     tft.drawRect(2, 16, tft.width() - 4, 26, ILI9341_WHITE);
     tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);
