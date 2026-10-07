@@ -8,14 +8,13 @@
 extern Adafruit_ILI9341 tft;
 
 struct TouchPoint {
-  bool pressed;     // raw physical state -- true for the whole duration a finger is down
-  bool isNewPress;  // true ONLY on the first sample of a new touch-down (rising edge);
-                    // false for every subsequent sample while still held, even though
-                    // `pressed` stays true. uiTouchInButton() checks this, not `pressed`,
-                    // so a held touch can't re-trigger a button/screen change by itself --
-                    // check `pressed` directly only where you deliberately want
-                    // repeat-while-held behavior (e.g. the keyboard's backspace key).
-  int x, y;   // screen-space (0..319, 0..239), rotation-1 landscape
+  bool pressed;     // True while the finger touches the screen.
+  bool isNewPress;  // True only on the first touch sample.
+                    // False while the finger stays down.
+                    // uiTouchInButton() checks this flag.
+                    // A held touch cannot re-trigger a button.
+                    // Check `pressed` only for repeat behavior.
+  int x, y;   // Screen coordinates in landscape mode.
 };
 
 struct Btn {
@@ -24,317 +23,277 @@ struct Btn {
 };
 
 void uiInit();
-// L-shaped 3-point tap calibration for the CURRENT rotation; persists to
-// NVS per-rotation (see ui.cpp). Measures which raw touch axis is which
-// rather than assuming it -- don't "optimize" this back to assuming a
-// swap/invert formula, that was tried twice and was wrong both times.
+// Calibrate touch for the current rotation.
+// Store results in NVS per rotation.
+// Measure raw touch axes directly.
+// Do not assume a swap or invert formula.
 void uiRunCalibration();
-// Sets display rotation (0-3) directly and persists it to NVS. Triggers
-// uiRunCalibration() if that rotation has no stored calibration yet.
+// Set display rotation and store it in NVS.
+// Run calibration if no data exists for this rotation.
 void uiSetRotation(uint8_t r);
-void uiCycleRotation();   // uiSetRotation((current + 1) % 4)
+void uiCycleRotation();
 TouchPoint uiReadTouch();
-// Blocks until the finger lifts (bounded by timeoutMs so a stuck touch
-// driver can't hang forever). Call this after any tap that triggers a
-// screen/mode transition -- a fixed delay() isn't enough, since a press
-// held past the delay bleeds through as a fresh tap on whatever's newly
-// drawn at the same coordinates.
+// Wait for the finger to lift.
+// Use timeoutMs to prevent driver hangs.
+// Call this after taps that change screens.
+// A fixed delay fails if the press lasts longer.
 void uiWaitForRelease(uint32_t timeoutMs = 2000);
-// Theme background. Vice = vertical indigo->magenta gradient, Basic = flat
-// black. Screens clear their area with these instead of fillRect(BLACK) so
-// the gradient shows everywhere.
+// Return background color for a given Y coordinate.
+// Vice uses a vertical gradient.
+// Basic uses flat black.
+// Use this function to clear screen areas.
 uint16_t uiBgColor(int y);
 void uiClearRect(int x, int y, int w, int h);
-void uiClearBelow(int y0);   // (0, y0) .. bottom-right
+void uiClearBelow(int y0);   // Clear the rectangle from (0, y0) to the bottom right.
+// Upscale a half-resolution image by 2x.
+// Blend texels to avoid blocky pixels.
+// Reuse this function for full-screen images.
+// `img` points to the source data.
+// `xx` and `yy` set the target position.
+uint16_t uiBgSample(const uint16_t *img, int sw, int sh, int xx, int yy);
 
 // --- flicker-free value / list redraw ------------------------------------
-// Shared "diff against what was last drawn, only touch what changed"
-// primitives -- the pattern this app already reinvented ad hoc per screen
-// (uiDrawClock's `last[]`, uiDrawBatteryIndicator's `s_batSig`, the old
-// per-screen `lastRssiShown`/dirty-flag variables), after the technique in
-// Kasprzak's FlickerFreePrint library. Every live-updating value or row
-// list in the app goes through one of these instead of its own static
-// "last shown" variable, so a shrinking/growing region and the Vice
-// gradient / scene-image background (uiClearRect) are handled consistently
-// everywhere.
+// Redraw only changed screen regions.
+// Compare new text against the previous buffer.
+// This handles shrinking and growing regions.
+// It works with the Vice gradient background.
 
-// Compares newText against prevBuf, copies it in, and returns true iff it
-// differed -- the bare "should I redraw at all" gate, for callers that do
-// their own erase/draw sequence (a glyph, a bar, a multi-part layout).
+// Compare new text with the previous buffer.
+// Copy the new text into the buffer.
+// Return true if the text changed.
 bool uiFieldChanged(char *prevBuf, size_t prevBufSz, const char *newText);
 
-// Formats fmt/... and, only if it differs from what's stored in prevBuf,
-// erases (x,y,w,h) via uiClearRect() and prints it at `sz` in `fg`. Returns
-// true iff it redrew -- a caller with secondary drawing tied to the same
-// value (e.g. a signal-strength bar next to the number) gates on that
-// instead of keeping its own duplicate change check.
+// Format the string and check for changes.
+// Erase the old area and print the new text.
+// Return true if the screen updated.
 bool uiDrawFieldIfChanged(int x, int y, int w, int h, uint16_t fg, uint8_t sz,
                           char *prevBuf, size_t prevBufSz, const char *fmt, ...);
 
-// Max bytes of a row's comparison signature for uiDrawListIfChanged() --
-// big enough for a combined "name + a couple of numeric fields" row; the
-// signature is just for change detection, it's never printed verbatim.
+// Maximum signature length for list rows.
+// Use this size for change detection only.
 static const int UI_LIST_SIG_LEN = 64;
 
-// Fixed-slot row list (the pattern tracker_detect.cpp proved out): for each
-// slot i in [0, maxRows), rowSignature(i, ...) builds a comparable text
-// signature for that row's current content. A slot whose signature differs
-// from prevBufs[i] gets its rect erased (uiClearRect) and drawRow(i) called
-// to do the actual per-column tft.print() calls; unchanged rows are left
-// untouched. Slots in [count, maxRows) are treated as blank, so a list that
-// shrinks clears its leftover rows instead of leaving them stale.
+// Redraw only changed rows in a fixed list.
+// Build a signature for each row.
+// Erase and redraw rows that changed.
+// Clear empty slots at the end of the list.
 void uiDrawListIfChanged(int x, int rowY0, int rowW, int rowH, int count, int maxRows,
                          char prevBufs[][UI_LIST_SIG_LEN],
                          const std::function<void(int i, char *sigOut, size_t sigCap)> &rowSignature,
                          const std::function<void(int i)> &drawRow);
 
-// Content-area background for menu / button screens: the dimmed, softened
-// Vice scene image instead of the flat gradient. UI_BG_BLACK (flat black /
-// gradient) is the default and is restored by every uiDrawTopBar() UNLESS
-// uiListBgEnabled() is on, in which case the default is UI_BG_IMAGE instead
-// -- that's what lets list / live-data screens (which never call
-// uiSetBgMode() themselves) pick up the scene image too. A button screen
-// still opts in explicitly by calling uiSetBgMode(UI_BG_IMAGE) right after
-// its top bar (or before its first uiClearBelow, for the home menu which has
-// no top bar) -- harmless no-op when the default is already UI_BG_IMAGE. No
-// effect in the Basic theme.
+// Set the content background mode.
+// The default is UI_BG_BLACK.
+// uiDrawTopBar() resets this mode.
+// List screens use UI_BG_IMAGE by default.
+// Button screens must call this function.
+// This setting has no effect in the Basic theme.
 enum { UI_BG_BLACK = 0, UI_BG_IMAGE = 1 };
 void uiSetBgMode(int mode);
 
-// Whether list / live-data screens (which don't call uiSetBgMode()
-// themselves) default to the scene image instead of the gradient. Persisted
-// in NVS ("disp"/"listbg", same namespace as splashEnabled()). On by
-// default under the Vice theme; the user can switch back to the plain
-// gradient from System > Display > Theme & Color.
+// Check if list screens use the scene image.
+// Store this setting in NVS.
+// The Vice theme enables this by default.
 bool uiListBgEnabled();
 void uiSetListBgEnabled(bool on);
 
-// Persistent bottom chrome: a solid black strip UI_STATUSBAR_H tall with a
-// 1px white rule along its top edge, holding the toast line, the clock and
-// the battery glyph. Painted by uiClearBelow() and uiDrawTopBar().
+// Status bar height in pixels.
+// Draw a black strip with a white top edge.
+// This function paints the status bar.
 static const int UI_STATUSBAR_H = 18;
-// Width reserved on the right of the status bar for the clock + battery
-// glyph (uiDrawClock, uiDrawBatteryIndicator) -- uiToast()'s text stops
-// here so it doesn't run under them.
+// Right zone width for the clock and battery.
+// Toast text stops at this boundary.
 static const int UI_RIGHTZONE_W = 96;
 void uiDrawStatusBar();
 
 void uiDrawTopBar(const char *title);
 bool uiTouchInBackButton(const TouchPoint &t);
-bool uiTouchInBackArea(const TouchPoint &t);   // area only, for a held back button
-// Global cap on button label text size. uiDrawButton() starts here and
-// shrinks to fit, so every button in the app is at most this size -- one
-// knob if you want them bigger/smaller. At 2 a ~15-char label fits a
-// full-width (>=180px) button (15 * 6px * 2 = 180px).
+bool uiTouchInBackArea(const TouchPoint &t);   // Check touch position for a held back button.
+// Maximum button label text size.
+// uiDrawButton() shrinks text to fit.
+// Change this value to resize all buttons.
 static const uint8_t UI_MENU_BTN_MAXSIZE = 2;
 void uiDrawButton(const Btn &b);
-// Alias for uiDrawButton() -- kept for call sites that name it explicitly.
+// Call uiDrawButton() with a different name.
 void uiDrawMenuButton(const Btn &b);
-// Greyed-out / disabled button: same footprint and label-fit as
-// uiDrawButton(), muted fill + grey text. For a menu row whose feature is
-// unavailable (for example a radio that is not marked installed).
+// Draw a disabled button.
+// Use muted colors and grey text.
+// Show this for unavailable features.
 void uiDrawButtonDim(const Btn &b);
+// Draw a button with a custom fill color.
+// Use this for distinct button states.
+// Calculate text contrast against the fill color.
+void uiDrawButtonColored(const Btn &b, uint16_t fill);
+// Draw a button with independent colors.
+// Set fill, edge, and text colors separately.
+// Use this for three-state indicators.
+void uiDrawButtonTricolor(const Btn &b, uint16_t fill, uint16_t edge, uint16_t text);
+// Return black or white for maximum contrast.
+uint16_t uiContrastText(uint16_t fill);
 bool uiTouchInButton(const TouchPoint &t, const Btn &b);
 
-// UI rule: the top-bar row is back+title ONLY, always -- never squeeze
-// extra per-screen buttons into it. That's caused real bugs (a button
-// drawn there survived a mode switch that only redrew content below the
-// top bar; text collided with the back button). Any screen needing extra
-// buttons (a tab, a mode toggle, a Track button, etc.) puts them in the
-// action row via uiDrawActionRow() instead, and starts its own content at
-// UI_CONTENT_Y (not the plain 29px case) to leave room for it.
+// Reserve the top bar for the back button and title only.
+// Do not add extra buttons to this row.
+// Place additional buttons in the action row.
+// Start screen content at UI_CONTENT_Y.
 static const int UI_TOPBAR_H = 28;
 static const int UI_ACTIONROW_Y = UI_TOPBAR_H + 1;
 static const int UI_ACTIONROW_H = 26;
-static const int UI_CONTENT_Y_PLAIN = UI_TOPBAR_H + 1;                     // no action row
-static const int UI_CONTENT_Y = UI_ACTIONROW_Y + UI_ACTIONROW_H + 1;       // with an action row
-// Lays out `count` equal-width buttons filling one row directly below the
-// top bar and draws them; set each btns[i].label before calling (x/y/w/h
-// are computed here and overwritten). Returns nothing -- read the same
-// array back for hit-testing (uiTouchInButton against btns[i]).
+static const int UI_CONTENT_Y_PLAIN = UI_TOPBAR_H + 1;                     // Content start Y without an action row.
+static const int UI_CONTENT_Y = UI_ACTIONROW_Y + UI_ACTIONROW_H + 1;       // Content start Y with an action row.
+// Draw a row of equal-width buttons.
+// Set button labels before calling.
+// This function computes button positions.
+// Use the same array for hit testing.
 void uiDrawActionRow(Btn *btns, int count);
-// The project's ONE paging control -- every paged list/grid screen uses
-// this, not its own prev/next buttons or a "tap the empty space" gesture.
-// Draws "< prev   N / M   next >" in one row at (x=8..width-8, y, h);
-// prevBtn/nextBtn come back dimmed (via uiDrawButtonDim()) at either end
-// when there's no previous/next page. The caller still does its own
-// touch handling on the two Btn outs, same shape every time:
-//   if (uiTouchInButton(t, prevBtn) && page > 0)         { ...; page--; }
-//   if (uiTouchInButton(t, nextBtn) && page < pages - 1) { ...; page++; }
-// Always draws (even at page 1/1, both ends dimmed) rather than hiding
-// itself for a single page -- keeps a paged screen's layout constant
-// instead of jumping around depending on item count.
+// Draw a standard paging control.
+// Every paged screen must use this function.
+// Dim the previous button on the first page.
+// Dim the next button on the last page.
+// Always draw the control to keep layout stable.
 static const int UI_PAGER_H = 26;
 void uiDrawPager(int y, int page, int pages, Btn &prevBtn, Btn &nextBtn);
-// Computes page geometry for a paged list/grid screen: how many rows of
-// height rowH (+gap between rows) fit between y0 and the pager -- which
-// itself sits pagerGap below the last row slot, with bottomMargin reserved
-// below IT (status bar, plus any fixed-height controls stacked under the
-// pager -- pass just the status bar margin if there are none). Capped to
-// hardCap rows (an array-sizing safety net, not usually the binding
-// constraint). `cols` multiplies rows into items-per-page for a grid (pass
-// 1 for a plain list). The row capacity itself is NOT clamped to `count` --
-// only the returned itemsPerPage/pages are -- so the pager sits in the same
-// place across pages and on a short list instead of creeping toward the
-// content. Returns rowsPerPage (the row capacity), for a caller that needs
-// it separately from itemsPerPage (e.g. to size cells to fill the available
-// height). Every paged list/grid screen in the app should call this instead
-// of hand-rolling this math -- see uiDropdownPick() below for the shape of
-// a caller: page = clamp(...) once up front, then each redraw does
-// base = page*itemsPerPage; n = min(itemsPerPage, count-base); and slices
-// items [base, base+n) onto the page.
+// Calculate page geometry for a list or grid.
+// Count rows that fit between y0 and the pager.
+// Reserve space for the pager and bottom margin.
+// Cap the row count to hardCap.
+// Multiply rows by cols for grid layouts.
+// Do not clamp row capacity to the item count.
+// This keeps the pager position stable.
+// Return the number of rows per page.
 int uiPagerLayout(int y0, int rowH, int gap, int bottomMargin, int pagerGap,
                   int count, int hardCap, int cols,
                   int &itemsPerPage, int &pages, int &pagerY);
-// Pull-down-menu picker: opens a full list of `count` text options
-// (itemLabel(i) supplies each one) below the top bar, paged if it doesn't
-// fit; tapping a row selects it and returns immediately (no separate
-// Apply step -- that's the caller's business if it wants one). Back
-// cancels and returns `current` unchanged. Services the clock/battery
-// corner itself each frame (see uiServiceChrome()) so it's safe to call
-// from any screen without that corner going dark for as long as the list
-// is open. For a plain text list -- something that wants to preview a
-// COLOR per row (a swatch) needs its own picker; see
-// system_screen.cpp's Accent Color picker for that shape.
+// Open a pull-down menu picker.
+// Display a list of text options.
+// Page the list if it does not fit.
+// Return immediately when a row is tapped.
+// Pressing Back cancels the selection.
+// This function updates the clock and battery.
+// Use a custom picker for color swatches.
 int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), int current);
-void uiToast(const char *msg);   // one-line status text at the bottom of the screen (leaves
-                                 // room on the right for uiDrawClock(), see below) -- character-
-                                 // steps a ticker (see uiServiceChrome()) if it's too long to fit
-// Stops the ticker and blanks the toast area. MUST be called on every
-// screen exit -- see exitScreen() in the .ino, the one place this is
-// wired in -- or a message from a screen you've left keeps redrawing
-// itself indefinitely (uiTickToast() runs off the main loop(), not tied
-// to any particular screen).
+void uiToast(const char *msg);   // Show a one-line status message.
+                                 // Place the text at the bottom of the screen.
+                                 // Leave space for the clock on the right.
+                                 // Scroll the text if it exceeds the width.
+// Clear the toast message.
+// Call this function on every screen exit.
+// This prevents old messages from redrawing.
 void uiClearToast();
-// Full-screen modal numeric keypad -- a stripped-down cousin of
-// uiTextInput() (keyboard.cpp) with no letters/layers: a 3x4 grid of big
-// digit keys plus '.', backspace, Cancel and OK, sized for fat-finger taps
-// on the resistive panel. For IP-address / port entry (Net stats > LAN
-// speed). Returns the typed string, or `initial` unchanged on Cancel / a
-// tap in the top-left back-button area -- same cancel contract as
-// uiTextInput(). Validation is loose (one '.' max, 20 chars); the caller
-// validates the actual value.
+// Open a full-screen numeric keypad.
+// Display a 3x4 grid of digit keys.
+// Use this for IP addresses and port numbers.
+// Return the typed string or the initial value.
+// Perform strict validation in the caller.
 String uiNumpadInput(const char *prompt, const String &initial = "");
-// Small bottom-right clock, drawn on every screen from the main loop
-// (independent of whatever screen is active). Shows "HH:MM" local time
-// (devtime.h's UTC clock shifted by the tz.h offset) once devtime.h has a
-// synced clock; shows "--:--" (dimmed) before that -- no separate
-// "unsynced" indicator, the dashes ARE the indicator.
+// Draw the clock in the bottom-right corner.
+// Update this clock from the main loop.
+// Show local time when the clock syncs.
+// Show dimmed dashes before synchronization.
 void uiDrawClock();
-// Clears the content area (below the top bar) and shows a one-line yellow
-// status message. Call this before any blocking radio/SD init or scan a
-// screen's Enter() does, so there's visible feedback instead of a stale or
-// blank screen during the wait.
+// Clear the content area and show a loading message.
+// Call this before blocking operations.
+// This provides visible feedback during waits.
 void uiShowLoading(const char *msg);
-// Draws `text` (default font) rotated in 90-degree steps (0-3, clockwise),
-// centered on (cx, cy). Used for the rotation-picker submenu so each
-// button's label previews the orientation it would apply. Renders to a
-// small offscreen GFXcanvas1 first, then blits it rotated pixel-by-pixel --
-// Adafruit_GFX has no built-in rotated text, and we only need the four
-// cardinal angles, not arbitrary rotation.
+// Draw rotated text at a center point.
+// Rotate text in 90-degree steps.
+// Render to an offscreen canvas first.
+// This avoids the library's lack of rotation support.
 void uiDrawRotatedText(int cx, int cy, const char *text, uint8_t rotSteps, uint8_t textSize, uint16_t color);
 
-// Draws the RSSI-number + signal-bar readout shared by every locate /
-// direction-finding sub-screen (WiFi Scan's and BLE Scan's "Track" mode,
-// Camera Detect, Tracker Detect, ...): a big dBm number above a bar
-// colored green/yellow/red by signal strength. `(x,y,w)` is the top-left
-// and width of the block; the bar is drawn directly below the number at a
-// fixed internal layout. A dimmed "-- lost" replaces the number when
-// `rssi <= -127` (no current reading) -- a caller that always has a real
-// reading (a continuous scan, never a BSSID-presence check) simply never
-// passes that sentinel, so the lost state never triggers. `rssiMin`/
-// `rssiMax` set the bar's 0%/100% points (narrower for a close-range
-// sniff tool, wider for an open WiFi/BLE RSSI scale); the green/yellow/
-// red split is the top/middle/bottom third of that same range, which is
-// within a couple dB of what every one of this pattern's hand-rolled
-// copies already used as fixed thresholds. Erases via uiClearRect() (so
-// the Vice gradient/scene background shows through, not a flat black
-// box -- the bug every one of those copies had) and only when `rssi`
-// differs from `*prevRssi`, a caller-owned static reset to an
-// out-of-range sentinel (e.g. -999) on entering the locate screen to
-// force one draw -- the flicker-free pattern, see uiDrawFieldIfChanged().
-// Returns true iff it redrew (a caller with its own secondary drawing
-// tied to the reading, if any, can gate on that).
+// Draw the RSSI value and signal bar.
+// Show a dimmed message when the signal is lost.
+// Set the bar range with rssiMin and rssiMax.
+// Color the bar green, yellow, or red.
+// Erase the area only when the value changes.
+// Return true if the screen updated.
 bool uiDrawLocateReading(int x, int y, int w, uint16_t presentColor,
                          int rssiMin, int rssiMax, int *prevRssi, int rssi);
 
-// Shared 3-tier severity convention (OK/WATCH/ALERT) for anomaly-detector
-// screens -- wifi_ids_screen.cpp and ble_spam_detect.cpp each had their own
-// identical copy of this; factored here so a third/fourth consumer doesn't
-// add a third/fourth copy. Values match what both files already used
-// locally (SEV_OK=0/SEV_WATCH=1/SEV_ALERT=2 or SV_OK/SV_WATCH/SV_ALERT) --
-// a file's own local enum can keep its own names as long as the numeric
-// values line up, no call-site renames required beyond the color/tag calls.
+// Define severity levels for anomaly screens.
+// Use these values for color and tag functions.
+// Local enums may use different names.
+// Match the numeric values exactly.
 enum { UI_SEV_OK = 0, UI_SEV_WATCH = 1, UI_SEV_ALERT = 2 };
-uint16_t uiSevColor(uint8_t sev);     // ILI9341_GREEN/YELLOW/RED
-const char *uiSevTag(uint8_t sev);    // "ok"/"watch"/"ALERT"
+uint16_t uiSevColor(uint8_t sev);     // Return the color for a severity level.
+const char *uiSevTag(uint8_t sev);    // Return the tag string for a severity level.
 
-void ledSet(bool on);      // red channel
-void ledGreen(bool on);    // green channel (wardrive new-contact blip, etc.)
-// Blue "working" heartbeat (50ms on / 25ms off) for the duration of a
-// scan / speed test / other job. Independent of the red armed blinker.
-// ledBusy() = explicit job callers; ledBusyScreen() = loop()'s per-frame
-// "on a scanning screen" signal (OR'd). ledBusyAlt() alternates the
-// flash blue/green (Skimmer).
+void ledSet(bool on);      // Control the red LED channel.
+void ledGreen(bool on);    // Control the green LED channel.
+void ledGreenPwm(uint8_t brightness);   // Set green LED brightness with PWM.
+// All three LED channels render in one background task.
+// This prevents independent timers from fighting.
+// Alert has the highest priority.
+// Busy has the middle priority.
+// Heartbeat has the lowest priority.
+void ledColorRGB(uint8_t r, uint8_t g, uint8_t b);     // Write directly to all three channels.
+void ledColorAccent(float intensity);                  // Apply accent color with intensity.
+// Show a working heartbeat during active jobs.
+// Use ledBusy() for explicit jobs.
+// Use ledBusyScreen() for scanning screens.
 void ledBusy(bool on);
 void ledBusyScreen(bool on);
-void ledBusyAlt(bool on);
-// 3 fast chirps + green blinks -- fire once when a detector picks up a new
-// target (Flock / Skimmer). Blocking (~0.25s).
+// Show an ambient heartbeat while idle.
+// Use plain red instead of the accent color.
+// Feed the on/off state to the shared render task.
+void ledHeartbeat(bool on);
+// Show an alert with alternating red and yellow.
+// This overrides busy and heartbeat while active.
+void ledAlert(bool on);
+// Show a solid accent color while a 2FA bond connects.
+void ledConnected(bool on);
+// Pause the shared render task entirely.
+// Use this for direct LED animations.
+// Always pair true with a later false.
+void ledSuspendRender(bool suspend);
+// Play three fast chirps and green blinks.
+// Fire this when a detector finds a new target.
 void alertDetected();
-// Volume scales the LEDC duty cycle (this hardware has no separate analog
-// volume control, just a PWM square wave into the amp). 0 = silent -- beep()
-// still blocks for `ms` at volume 0 so callers that rely on it for timing
-// (e.g. the WiFi locate screen's beep-rate-as-signal-strength) keep working.
-int uiGetBeepVolume();        // 0-100
-void uiSetBeepVolume(int v);  // persists to NVS
+// Volume scales the LEDC duty cycle.
+// Zero volume produces silence.
+// beep() still blocks for the requested duration.
+int uiGetBeepVolume();        // Return volume from 0 to 100.
+void uiSetBeepVolume(int v);  // Persist volume to NVS.
 void beep(uint32_t ms, uint32_t toneHz);
-// Keep the amp + DAC powered across many back-to-back beeps (e.g. the
-// range-finder chirps). Without this, every short chirp restarts from the
-// amp's ~20ms unmute ramp and is mostly inaudible. Call beepHold(true) on
-// entering a screen that chirps repeatedly, beepHold(false) on leaving.
+// Keep the amplifier powered between short beeps.
+// This prevents the unmute ramp from cutting the sound.
+// Call beepHold(true) before repeated chirps.
+// Call beepHold(false) after the chirps finish.
 void beepHold(bool on);
-// The shared GPIO26 DAC channel (22050 Hz) -- also used by the easter egg's
-// MOD player so it never has to allocate/free its own. May be null if the
-// DAC driver failed to init.
+// Return the shared DAC channel handle.
+// This channel also serves the MOD player.
+// Return null if the driver failed to initialize.
 dac_continuous_handle_t uiDac();
 int uiDacRate();
-// Tear down and recreate the shared DAC channel. Call after something that
-// drives the DAC from its own task (the splash MOD player) exits -- a DMA
-// underrun there can leave the channel wedged so later beeps are silent.
+// Reinitialize the shared DAC channel.
+// Call this after the MOD player exits.
+// This clears DMA underruns that silence beeps.
 void uiAudioReset();
-// Range-finder chirp: beep RATE and PITCH both scale with `rssi` as a
-// closeness proxy (far = slow + low, close = fast + high, accelerating
-// hard near the target). Self-rate-limited by an internal timer -- call it
-// every loop iteration while a target is in range and it no-ops between
-// chirps. Honors the beep-volume setting; a wrapper around beep().
+// Play a range-finder chirp.
+// Scale rate and pitch with rssi.
+// This function limits its own call rate.
 void rangeBeep(int rssi);
 
-// Onboard LiPo, read from GPIO34 through the CYD's ~2:1 divider (calibrated
-// ADC, 16-sample average), then scaled by the user cal factor. No
-// charge-status line is broken out to a GPIO on this board -- only voltage.
+// Read LiPo voltage from GPIO34.
+// Apply the calibrated ADC factor.
 int uiBatteryMv();
-// Rough 1S state-of-charge from resting voltage; -1 = no cell (>4.3V charger
-// rail, or <2.8V). Sags low under a heavy scan.
+// Estimate state of charge from resting voltage.
+// Return -1 if the cell is missing or overcharged.
 int uiBatteryPct();
 
 // --- battery calibration (System > Hardware > Battery calibrate) ---
-// The board's actual resistor divider + the eFuse ADC cal vary unit to
-// unit, so uiBatteryMv() = raw * factor. Factor persists in NVS ("batcal").
-void  uiBatteryCalLoad();            // call once from uiInit()
-int   uiBatteryRawMv();              // before the cal factor
-float uiBatteryCal();               // current factor (default 1.0)
-void  uiBatterySetCal(float k);     // clamped 0.5..2.0, persisted
-void  uiBatterySetCalFromActual(int actualMv);   // factor = actualMv / rawMv
-// Battery glyph + % in the bottom-right corner (left of it: the clock,
-// uiDrawClock()). Call every loop() iteration (self-throttled); pulses
-// colours when below 15%. uiDrawTopBar() forces a repaint on a screen
-// change.
+// Apply the calibration factor to raw voltage.
+// Store the factor in NVS.
+void  uiBatteryCalLoad();            // Load calibration from NVS.
+int   uiBatteryRawMv();              // Return voltage before calibration.
+float uiBatteryCal();               // Return the current calibration factor.
+void  uiBatterySetCal(float k);     // Set and persist the calibration factor.
+void  uiBatterySetCalFromActual(int actualMv);   // Calculate factor from actual voltage.
+// Draw the battery glyph and percentage.
+// Update this indicator every loop iteration.
+// Pulse colors when the charge drops below 15%.
 void uiDrawBatteryIndicator();
-// The clock, the battery glyph, and the toast ticker's next scroll step
-// (see uiToast()) -- one call. main loop() calls this every iteration
-// (see the .ino); any OTHER blocking touch-poll loop (a settings
-// sub-page, a modal wait) needs to call this itself once per iteration,
-// or all three just go dark/stop scrolling for as long as that loop owns
-// the CPU -- they're normally only alive because loop() keeps running.
+// Update the clock, battery, and toast ticker.
+// Call this function every loop iteration.
+// Other blocking loops must call this function too.
 void uiServiceChrome();

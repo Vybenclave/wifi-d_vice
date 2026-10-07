@@ -1,12 +1,3 @@
-// GPS-tagged WiFi wardriving logger. The GPS fix comes from the shared
-// background reader (gps_shared.h) now -- it's been running since boot for
-// the GPS time sync, so this screen just reads its live TinyGPSPlus state
-// instead of opening a second reader on the same UART. Logs to SD (see
-// sd_bus.h).
-//
-// The SD log format (plaintext engagement header, encrypted= marker, then
-// encrypt-when-armed rows) is shared with the other scan screens and lives
-// in wlog.{cpp,h} now -- this screen just formats rows and hands them over.
 #include <SD.h>
 #include <WiFi.h>
 #include "ui.h"
@@ -23,10 +14,9 @@ static uint32_t lastTick = 0;
 static uint32_t rowsLogged = 0;
 static double   lastLat = 0, lastLon = 0;   // last good fix, cached for no/stale-fix logging
 static uint32_t lastFixMs = 0;              // 0 = never had a fix this session
-static Btn toggleBtn;   // positioned in gpsEnter(), once tft is sized/rotated
-
-// Session set of BSSIDs already logged, so the green LED blips only on a
-// genuinely new contact. Fixed cap -- oldest entries just stop deduping.
+static Btn toggleBtn;
+static bool scanPending = false;
+// Track logged BSSIDs. The green LED blips only on new contacts.
 static uint64_t seenBssid[256];
 static int      seenN = 0;
 static uint32_t greenOffAt = 0;
@@ -44,19 +34,13 @@ static void resetGpsFields();   // defined below
 
 void gpsEnter() {
   uiDrawTopBar("Wardrive");
-  // GPS UART is opened once at boot by gpsSharedBegin() (it's also the GPS
-  // time-sync source now, so it has to run whether or not this screen is
-  // ever visited) -- nothing to open here.
-  // SD check first: uiShowLoading() clears the content area (incl. the
-  // action row), so drawing the button before this wiped it on the first
-  // visit and nothing redrew it. Do the check, THEN the button, THEN draw().
+  // uiShowLoading() clears the content area. Draw the button after the check to prevent erasure.
   if (!sdOk) {
     uiShowLoading("Checking SD card...");
     sdBusBegin();
     sdOk = SD.begin(SD_CS, sdSPI);
   }
-  // Per the UI rule (see ui.h): the top-bar row is back+title only; a
-  // per-screen button goes in the action row below it.
+  // The top bar shows only the back button and title. Place screen buttons in the action row below.
   Btn row[1] = {{0, 0, 0, 0, "start / stop logging"}};
   uiDrawActionRow(row, 1);
   toggleBtn = row[0];
@@ -66,15 +50,14 @@ void gpsEnter() {
   rowsLogged = 0;
   seenN = 0;
   greenOffAt = 0;
+  scanPending = false;
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   lastTick = millis();
   draw();
 }
 
-// "What's currently drawn" per field -- see uiDrawFieldIfChanged() in ui.h.
-// Each line below only erases + reprints when its own text actually
-// changes, instead of the whole block clearing and reprinting every tick.
+// Update only changed fields. This avoids clearing and reprinting the whole block every tick.
 static char prevFix[40] = "", prevLatLon[48] = "", prevSd[24] = "", prevEng[48] = "",
             prevLogging[24] = "", prevRows[48] = "", prevFail[64] = "";
 static const int GPS_FIELD_H = 14;
@@ -129,31 +112,16 @@ static void draw() {
   }
 }
 
-// gpsGetLastFix() itself now lives in gps_shared.cpp -- it reads the same
-// background parser this screen does, so there's no reason to keep a
-// second copy here.
-
 void gpsLoop() {
-  // Byte draining + NMEA decode happens in gpsSharedLoop() (called from the
-  // main loop() regardless of the active screen); this just reads the
-  // result.
+  // gpsSharedLoop() handles byte draining and NMEA decoding. This function only reads the result.
   if (greenOffAt && millis() >= greenOffAt) { ledGreen(false); greenOffAt = 0; }
 
-  uint32_t interval = logging ? 5000 : 1000;
-  if (millis() - lastTick < interval) return;
-  lastTick = millis();
-
-  // Cache the last good fix. A "static location" capture only needs one
-  // fix (or none) -- keep logging AP data regardless, with a fix column
-  // that's blank when we've never had one and flagged stale when it's old.
-  if (gpsShared().location.isValid()) {
-    lastLat = gpsShared().location.lat();
-    lastLon = gpsShared().location.lng();
-    lastFixMs = millis();
-  }
-
-  if (logging) {
-    int n = WiFi.scanNetworks(false, true);
+  // Poll the pending async scan every tick. scanComplete() reports status without blocking touch input.
+  if (scanPending) {
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return;   // not done yet -- check again next tick
+    if (n < 0) n = 0;                     // WIFI_SCAN_FAILED or similar
+    scanPending = false;
     bool sawNew = false;
     bool haveFix   = lastFixMs != 0;
     bool freshFix  = haveFix && (millis() - lastFixMs < 15000);
@@ -173,6 +141,26 @@ void gpsLoop() {
     if (sawNew) { ledGreen(true); greenOffAt = millis() + 60; }   // blip on a new contact
     wlogFlush();   // once per scan batch, not per row
     WiFi.scanDelete();
+    lastTick = millis();   // pace the NEXT scan from completion, not from when this one started
+    draw();
+    return;
+  }
+
+  uint32_t interval = logging ? 5000 : 1000;
+  if (millis() - lastTick < interval) return;
+  lastTick = millis();
+
+  // Cache the last valid fix. Log access point data regardless of fix status. Mark the fix column blank or stale.
+  if (gpsShared().location.isValid()) {
+    lastLat = gpsShared().location.lat();
+    lastLon = gpsShared().location.lng();
+    lastFixMs = millis();
+  }
+
+  if (logging) {
+    WiFi.scanNetworks(true, true);   // async -- picked up above once scanComplete() says it's done
+    scanPending = true;
+    return;
   }
   draw();
 }

@@ -3,29 +3,40 @@
 #include "sd_bus.h"
 #include "pins.h"
 #include "crypto.h"
+#include "devtime.h"
+#include "wlog.h"
+#include "gps_shared.h"
 
 static const char *PTR_DIR   = "/eng";
 static const char *PTR_FILE  = "/eng/active.txt";
-static const char *LEGACY_ST = "/eng/state.txt";     // pre-per-client global engagement
+static const char *JOB_PTR_FILE = "/eng/job_active.txt";
+static const char *LEGACY_ST = "/eng/state.txt";
 static const char *LEGACY_WD = "/eng/wifi.dat";
 static const char *VERIFY_PT  = "VYBEN-ENG-UNLOCK-v1";
-static const char  SEP        = '\x1f';   // ssid/pass delimiter inside a record blob
+static const char  SEP        = '\x1f';   // This character separates the ssid and pass fields.
 
 static bool   s_sd = false;
 static String s_client;                   // active client folder name ("" = none)
 static bool   s_started = false;
 static String s_tester, s_armedAt, s_verifierHex;
-static String s_salt;                     // KDF salt + verifier AAD, stored verbatim.
-                                          // New clients: the client name. Migrated
-                                          // pre-per-client cards: "client|tester".
-                                          // Kept out of `tester` so that field is
-                                          // free metadata and can't break decryption.
-static long   s_iters = 100000;           // KDF rounds for THIS client (old cards: 100k)
+static String s_salt;                     // The system stores the KDF salt and verifier AAD verbatim.
+                                          // New clients use the client name.
+                                          // Migrated cards use the format client pipe tester.
+                                          // The code keeps this value separate from the tester field.
+                                          // This keeps the tester field free.
+                                          // It also prevents decryption errors.
+static long   s_iters = 100000;           // This value sets the KDF rounds for the current client.
+
+// ---- job state (one bounded run, see engStoreJobStart()) ----
+static bool   s_jobOpen = false;
+static String s_jobPath;        // full path to the open job_NNN.txt
+static int    s_jobId = -1;
+static String s_jobStartedAt;
 
 // ---- path helpers ----
-// FAT32-safe: the client folder name is an operator-typed field, not a fixed
-// set of values. Matches wlog.cpp's sanitizeForPath so the folder wlog logs
-// into is the same one this store uses.
+// The client folder name comes from operator input.
+// The code matches the path sanitizer in wlog.cpp.
+// This ensures both modules use the same folder.
 static String sanitizeName(const String &s) {
   String out;
   for (size_t i = 0; i < s.length(); i++) {
@@ -65,7 +76,7 @@ static size_t fromHex(const String &s, uint8_t *out, size_t outCap) {
   return n;
 }
 
-// ---- recursive delete (mirrors system_screen.cpp's wipeDir) ----
+// ---- recursive delete ----
 static void wipeTree(const String &path) {
   File dir = SD.open(path);
   if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
@@ -98,12 +109,12 @@ static void loadClientState() {
     int eq = line.indexOf('=');
     if (eq < 0) continue;
     String k = line.substring(0, eq), v = line.substring(eq + 1);
-    if      (k == "started")  s_started = (v == "1");
-    else if (k == "tester")   s_tester = v;
-    else if (k == "armed_at") s_armedAt = v;
-    else if (k == "verifier") s_verifierHex = v;
-    else if (k == "salt")     s_salt = v;
-    else if (k == "iters")    s_iters = v.toInt();
+    if      (k == "started")   s_started = (v == "1");
+    else if (k == "tester")    s_tester = v;
+    else if (k == "armed_at")  s_armedAt = v;
+    else if (k == "verifier")  s_verifierHex = v;
+    else if (k == "salt")      s_salt = v;
+    else if (k == "iters")     s_iters = v.toInt();
   }
   f.close();
 }
@@ -144,7 +155,7 @@ static void clearActivePtr() {
   if (s_sd && SD.exists(PTR_FILE)) SD.remove(PTR_FILE);
 }
 
-// ---- one-time migration of a pre-per-client global engagement ----
+// ---- legacy migration ----
 static void migrateLegacy() {
   File f = SD.open(LEGACY_ST, FILE_READ);
   if (!f) return;
@@ -182,6 +193,12 @@ static void migrateLegacy() {
   SD.remove(LEGACY_ST);
 }
 
+// The compiler requires this forward declaration.
+// The function appears later in this file.
+// The code keeps it file-local.
+// It does not appear in the header file.
+static void recoverOrphanedJob();
+
 void engStoreBegin() {
   sdBusBegin();
   s_sd = SD.begin(SD_CS, sdSPI);
@@ -192,6 +209,7 @@ void engStoreBegin() {
   s_client = readActivePtr();
   if (s_client.length() == 0 && SD.exists(LEGACY_ST)) migrateLegacy();
   loadClientState();
+  recoverOrphanedJob();
 }
 
 bool   engStoreAvailable()      { return s_sd; }
@@ -199,9 +217,9 @@ String engStoreCurrentClient()  { return s_client; }
 String engStoreClient()         { return s_client; }
 String engStoreTester()         { return s_tester; }
 String engStoreArmedAt()        { return s_armedAt; }
-// Until a verifier is committed (first ARM) nothing is locked to a count yet,
-// so report the count the first ARM will use -- keeps the key a not-yet-armed
-// client is unlocked with identical to the one its verifier gets built under.
+// The system has not locked a key count yet.
+// The function returns the count for the first ARM.
+// This keeps the unlock key identical to the verifier key.
 long   engStoreIters()          { return s_verifierHex.length() ? s_iters : (long)CRYPTO_KDF_ITERS; }
 String engStoreSalt()           { return s_salt.length() ? s_salt : s_client; }
 bool   engStoreStarted()        { return s_sd && s_client.length() && s_started; }
@@ -230,6 +248,24 @@ int engStoreListClients(String *out, int maxN) {
 bool engStoreClientExists(const String &name) {
   String s = sanitizeName(name);
   return s_sd && s.length() && SD.exists("/" + s);
+}
+
+bool engStorePeekClient(const String &name, bool &started) {
+  String s = sanitizeName(name);
+  started = false;
+  if (!s_sd || s.length() == 0) return false;
+  File f = SD.open("/" + s + "/eng.txt", FILE_READ);
+  if (!f) return false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    int eq = line.indexOf('=');
+    if (eq < 0) continue;
+    String k = line.substring(0, eq), v = line.substring(eq + 1);
+    if (k == "started") started = (v == "1");
+  }
+  f.close();
+  return true;
 }
 
 void engStoreSelectClient(const String &name) {
@@ -296,6 +332,11 @@ void engStoreDeleteClient(const String &name) {
   wipeTree(dir);
   SD.rmdir(dir);
   if (s == s_client) {
+    // Any open job's backing file is gone with the folder -- just forget
+    // it in RAM, nothing left to write.
+    s_jobOpen = false;
+    s_jobId = -1;
+    s_jobPath = s_jobStartedAt = "";
     s_client = "";
     clearActivePtr();
     loadClientState();   // zeroes the RAM copy
@@ -304,7 +345,10 @@ void engStoreDeleteClient(const String &name) {
 
 void engStoreClear() {
   // The full-card wipe already removed every folder; just drop the pointer
-  // and the RAM state.
+  // and the RAM state. Any open job's backing file is gone too.
+  s_jobOpen = false;
+  s_jobId = -1;
+  s_jobPath = s_jobStartedAt = "";
   if (s_sd && SD.exists(PTR_FILE)) SD.remove(PTR_FILE);
   s_client = "";
   loadClientState();
@@ -407,5 +451,378 @@ int engStoreWifiCount() {
     if (line.length()) n++;
   }
   f.close();
+  return n;
+}
+
+// ---- findings register ----
+// The file uses the same hex-blob format as the wifi file.
+// The code uses a fixed AAD string to separate domains.
+// Each blob contains thirteen fields.
+// The code truncates text fields to one hundred sixty characters.
+// It also strips embedded newlines.
+// This prevents row splitting during reads.
+static const char *FINDINGS_AAD = "find";
+static const size_t FINDING_BUF = 768;   // comfortably covers 13 fields incl. two 160-char free-text ones + GCM overhead
+
+static String findingsPath() { return clientDir() + "/findings.csv"; }
+
+static String sanitizeFindingText(const String &s, size_t maxLen) {
+  String out = s.substring(0, maxLen);
+  out.replace("\n", " ");
+  out.replace("\r", " ");
+  return out;
+}
+
+static String encodeFinding(const Finding &fd) {
+  String blob = String(fd.id) + SEP + fd.openedAt + SEP + fd.jobId + SEP +
+                fd.controlRef + SEP + fd.source + SEP + String(fd.severity) + SEP +
+                fd.description + SEP + fd.status + SEP + fd.owner + SEP + fd.targetDate + SEP +
+                fd.closedAt + SEP + fd.location + SEP + fd.notes;
+  if (cryptoHasKey()) {
+    uint8_t out[FINDING_BUF];
+    size_t n = 0;
+    if (blob.length() + 28 <= sizeof(out) &&
+        cryptoEncryptRecord((const uint8_t *)blob.c_str(), blob.length(),
+                            (const uint8_t *)FINDINGS_AAD, 4, out, sizeof(out), &n)) {
+      return "E " + toHex(out, n);
+    }
+  }
+  return "P " + toHex((const uint8_t *)blob.c_str(), blob.length());
+}
+
+// The parser splits the blob into thirteen fields.
+// The notes field takes the remainder.
+// This prevents desync if the notes contain the separator.
+// The keyboard cannot type the separator character.
+static bool decodeFinding(const String &line, Finding &fd) {
+  if (line.length() < 3 || line[1] != ' ') return false;
+  char kind = line[0];
+  String hex = line.substring(2);
+  uint8_t raw[FINDING_BUF];
+  size_t rawN = fromHex(hex, raw, sizeof(raw));
+  if (rawN == 0) return false;
+
+  uint8_t blob[FINDING_BUF];
+  size_t blobN = 0;
+  if (kind == 'P') {
+    memcpy(blob, raw, rawN);
+    blobN = rawN;
+  } else if (kind == 'E') {
+    if (!cryptoDecryptRecord(raw, rawN, (const uint8_t *)FINDINGS_AAD, 4, blob, sizeof(blob), &blobN)) return false;
+  } else {
+    return false;
+  }
+
+  String s;
+  s.reserve(blobN);
+  for (size_t i = 0; i < blobN; i++) s += (char)blob[i];
+
+  String parts[13];
+  int idx = 0, start = 0;
+  for (int i = 0; i < (int)s.length() && idx < 12; i++) {
+    if (s[i] == SEP) { parts[idx++] = s.substring(start, i); start = i + 1; }
+  }
+  if (idx != 12) return false;      // malformed -- didn't find all 12 separators
+  parts[idx] = s.substring(start);  // 13th field (notes) is the remainder
+
+  fd.id         = parts[0].toInt();
+  fd.openedAt   = parts[1];
+  fd.jobId      = parts[2];
+  fd.controlRef = parts[3];
+  fd.source     = parts[4];
+  fd.severity   = (uint8_t)parts[5].toInt();
+  fd.description = parts[6];
+  fd.status     = parts[7];
+  fd.owner      = parts[8];
+  fd.targetDate = parts[9];
+  fd.closedAt   = parts[10];
+  fd.location   = parts[11];
+  fd.notes      = parts[12];
+  return true;
+}
+
+int engStoreFindingOpen(const String &jobId, const String &controlRef,
+                        const String &source, uint8_t severity,
+                        const String &description, const String &location) {
+  if (!s_sd || s_client.length() == 0) return -1;
+  if (!SD.exists(clientDir())) SD.mkdir(clientDir());
+
+  // The code uses a separate counter file.
+  // Scanning the main file would require decryption.
+  // Decryption fails if the current key differs from older keys.
+  // This counter file works in all cases.
+  String seqPath = clientDir() + "/findings_seq.txt";
+  int id = 0;
+  File sf = SD.open(seqPath, FILE_READ);
+  if (sf) { id = sf.parseInt(); sf.close(); }
+  File sw = SD.open(seqPath, FILE_WRITE);   // truncates
+  if (sw) { sw.print(id + 1); sw.close(); }
+
+  Finding fd;
+  fd.id = id;
+  fd.openedAt   = devTimeNowString();
+  fd.jobId      = jobId;
+  fd.controlRef = controlRef;
+  fd.source     = sanitizeFindingText(source, 40);
+  fd.severity   = severity;
+  fd.description = sanitizeFindingText(description, 160);
+  fd.status     = "open";
+  fd.owner      = s_tester;   // default to the current tester; engStoreFindingUpdate() can change it
+  fd.targetDate = "";
+  fd.closedAt   = "";
+  // The function uses the caller coordinate if available.
+  // It falls back to the shared GPS reader otherwise.
+  // The field stays empty if neither source has a fix.
+  fd.location = location;
+  if (fd.location.length() == 0 && gpsShared().location.isValid()) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%.6f,%.6f", gpsShared().location.lat(), gpsShared().location.lng());
+    fd.location = buf;
+  }
+  fd.notes      = "";
+
+  File f = SD.open(findingsPath(), FILE_APPEND);
+  if (!f) f = SD.open(findingsPath(), FILE_WRITE);   // The SD library may not create a file with FILE_APPEND.
+                                                         // The code falls back to FILE_WRITE to create it.
+  if (!f) return -1;
+  f.println(encodeFinding(fd));
+  f.close();
+  return fd.id;
+}
+
+bool engStoreFindingUpdate(int id, const String &status, const String &owner,
+                           const String &targetDate, const String &notes) {
+  if (!s_sd || s_client.length() == 0) return false;
+  String path = findingsPath();
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+
+  String rewritten;
+  bool found = false;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    Finding fd;
+    if (!found && decodeFinding(line, fd) && fd.id == id) {
+      found = true;
+      if (status.length()) {
+        fd.status = status;
+        if (status == "closed" && fd.closedAt.length() == 0) fd.closedAt = devTimeNowString();
+      }
+      if (owner.length())      fd.owner = sanitizeFindingText(owner, 40);
+      if (targetDate.length()) fd.targetDate = targetDate;
+      if (notes.length())      fd.notes = sanitizeFindingText(notes, 160);
+      rewritten += encodeFinding(fd) + "\n";
+    } else {
+      rewritten += line + "\n";   // The code passes through unmatched lines verbatim.
+                                   // This prevents data loss for undecodable rows.
+    }
+  }
+  f.close();
+  if (!found) return false;
+
+  File w = SD.open(path, FILE_WRITE);   // truncates
+  if (!w) return false;
+  w.print(rewritten);
+  w.close();
+  return true;
+}
+
+bool engStoreFindingClose(int id, const String &notes) {
+  return engStoreFindingUpdate(id, "closed", "", "", notes);
+}
+
+int engStoreFindingsList(Finding *out, int maxN) {
+  if (!s_sd || s_client.length() == 0 || maxN <= 0) return 0;
+  File f = SD.open(findingsPath(), FILE_READ);
+  if (!f) return 0;
+  int n = 0;
+  while (f.available() && n < maxN) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (decodeFinding(line, out[n])) n++;
+  }
+  f.close();
+  return n;
+}
+
+int engStoreFindingsOpenCount() {
+  if (!s_sd || s_client.length() == 0) return 0;
+  File f = SD.open(findingsPath(), FILE_READ);
+  if (!f) return 0;
+  int n = 0;
+  Finding fd;   // reused per line -- no need for a whole array just to count
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (decodeFinding(line, fd) && fd.status != "closed") n++;
+  }
+  f.close();
+  return n;
+}
+
+int engStoreFindingsCountForJob(const String &jobId) {
+  if (!s_sd || s_client.length() == 0) return 0;
+  File f = SD.open(findingsPath(), FILE_READ);
+  if (!f) return 0;
+  int n = 0;
+  Finding fd;   // reused per line -- same as engStoreFindingsOpenCount()
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    if (decodeFinding(line, fd) && fd.jobId == jobId) n++;
+  }
+  f.close();
+  return n;
+}
+
+// ---- jobs ----------------------------------------------------------
+int engStoreJobStart() {
+  if (!s_sd || s_client.length() == 0) return -1;
+  if (s_jobOpen) engStoreJobEnd("");   // The code closes any open job before starting a new one.
+                                       // This prevents resource leaks.
+
+  String dir = clientDir() + "/" + devDateString();
+  if (!SD.exists(clientDir())) SD.mkdir(clientDir());
+  if (!SD.exists(dir)) SD.mkdir(dir);
+
+  char path[96];
+  int n = 0;
+  do {
+    snprintf(path, sizeof(path), "%s/job_%03d.txt", dir.c_str(), n++);
+  } while (SD.exists(path) && n < 1000);
+
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) return -1;
+
+  s_jobId = n - 1;
+  s_jobPath = path;
+  s_jobStartedAt = devTimeNowString();
+
+  f.printf("job_id=%d\n", s_jobId);
+  f.printf("started_at=%s\n", s_jobStartedAt.c_str());
+  f.printf("status=active\n");
+  f.close();
+
+  s_jobOpen = true;
+
+  File ptr = SD.open(JOB_PTR_FILE, FILE_WRITE);
+  if (ptr) { ptr.println(s_jobPath); ptr.close(); }
+
+  return s_jobId;
+}
+
+void engStoreJobEnd(const String &summary) {
+  if (!s_sd || !s_jobOpen) return;
+  // FILE_WRITE truncates on this core (same as writeClientState()) --
+  // rewrite every field fresh from RAM rather than trying to append/edit
+  // in place.
+  File f = SD.open(s_jobPath, FILE_WRITE);
+  if (f) {
+    f.printf("job_id=%d\n", s_jobId);
+    f.printf("started_at=%s\n", s_jobStartedAt.c_str());
+    f.printf("ended_at=%s\n", devTimeNowString().c_str());
+    f.printf("status=completed\n");
+    f.printf("summary=%s\n", summary.c_str());
+    f.close();
+  }
+  s_jobOpen = false;
+  s_jobId = -1;
+  s_jobPath = "";
+  s_jobStartedAt = "";
+
+  if (s_sd && SD.exists(JOB_PTR_FILE)) SD.remove(JOB_PTR_FILE);
+}
+
+bool   engStoreJobOpen()      { return s_jobOpen; }
+int    engStoreJobId()        { return s_jobOpen ? s_jobId : -1; }
+
+// ---- notes journal ---------------------------------------------------
+bool engStoreNotesOpen() { return wlogOpen("notes", "utc,text"); }
+
+void engStoreNotesAdd(const String &text) {
+  String clean = text;
+  clean.replace("\n", " ");
+  clean.replace("\r", " ");   // The code replaces carriage returns with spaces.
+                              // This prevents row splitting in the log file.
+  String row = devTimeNowString() + "," + clean;   // text is deliberately last -- a comma inside it doesn't corrupt a first-comma split
+  wlogRow(row);
+  wlogFlush();
+}
+
+void engStoreNotesClose() { wlogClose(); }
+
+// ---- boot-safe job recovery ------------------------------------------
+static void recoverOrphanedJob() {
+  if (!s_sd || !SD.exists(JOB_PTR_FILE)) return;
+  File ptr = SD.open(JOB_PTR_FILE, FILE_READ);
+  if (!ptr) return;
+  String jobPath = ptr.readStringUntil('\n');
+  ptr.close();
+  jobPath.trim();
+
+  if (jobPath.length() == 0 || !SD.exists(jobPath)) {
+    SD.remove(JOB_PTR_FILE);
+    return;
+  }
+
+  File f = SD.open(jobPath, FILE_READ);
+  if (!f) { SD.remove(JOB_PTR_FILE); return; }
+  int recoveredId = -1;
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("job_id=")) {
+      recoveredId = line.substring(7).toInt();
+      break;
+    }
+  }
+  f.close();
+
+  f = SD.open(jobPath, FILE_WRITE);
+  if (f) {
+    f.printf("job_id=%d\n", recoveredId);
+    f.printf("ended_at=%s\n", devTimeNowString().c_str());
+    f.printf("status=completed\n");
+    f.printf("summary=ended by reboot\n");
+    f.close();
+  }
+  SD.remove(JOB_PTR_FILE);
+}
+
+// ---- client file listing ---------------------------------------------
+static void listClientFilesRec(const String &path, String *relPaths, uint32_t *sizes, int &n, int maxN, const String &baseDir) {
+  File dir = SD.open(path);
+  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
+  File entry = dir.openNextFile();
+  while (entry && n < maxN) {
+    String p = entry.path();
+    bool isDir = entry.isDirectory();
+    uint32_t sz = entry.size();
+    entry.close();
+    if (isDir) {
+      listClientFilesRec(p, relPaths, sizes, n, maxN, baseDir);
+    } else {
+      if (n < maxN) {
+        String rel = p.substring(baseDir.length());
+        if (rel.length() > 0 && rel[0] == '/') rel = rel.substring(1);
+        relPaths[n] = rel;
+        sizes[n] = sz;
+        n++;
+      }
+    }
+    entry = dir.openNextFile();
+  }
+  dir.close();
+}
+
+int engStoreListClientFiles(String *relPaths, uint32_t *sizes, int maxN) {
+  if (!s_sd || s_client.length() == 0 || maxN <= 0) return 0;
+  int n = 0;
+  listClientFilesRec(clientDir(), relPaths, sizes, n, maxN, clientDir());
   return n;
 }

@@ -1,32 +1,31 @@
-// Shared passive 802.11 promiscuous-capture core -- see wifi_ids.h for the
-// API, the "why one core" rationale, and the coexistence / BLE notes.
+// Shared passive 802.11 promiscuous-capture core.
+// See wifi_ids.h for the API and coexistence notes.
 //
-// Shape of this file:
-//   RX callback (widsRxCb)  -- runs in the WiFi driver's task context, NOT a
-//                              hard ISR, but kept ISR-cheap anyway: parse the
-//                              fixed header, bounded memcpy of a snapshot into
-//                              a lock-free ring, return. No malloc, no
-//                              detector calls, no draw.
-//   Drain (wifiIdsLoop)     -- task context: advance the hopper, pop the ring,
-//                              call each subscribed detector once per frame.
+// This file contains two main parts.
+// The RX callback runs in the WiFi driver task context.
+// It parses the fixed header.
+// It copies a snapshot into a lock-free ring.
+// It returns immediately.
+// The drain function runs in the main task context.
+// It advances the hopper and pops the ring.
+// It calls each subscribed detector once per frame.
 //
-// Ring buffer vs. direct dispatch from the callback: ring buffer. Direct
-// dispatch would force every detector callback to be RX-context-safe (no
-// tft, careful about blocking) and would run detector work -- IE walking,
-// screen counters -- inside the capture path during exactly the floods we
-// care about. The ring decouples them; the cost is that a flood which
-// outruns wifiIdsLoop() drops frames once the ring fills. That is fine for
-// flood/anomaly detection (you still see the flood; the drop count is itself
-// signal, exposed via wifiIdsDropped()) and is the documented tradeoff.
+// We use a ring buffer instead of direct dispatch.
+// Direct dispatch forces detector callbacks to be RX-context-safe.
+// It runs detector work inside the capture path during floods.
+// The ring decouples the capture path from the detector work.
+// A flood outrunning the drain function drops frames when the ring fills.
+// This tradeoff suits flood detection.
+// The drop count signals the flood.
 
 #include <WiFi.h>
 #include "esp_wifi.h"
 #include "wifi_ids.h"
+#include "debuglog.h"
 
-// ---- capture ring ---------------------------------------------------------
+// Capture ring
 
-// 24 * (~30 + 200) ~= 5.5 KB static. Deep enough to ride out a short burst
-// between two wifiIdsLoop() calls at the firmware's loop rate.
+// The ring holds 24 entries. This size absorbs short bursts between loop calls.
 static const int WIDS_RING_LEN = 24;
 
 struct RingEntry {
@@ -40,18 +39,15 @@ struct RingEntry {
   uint8_t  buf[WIFI_IDS_SNAP_LEN];
 };
 
-// Heap, not static: ~5.5 KB. Allocated in wifiIdsBegin(), freed in
-// wifiIdsEnd(), so screens that never open the IDS (and the WiFi+BLE-hungry
-// Flock scan) keep that DRAM.
+// We allocate the ring on the heap. This saves static RAM for other screens.
 static RingEntry        *s_ring = nullptr;
 static volatile uint16_t s_head = 0;      // producer: widsRxCb
 static volatile uint16_t s_tail = 0;      // consumer: wifiIdsLoop
 static volatile uint32_t s_dropped = 0;
 
-// ---- detector table -----------------------------------------------------
+// Detector table
 
-// Tier 1 (DESIGN.md 3) is ~4 detectors; +1 for the Guardian aggregate, +1
-// headroom.
+// We reserve space for four detectors plus two extra slots.
 static const int WIDS_MAX_DETECTORS = 6;
 
 struct Detector {
@@ -60,18 +56,12 @@ struct Detector {
   uint16_t          mask;
 };
 static Detector          s_det[WIDS_MAX_DETECTORS];
-// Union of every registered detector's mask. The RX callback checks this and
-// drops (without copying) any subtype nobody asked for -- keeps the capture
-// path off frames no one will look at, e.g. beacons while only the deauth
-// detector is up.
+// This mask tracks all registered detector requests. The RX callback drops unrequested subtypes. This keeps the capture path fast.
 static volatile uint16_t s_wantMask = 0;
 
-// ---- EAPOL / WPS: the one data-frame exception -------------------------
+// EAPOL and WPS exception
 //
-// A second, much smaller ring -- an EAPOL/WPS sighting needs ~21 bytes, not
-// a 200-byte mgmt snapshot. One `kind` tag shares it between the two
-// detector families (both are rare data-frame subsets admitted by the same
-// filter widening and the same admission-filter chain in widsRxCb).
+// EAPOL and WPS frames need less space than management frames. We use a smaller ring for them. A kind tag shares this ring between both families.
 enum { WIDS_DF_EAPOL = 0, WIDS_DF_WPS = 1 };
 struct EapolRingEntry {
   uint8_t  kind;
@@ -96,7 +86,7 @@ static const int WIDS_MAX_WPS_DETECTORS = 2;
 struct WpsDetector { WifiIdsWpsFn fn; void *ctx; };
 static WpsDetector s_wpsDet[WIDS_MAX_WPS_DETECTORS];
 
-// ---- hopper + lifecycle state -----------------------------------------
+// Hopper and lifecycle state
 
 static int      s_refs    = 0;
 static uint32_t s_dwellMs = 250;
@@ -104,9 +94,7 @@ static uint32_t s_lastHop = 0;
 static uint8_t  s_chan    = WIFI_IDS_CHAN_MIN;
 static bool     s_pinned  = false;
 
-// Restricted hop set (wifiIdsHopSet) -- cycles only s_hopSet[0..s_hopSetN)
-// instead of the full 1..13 sweep. s_hopSetN == 0 means "not active", the
-// default/unchanged full-sweep path.
+// This array holds a restricted channel list. The hopper cycles through this list. A count of zero means the hopper uses the full channel sweep.
 static const int WIDS_HOP_SET_MAX = 3;
 static uint8_t  s_hopSet[WIDS_HOP_SET_MAX];
 static uint8_t  s_hopSetN = 0;
@@ -119,15 +107,10 @@ static void widsRecalcWantMask() {
   s_wantMask = m;
 }
 
-// ---- RX callback ------------------------------------------------------
+// RX callback
 
-// IRAM_ATTR to match deauth_detect's original and to be safe if a future
-// core revision runs this closer to interrupt context. It calls only
-// memcpy/memset on stack + static data and returns; all real work is
-// deferred to the ring drain.
-// Pushes one EAPOL/WPS sighting; silently drops if that ring is full (same
-// bounded-drop discipline as the mgmt ring, just no dedicated counter -- an
-// EAPOL/WPS exchange is a handful of frames, not a flood target itself).
+// We mark this function for IRAM. This keeps it safe if the core runs it near interrupt context. The function only copies data to the ring. It defers all heavy work.
+// This function pushes one EAPOL or WPS sighting. It drops the frame silently if the ring is full. We do not count these drops.
 static inline void widsPushEapol(const EapolRingEntry &e) {
   if (!s_eapolRing) return;
   uint16_t next = (uint16_t)((s_eapolHead + 1) % WIDS_EAPOL_RING_LEN);
@@ -136,24 +119,17 @@ static inline void widsPushEapol(const EapolRingEntry &e) {
   s_eapolHead = next;
 }
 
-// Admits a DATA frame only as far as confirming it carries EAPOL (ethertype
-// 0x888E after the 802.11 header + 8-byte LLC/SNAP), then classifies it as
-// EAPOL-Key (handshake) or EAP-Packet/WSC (WPS) or discards it. Checks are
-// ordered cheapest-first so the non-EAPOL data-frame majority (encrypted IP
-// traffic) is rejected in a handful of integer ops, before the one
-// memcmp-class check (the LLC/SNAP compare).
+// This function checks if a data frame carries EAPOL or WPS. It orders checks from cheapest to most expensive. This rejects encrypted IP traffic quickly.
 static void IRAM_ATTR widsHandleDataFrame(const wifi_promiscuous_pkt_t *pkt) {
   const uint8_t *p = pkt->payload;
   uint16_t L = pkt->rx_ctrl.sig_len;
 
-  // Frame control byte 0: bits 2..3 = type (2 == data). Covers QoS-Data,
-  // plain Data, Null, QoS-Null etc. -- the header-length calc below handles
-  // the QoS-Control-field difference; frames with no LLC payload (Null/
-  // QoS-Null/CF-ACK) just fail the length checks a few lines down.
+  // We check the frame type bits. Type two indicates a data frame. The header length calculation handles QoS fields. Frames without LLC payloads fail the length check later.
   if (((p[0] >> 2) & 0x3) != 2) return;
 
   uint8_t fc1 = p[1];
   bool toDs   = fc1 & 0x01, fromDs = fc1 & 0x02;
+  // We require exactly one of ToDS or FromDS to be set. This rejects ad-hoc networks and inter-AP links. We only process client-to-AP or AP-to-client links.
   if (toDs == fromDs) return;   // need exactly one of ToDS/FromDS: reject ad-hoc/IBSS (00,
                                  // no AP involved) and WDS (11, inter-AP -- a different address-
                                  // field shape entirely, not a client<->AP link we can resolve
@@ -165,24 +141,21 @@ static void IRAM_ATTR widsHandleDataFrame(const wifi_promiscuous_pkt_t *pkt) {
   if (qos)   hdrLen += 2;                 // QoS Control
   if (order) hdrLen += 4;                 // HT Control
 
-  // header + 8-byte LLC/SNAP (ethertype is the last 2 of those 8) + the
-  // first 2 bytes of the 802.1X header (version, type) read just below.
+  // We verify the frame length. It must contain the header, the LLC/SNAP block, and the 802.1X header.
   if (L < (uint16_t)(hdrLen + 8 + 2)) return;
 
   static const uint8_t SNAP_HDR[6] = { 0xAA, 0xAA, 0x03, 0x00, 0x00, 0x00 };
   const uint8_t *llc = p + hdrLen;
   if (memcmp(llc, SNAP_HDR, 6) != 0) return;
   uint16_t ethertype = (uint16_t)((llc[6] << 8) | llc[7]);
+  // We check the ethertype. Most data frames carry encrypted payloads. They fail this check.
   if (ethertype != 0x888E) return;        // not EAPOL -- the overwhelming majority of data
                                           // frames (encrypted payload) die here or earlier
 
   const uint8_t *eapol = llc + 8;         // 802.1X header: version(1) type(1) length(2)
   uint8_t ieee8021xType = eapol[1];
 
-  // Resolve BSSID/STA from ToDS/FromDS (802.11-2020 Table 9-26): FromDS=1,
-  // ToDS=0 => AP->STA, addr2(TA)=BSSID, addr1(RA)=STA. ToDS=1,FromDS=0 =>
-  // STA->AP, addr1(RA)=BSSID, addr2(TA)=STA. The toDs==fromDs check above
-  // already ruled out the other two combinations.
+  // We resolve the BSSID and station addresses. The ToDS and FromDS flags determine which address field holds each value.
   const uint8_t *bssid, *sta;
   if (fromDs) { bssid = p + 10; sta = p + 4; }
   else        { bssid = p + 4;  sta = p + 10; }
@@ -195,7 +168,7 @@ static void IRAM_ATTR widsHandleDataFrame(const wifi_promiscuous_pkt_t *pkt) {
   e.rssi    = pkt->rx_ctrl.rssi;
 
   if (ieee8021xType == 3) {
-    // EAPOL-Key. Body: descriptor-type(1) keyInfo(2) keyLen(2) replayCounter(8) ...
+    // We process EAPOL-Key frames. The key body contains descriptor, key info, key length, and replay counter fields.
     if (L < (uint16_t)(hdrLen + 8 + 11)) return;
     uint16_t keyInfo = (uint16_t)((eapol[5] << 8) | eapol[6]);
     bool ack = keyInfo & 0x0080, mic = keyInfo & 0x0100, install = keyInfo & 0x0040, secure = keyInfo & 0x0200;
@@ -213,10 +186,7 @@ static void IRAM_ATTR widsHandleDataFrame(const wifi_promiscuous_pkt_t *pkt) {
     widsPushEapol(e);
 
   } else if (ieee8021xType == 0) {
-    // EAP-Packet -- only interesting to us if it's WSC/WPS: Expanded EAP
-    // type (254) carrying the WFA vendor id 00:37:2A, vendor-type 1
-    // (SimpleConfig). Layout after the 4-byte 802.1X header: code(1) id(1)
-    // len(2) type(1) vendorId(3) vendorType(4) -- RFC 3748 Expanded Type.
+    // We check for WPS packets. We look for Expanded EAP type 254. We verify the WFA vendor ID and vendor type.
     if (L < (uint16_t)(hdrLen + 8 + 16)) return;
     uint8_t code = eapol[4];
     uint8_t eapType = eapol[8];
@@ -232,7 +202,7 @@ static void IRAM_ATTR widsHandleDataFrame(const wifi_promiscuous_pkt_t *pkt) {
     e.eapCode = code;
     widsPushEapol(e);
   }
-  // other 802.1X packet types (1=EAPOL-Start, 2=EAPOL-Logoff, 4=EAPOL-Encapsulated-ASF-Alert) ignored
+  // We ignore other 802.1X packet types.
 }
 
 static void IRAM_ATTR widsRxCb(void *buf, wifi_promiscuous_pkt_type_t type) {
@@ -245,12 +215,14 @@ static void IRAM_ATTR widsRxCb(void *buf, wifi_promiscuous_pkt_type_t type) {
   if (!s_ring || type != WIFI_PKT_MGMT) return;
   const uint8_t *p = pkt->payload;
 
-  // Frame control byte 0: bits 2..3 = type (0 == management), 4..7 = subtype.
+  // We check the frame type bits. Type zero indicates a management frame.
   if (((p[0] >> 2) & 0x3) != 0) return;
   uint8_t st = (p[0] >> 4) & 0xF;
+  // We drop frames for subtypes that have no registered detectors.
   if (!((s_wantMask >> st) & 1u)) return;      // nobody subscribed to this subtype
 
   uint16_t next = (uint16_t)((s_head + 1) % WIDS_RING_LEN);
+  // The ring is full. We drop the frame to keep the capture path bounded.
   if (next == s_tail) { s_dropped++; return; } // ring full: drop, keep the path bounded
 
   RingEntry &e = s_ring[s_head];
@@ -263,8 +235,7 @@ static void IRAM_ATTR widsRxCb(void *buf, wifi_promiscuous_pkt_type_t type) {
   uint16_t n = (L > WIFI_IDS_SNAP_LEN) ? WIFI_IDS_SNAP_LEN : L;
   e.snapLen = n;
 
-  // seq_ctrl and addr1..3 are in the fixed 24-byte mgmt header on every
-  // subtype we carry; guard anyway against a runt frame.
+  // We copy sequence and address fields. We check the frame length to avoid reading runt frames.
   if (L >= 24) {
     e.seq = (uint16_t)((p[22] | (p[23] << 8)) >> 4);
     memcpy(e.a1, p + 4,  6);
@@ -279,7 +250,7 @@ static void IRAM_ATTR widsRxCb(void *buf, wifi_promiscuous_pkt_type_t type) {
   s_head = next;
 }
 
-// ---- hopper -----------------------------------------------------------
+// Hopper
 
 static void widsServiceHopper() {
   if (s_pinned) return;
@@ -292,10 +263,11 @@ static void widsServiceHopper() {
   } else {
     s_chan = (s_chan >= WIFI_IDS_CHAN_MAX) ? WIFI_IDS_CHAN_MIN : (uint8_t)(s_chan + 1);
   }
+  // The channel set call may fail on restricted regions. We simply stay on the current channel.
   esp_wifi_set_channel(s_chan, WIFI_SECOND_CHAN_NONE);   // failure (12/13 off-regdomain) just leaves us where we were
 }
 
-// ---- public API -----------------------------------------------------
+// Public API
 
 int wifiIdsRegister(WifiIdsDetectorFn fn, void *ctx, uint16_t subtypeMask) {
   if (!fn) return -1;
@@ -315,11 +287,7 @@ void wifiIdsUnregister(int handle) {
   widsRecalcWantMask();
 }
 
-// Applies the current filter mask (MGMT, plus DATA when an EAPOL/WPS
-// consumer wants it) to the running driver. Called from wifiIdsBegin() and,
-// if the core is already up, from wifiIdsWantEapol() -- so flipping EAPOL
-// capture on/off mid-session takes effect immediately instead of needing a
-// screen re-entry.
+// This function applies the current filter mask to the driver. It enables data frame capture when EAPOL or WPS detection is active. The filter updates immediately without restarting the driver.
 static void widsApplyFilter() {
   wifi_promiscuous_filter_t filt;
   filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT |
@@ -331,18 +299,21 @@ void wifiIdsBegin() {
   if (s_refs++ > 0) return;                 // already running for another consumer
 
   s_ring = (RingEntry *)calloc(WIDS_RING_LEN, sizeof(RingEntry));
+  // Memory allocation failed. We stop the driver and return.
   if (!s_ring) {                            // OOM: give up cleanly, detectors just get nothing
-    Serial.printf("[wifi_ids] ring alloc failed, free heap %u\n", (unsigned)ESP.getFreeHeap());
+    DLOG("wifi_ids", "ring alloc failed, free heap %u", (unsigned)ESP.getFreeHeap());
     s_refs = 0;
     return;
   }
   if (s_wantEapol) {
     s_eapolRing = (EapolRingEntry *)calloc(WIDS_EAPOL_RING_LEN, sizeof(EapolRingEntry));
+    // EAPOL ring allocation failed. We continue without it. The main screen still works.
     // OOM here is non-fatal: EAPOL/WPS detectors just see nothing, same
     // "give up cleanly" policy as the mgmt ring -- the screen still works.
   }
-  Serial.printf("[wifi_ids] begin, free heap %u\n", (unsigned)ESP.getFreeHeap());
+  DLOG("wifi_ids", "begin, free heap %u", (unsigned)ESP.getFreeHeap());
 
+  // We start the driver in STA mode. We do not use NULL mode. NULL mode de-initializes the WiFi driver on this core. STA mode keeps the driver active.
   // Bring the driver up in STA (started, not associated) and switch to
   // promiscuous. NOT WIFI_MODE_NULL: on the current Arduino-ESP32 core that
   // de-inits WiFi, and esp_wifi_set_promiscuous() then fails silently with
@@ -372,6 +343,7 @@ void wifiIdsEnd() {
 
   esp_wifi_set_promiscuous_rx_cb(nullptr);
   esp_wifi_set_promiscuous(false);
+  // We drop to STA mode. We avoid NULL mode. NULL mode de-initializes the driver. STA mode keeps the driver warm for subsequent scans.
   // Drop to STA, NOT WIFI_MODE_NULL. NULL de-inits the driver on this core,
   // so the next WiFi screen cold-re-inits and its first ~5 scans / a
   // WiFi.begin() come up empty while the RF recalibrates. STA leaves the
@@ -383,7 +355,7 @@ void wifiIdsEnd() {
   s_ring = nullptr;
   free(s_eapolRing);
   s_eapolRing = nullptr;
-  Serial.printf("[wifi_ids] end, free heap %u\n", (unsigned)ESP.getFreeHeap());
+  DLOG("wifi_ids", "end, free heap %u", (unsigned)ESP.getFreeHeap());
 }
 
 int wifiIdsRegisterEapol(WifiIdsEapolFn fn, void *ctx) {
@@ -431,6 +403,7 @@ void wifiIdsLoop() {
 
   widsServiceHopper();
 
+  // We limit the drain loop to one full ring per call. This prevents a sustained flood from starving the UI.
   // Bounded: never walk more than one full ring per call, so a sustained
   // flood can't turn this into an unbounded loop that starves the UI.
   int budget = WIDS_RING_LEN;
@@ -457,6 +430,7 @@ void wifiIdsLoop() {
     s_tail = (uint16_t)((s_tail + 1) % WIDS_RING_LEN);
   }
 
+  // We drain the EAPOL and WPS ring. We apply the same bounded loop discipline. The loop skips if the ring is empty.
   // EAPOL/WPS ring -- same bounded-drain discipline, separate small ring
   // (see widsHandleDataFrame). No-op (empty ring, head==tail) when nobody
   // called wifiIdsWantEapol(true).
@@ -489,6 +463,7 @@ void wifiIdsLoop() {
 }
 
 void wifiIdsSetDwell(uint32_t dwellMs) {
+  // We enforce a minimum dwell time. The PHY needs this time to settle on each channel.
   if (dwellMs < 20) dwellMs = 20;           // sane floor -- below this the PHY barely settles per channel
   s_dwellMs = dwellMs;
 }

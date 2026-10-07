@@ -8,17 +8,14 @@
 #include "driver/dac_continuous.h"
 #include "devtime.h"
 #include "tz.h"
+#include "demomode.h"
 #include "theme.h"
 #include "accent.h"
 #include "debuglog.h"
-#include "bg_landscape.h"   // BG_LANDSCAPE[19200]  160x120, upscaled x2
-#include "bg_portrait.h"    // BG_PORTRAIT[19200]   120x160
+#include "bg_landscape.h"   // 160x120 landscape image array.
+#include "bg_portrait.h"    // 120x160 portrait image array.
 
-// One shared DAC channel on GPIO26 for ALL audio -- UI beeps and the
-// easter-egg MOD player. Created once here, enabled only while something
-// is playing. Using a single continuous/DMA channel (never the one-shot
-// dacWrite path) means beeps and the demo can't leave the DAC in a state
-// that breaks the other -- which is what killed the sound after the demo.
+// One shared DAC channel on GPIO26 handles all audio. The system enables it only during playback.
 static dac_continuous_handle_t g_dac = nullptr;
 static const int UI_DAC_HZ = 22050;
 dac_continuous_handle_t uiDac() { return g_dac; }
@@ -46,18 +43,15 @@ static void dacInit() {
   }
 }
 
-Adafruit_ILI9341 tft(TFT_CS, TFT_DC, -1);   // reset shared with EN, see pins.h
+Adafruit_ILI9341 tft(TFT_CS, TFT_DC, -1);   // Reset pin shares the EN line. See pins.h.
 
-static bool s_batForce = false;   // uiDrawTopBar() -> uiDrawBatteryIndicator() repaint on screen change
-static bool s_clockForce = false; // uiDrawStatusBar() -> uiDrawClock() repaint on screen change
-// Hoisted out of the battery-indicator section below (battStatusColor() and
-// uiDrawClock() both want it, and uiDrawClock() is drawn first in loop()).
-static int s_batPct = -2;         // -2 = never read
+static bool s_batForce = false;   // Hoist this value so both battery and clock functions share it.
+static bool s_clockForce = false; // Hoist this value so both battery and clock functions share it.
+static int s_batPct = -2;         // -2 means the value is unread.
 static int  s_bgMode  = UI_BG_BLACK;
 void uiSetBgMode(int m) { s_bgMode = m; }
 
-// Cached in RAM (like themeGet()) rather than read from NVS -- uiDrawTopBar()
-// checks this on every screen draw, not just once at Enter().
+// Cache this flag in RAM for fast access during every screen draw.
 static bool s_listBg = true;
 static void loadListBg() {
   Preferences p;
@@ -76,8 +70,7 @@ void uiSetListBgEnabled(bool on) {
 static void loadBeepVolume();   // defined below beep(); forward-declared for uiInit()
 static void ledBusyTask(void *); // defined below ledSet(); forward-declared for uiInit()
 
-// ---- bit-banged XPT2046 (touch pins don't sit on either hw SPI's native
-// set -- see esp32-cyd skill / cyd_selftest for why this isn't a library) ----
+// Bit-bang the XPT2046 touch controller. The pins lack hardware SPI support.
 static uint16_t xptCmd(uint8_t cmd) {
   digitalWrite(TP_CS, LOW);
   for (int i = 7; i >= 0; i--) {
@@ -108,18 +101,7 @@ static bool readTouchRaw(int &rawX, int &rawY) {
   return digitalRead(TP_IRQ) == LOW;   // still down after the read settles
 }
 
-// Calibration -- persisted in NVS, refined by uiRunCalibration(). Stored
-// PER ROTATION (4 independent slots): touching is a physically fixed
-// overlay that doesn't rotate with tft.setRotation(), but WHICH raw axis
-// correlates with "screen X" and its direction both change with rotation
-// (rotation changes what's currently drawn as "screen X"). Two attempts at
-// deriving that relationship analytically from one hardware-confirmed
-// baseline both turned out wrong when tested -- MADCTL semantics per
-// rotation aren't simple enough to get right by inspection alone. So
-// instead of deriving it, uiRunCalibration() *measures* it fresh each time:
-// a 3-point (L-shaped) tap discovers which raw axis moves with screen X
-// vs screen Y and in which direction, rather than assuming. This can't be
-// wrong in the way the formula derivation was, since nothing is assumed.
+// Persist touch calibration in NVS. The physical overlay stays fixed. Screen rotation changes the raw axis mapping. The system measures the mapping per rotation. It uses a three-point tap to find the correct axes. This avoids incorrect mathematical assumptions.
 struct TouchCal {
   bool valid;
   bool swapXY;         // true: rawY tracks screen X, rawX tracks screen Y
@@ -183,11 +165,7 @@ void uiSetRotation(uint8_t r) {
 void uiCycleRotation() { uiSetRotation((displayRotation + 1) % 4); }
 
 TouchPoint uiReadTouch() {
-  // wasPressed tracks physical state across calls so isNewPress can detect
-  // the rising edge -- every call updates it, whether or not this sample is
-  // a press, so a screen that stops polling mid-hold (e.g. a modal sub-loop
-  // like calibration/keyboard, which read the raw touch directly instead)
-  // doesn't leave it desynced for the next uiReadTouch() call afterward.
+  // Track the physical press state across calls. This keeps the rising-edge detector in sync.
   static bool wasPressed = false;
   TouchPoint t{false, false, 0, 0};
   int rawX, rawY;
@@ -226,12 +204,7 @@ static bool waitForRawTap(int &rawX, int &rawY) {
 }
 
 void uiRunCalibration() {
-  // Whatever triggered this (tapping "Rotate screen", holding BOOT, tapping
-  // "Recalibrate touch") may still be physically held down right now -- if
-  // so, the first crosshair's waitForRawTap() would instantly "register" a
-  // tap at that stale, wrong location instead of actually waiting for a
-  // fresh one. Uses the raw reader, not uiReadTouch(), since calibration
-  // for the current rotation may not exist yet at this point.
+  // Drain any stale touch state before starting. The raw reader avoids using uncalibrated coordinates.
   int rx, ry;
   while (readTouchRaw(rx, ry)) delay(10);
 
@@ -249,10 +222,7 @@ void uiRunCalibration() {
     tft.drawFastVLine(x, y - 8, 17, ILI9341_CYAN);
   };
 
-  // L-shaped 3 points (not 2 diagonal ones) -- p1->p2 isolates a screen-X-
-  // only change, p1->p3 isolates a screen-Y-only change. That's what lets
-  // this *measure* which raw axis is which instead of assuming it (see the
-  // struct comment above for why assuming it twice went wrong).
+  // Use three points in an L shape. The first two points isolate horizontal movement. The first and third isolate vertical movement. This measures the axis mapping directly.
   int x1 = INSET, y1 = INSET;
   int x2 = tft.width() - INSET, y2 = y1;
   int x3 = x1, y3 = tft.height() - INSET;
@@ -299,8 +269,10 @@ void uiInit() {
   pinMode(TP_MISO, INPUT);
   pinMode(TP_IRQ, INPUT);
 
-  pinMode(LED_STATUS, OUTPUT); ledSet(false);
-  pinMode(LED_GREEN, OUTPUT);  digitalWrite(LED_GREEN, HIGH);   // off (active low)
+  ledcAttach(LED_STATUS, 5000, 8);
+  ledcAttach(LED_BUSY, 5000, 8);
+  ledcAttach(LED_GREEN, 5000, 8);   // all 3 channels PWM-capable -- see ledColorRGB()/ledColorAccent()
+  ledColorRGB(0, 0, 0);             // all off (active low, handled inside ledColorRGB())
   pinMode(AUDIO_EN, OUTPUT);   digitalWrite(AUDIO_EN, HIGH);
   pinMode(BOOT_KEY, INPUT_PULLUP);
 
@@ -337,9 +309,7 @@ uint16_t uiBgColor(int y) {
   return (r << 11) | (g << 5) | bl;
 }
 
-// Half-res dimmed scene art. Landscape panel -> BG_LANDSCAPE (160x120),
-// portrait -> BG_PORTRAIT (120x160); flipped orientations reuse the same
-// array, same as showSplash().
+// Return the half-resolution scene art pointer. Landscape and portrait arrays share the same data.
 static const uint16_t *bgSrc(int &sw, int &sh) {
   if (tft.width() >= tft.height()) { sw = 160; sh = 120; return BG_LANDSCAPE; }
   sw = 120; sh = 160; return BG_PORTRAIT;
@@ -358,12 +328,8 @@ static inline uint16_t avg565_4(uint16_t a, uint16_t b, uint16_t c, uint16_t d) 
   return (r << 11) | (g << 5) | bl;
 }
 
-// Softened 2x upscale of the half-res scene art -- plain nearest-neighbor
-// (sx=xx>>1) reads blocky at this scale; blend toward the next source texel
-// on the "far" half of each 2x2 output block instead, on both axes, so the
-// background reads as a blurred photo rather than pixel art. Cheap (at most
-// 4 PROGMEM reads, integer-only) since the source is already tiny.
-static uint16_t bgSample(const uint16_t *img, int sw, int sh, int xx, int yy) {
+// Soften the 2x upscale of half-resolution art. Blending reduces blockiness. The function uses at most four integer reads. Other modules reuse this routine.
+uint16_t uiBgSample(const uint16_t *img, int sw, int sh, int xx, int yy) {
   int sx = xx >> 1; if (sx >= sw) sx = sw - 1; if (sx < 0) sx = 0;
   int sy = yy >> 1; if (sy >= sh) sy = sh - 1; if (sy < 0) sy = 0;
   bool blendX = xx & 1, blendY = yy & 1;
@@ -388,7 +354,7 @@ void uiClearRect(int x, int y, int w, int h) {
     for (int yy = y; yy < y + h; yy++) {
       int n = 0;
       for (int xx = x; xx < x + w && n < 320; xx++, n++)
-        line[n] = bgSample(img, sw, sh, xx, yy);
+        line[n] = uiBgSample(img, sw, sh, xx, yy);
       tft.setAddrWindow(x, yy, n, 1);
       tft.writePixels(line, n, true, false);
     }
@@ -453,9 +419,7 @@ void uiDrawListIfChanged(int x, int rowY0, int rowW, int rowH, int count, int ma
 }
 
 void uiDrawTopBar(const char *title) {
-  // Default per-screen: plain gradient, unless the user opted list/live-data
-  // screens into the scene image too (System > Display > Theme & Color). A
-  // menu screen overriding to UI_BG_IMAGE right after is then a no-op.
+  // Set the background mode. List screens use the scene image if enabled. Menu screens override this setting.
   s_bgMode = uiListBgEnabled() ? UI_BG_IMAGE : UI_BG_BLACK;
   tft.fillRect(0, 0, tft.width(), 28, accentTitleBar());   // universal -- Basic used a fixed navy before
   tft.drawFastHLine(0, 28, tft.width(), ILI9341_WHITE);
@@ -478,8 +442,7 @@ void uiDrawTopBar(const char *title) {
 
 bool uiTouchInBackButton(const TouchPoint &t) { return uiTouchInButton(t, kBackBtn); }
 
-// Area-only hit test (ignores isNewPress) -- for detecting a *held* back
-// button, where uiTouchInBackButton()'s new-press guard would miss it.
+// Test the button area without checking for a new press. This detects held touches.
 bool uiTouchInBackArea(const TouchPoint &t) {
   return t.pressed && t.x >= kBackBtn.x && t.x < kBackBtn.x + kBackBtn.w &&
          t.y >= kBackBtn.y && t.y < kBackBtn.y + kBackBtn.h;
@@ -494,8 +457,7 @@ void uiDrawButton(const Btn &b) {
       tft.drawRoundRect(b.x + 1, b.y + 1, b.w - 2, b.h - 2, r - 1, accentEdge());
     tft.drawFastHLine(b.x + r, b.y + 2, b.w - 2 * r, accentBevel());
 
-    // Label starts at the global cap (UI_MENU_BTN_MAXSIZE, see ui.h) and
-    // steps down until it fits -- one knob for button text size app-wide.
+    // Scale the label down until it fits the button. This applies a global text size limit.
     int16_t bx, by; uint16_t bw, bh;
     int ts = UI_MENU_BTN_MAXSIZE;
     for (; ts > 1; ts--) {
@@ -524,9 +486,66 @@ void uiDrawButton(const Btn &b) {
   tft.print(b.label);
 }
 
-// uiDrawButton() now caps label size at UI_MENU_BTN_MAXSIZE app-wide, so
-// this is just an alias kept for the call sites that name it explicitly.
 void uiDrawMenuButton(const Btn &b) { uiDrawButton(b); }
+
+uint16_t uiContrastText(uint16_t c) {
+  int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
+  int luma = (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
+  return luma / 1000 > 140 ? ILI9341_BLACK : ILI9341_WHITE;
+}
+
+void uiDrawButtonColored(const Btn &b, uint16_t fill) {
+  if (themeIsVice()) {
+    int r = b.h / 2; if (r > 10) r = 10; if (r < 3) r = 3;
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, fill);
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, fill);
+  } else {
+    tft.drawRect(b.x, b.y, b.w, b.h, fill);
+  }
+
+  int16_t bx, by; uint16_t bw, bh;
+  int ts = UI_MENU_BTN_MAXSIZE;
+  for (; ts > 1; ts--) {
+    tft.setTextSize(ts);
+    tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
+    if ((int)bw <= b.w - 8 && (int)bh <= b.h - 4) break;
+  }
+  tft.setTextSize(ts);
+  tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
+  int tx = b.x + (b.w - (int)bw) / 2 - bx;
+  int ty = b.y + (b.h - (int)bh) / 2 - by;
+  tft.setTextColor(themeIsVice() ? uiContrastText(fill) : fill);
+  tft.setCursor(tx, ty);
+  tft.print(b.label);
+  tft.setTextSize(1);
+}
+
+void uiDrawButtonTricolor(const Btn &b, uint16_t fill, uint16_t edge, uint16_t text) {
+  if (themeIsVice()) {
+    int r = b.h / 2; if (r > 10) r = 10; if (r < 3) r = 3;
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, r, fill);
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, r, edge);
+  } else {
+    tft.fillRect(b.x, b.y, b.w, b.h, fill);
+    tft.drawRect(b.x, b.y, b.w, b.h, edge);
+  }
+
+  int16_t bx, by; uint16_t bw, bh;
+  int ts = UI_MENU_BTN_MAXSIZE;
+  for (; ts > 1; ts--) {
+    tft.setTextSize(ts);
+    tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
+    if ((int)bw <= b.w - 8 && (int)bh <= b.h - 4) break;
+  }
+  tft.setTextSize(ts);
+  tft.getTextBounds(b.label, 0, 0, &bx, &by, &bw, &bh);
+  int tx = b.x + (b.w - (int)bw) / 2 - bx;
+  int ty = b.y + (b.h - (int)bh) / 2 - by;
+  tft.setTextColor(text);
+  tft.setCursor(tx, ty);
+  tft.print(b.label);
+  tft.setTextSize(1);
+}
 
 void uiDrawButtonDim(const Btn &b) {
   const uint16_t fill = 0x2124;   // dark grey
@@ -647,26 +666,13 @@ int uiDropdownPick(const char *title, int count, const char *(*itemLabel)(int), 
 }
 
 bool uiTouchInButton(const TouchPoint &t, const Btn &b) {
-  // isNewPress, not pressed -- a held touch must not keep re-triggering
-  // this button/screen change on every poll. See TouchPoint's comment in
-  // ui.h for where to deliberately opt back into repeat-while-held.
+  // Check for a new press only. A held touch must not trigger repeated actions.
   return t.isNewPress && t.x >= b.x && t.x < b.x + b.w && t.y >= b.y && t.y < b.y + b.h;
 }
 
 // --- toast (status-bar message), with a step-scroll ticker for anything
 // too long to fit -----------------------------------------------------
-// A message longer than the reserved width used to just run straight
-// under the clock/battery corner (Adafruit_GFX's print() doesn't clip to
-// any rect on its own). Now the widest thing ever handed to tft.print()
-// here is a substring already sliced to fit -- whether that's the whole
-// message (short enough) or one CHARACTER-stepped window of a longer one
-// -- so it can't bleed into that corner either way. Stepping by whole
-// characters (not pixels) means no per-pixel clipping/canvas trick is
-// needed at all, which matters on this MCU: a smooth pixel scroll would
-// need an offscreen canvas blitted pixel-by-pixel over SPI every ~30ms,
-// competing for CPU/SPI time with whatever scan the active screen is
-// running. A few characters advancing a few times a second still reads
-// unmistakably as a ticker.
+// Scroll long messages in the status bar. Character stepping avoids pixel-level canvas blitting. This saves CPU and SPI bandwidth during screen updates.
 static String   s_toastMsg;
 static bool     s_toastScrolling = false;
 static int      s_toastCharsFit = 0;
@@ -704,11 +710,7 @@ void uiToast(const char *msg) {
 }
 
 void uiClearToast() {
-  // The ticker (uiTickToast(), via uiServiceChrome()) runs from the main
-  // loop() regardless of which screen is active -- without this, a
-  // message from a screen you've LEFT keeps redrawing itself over
-  // whatever the next screen puts in the status bar, forever, since
-  // nothing else ever tells it to stop.
+  // Stop the ticker when clearing the toast. The ticker runs continuously across all screens.
   s_toastScrolling = false;
   s_toastMsg = "";
   int y = tft.height() - UI_STATUSBAR_H + 1;
@@ -716,9 +718,7 @@ void uiClearToast() {
   tft.fillRect(0, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
 }
 
-// Advances the status-bar ticker, if the last uiToast() message was too
-// long to fit -- called every loop() tick via uiServiceChrome(), self-
-// throttled to TOAST_STEP_MS so it reads as a marquee, not a flicker.
+// Advance the ticker if a long message is active. The function throttles updates to prevent flickering.
 static void uiTickToast() {
   if (!s_toastScrolling) return;
   uint32_t now = millis();
@@ -734,19 +734,10 @@ static void uiTickToast() {
   toastDrawWindow(window);
 }
 
-// Manually-computed RGB565 -- Adafruit_ILI9341's color set has no BROWN.
-// (Used by battStatusColor()'s low-battery pulse, below.)
+// Define a brown color. The display driver lacks a built-in brown constant.
 static const uint16_t UI_BROWN = 0xA145;
 
-// Same palette uiDrawBatteryIndicator() colors its glyph/label with -- one
-// place, so the clock next to it (uiDrawClock, below) always matches it
-// exactly instead of picking its own colors. The charge-state warning
-// colors (low-battery pulse, mid-range yellow, USB grey) stay fixed --
-// they're a functional signal, not branding, and a pulsing "danger" red
-// swapped for whatever the user's accent happens to be would defeat the
-// point. "All is well" (>=40%, off USB) is the exception: that's most of
-// a device's life, so THAT'S the one state tied to the accent -- the
-// clock/battery corner reads in the user's chosen color most of the time.
+// Return the battery status color. Warning colors stay fixed for functional clarity. The healthy state uses the accent color.
 static uint16_t battStatusColor() {
   if (s_batPct < 0) return ILI9341_DARKGREY;              // USB / never read yet
   if (s_batPct < 15) {                                     // low: pulse through these
@@ -759,11 +750,7 @@ static uint16_t battStatusColor() {
 }
 
 void uiDrawClock() {
-  // Right-aligned, just left of the battery glyph (uiDrawBatteryIndicator),
-  // which occupies roughly the rightmost 55px of the bottom edge -- see
-  // UI_RIGHTZONE_W. Repainted every loop() tick like the battery glyph, but
-  // only actually redraws when the printed string changes (once a minute),
-  // same "cheap and idempotent" contract as uiDrawBatteryIndicator.
+  // Draw the clock next to the battery indicator. The function only redraws when the time string changes.
   static char last[7] = "";
   char buf[7] = "--:--";   // unsynced: no time to show yet
   if (devTimeSynced()) {
@@ -855,45 +842,69 @@ bool uiDrawLocateReading(int x, int y, int w, uint16_t presentColor,
   return true;
 }
 
-void ledSet(bool on)   { digitalWrite(LED_STATUS, on ? LOW : HIGH); }   // red, active low
-void ledGreen(bool on) { digitalWrite(LED_GREEN,  on ? LOW : HIGH); }   // green, active low
+// Control the status LED via the PWM channel. Direct digital writes detach the channel.
+void ledSet(bool on)   { ledcWrite(LED_STATUS, on ? 0 : 255); }   // red, active low
+// Control the green LED via the PWM channel. The pin supports hard switching and fading. Full brightness uses a zero duty cycle.
+void ledGreenPwm(uint8_t brightness) { ledcWrite(LED_GREEN, 255 - brightness); }
+void ledGreen(bool on) { ledGreenPwm(on ? 255 : 0); }
 
-// "Working" heartbeat: 50ms on / 25ms off while a scan / speed test /
-// other job runs. Its own core-0 task so it keeps blinking through
-// blocking loops, and a separate GPIO from the red armed-engagement
-// blinker so the two never interfere.
-//
-// Two independent inputs, OR'd: ledBusy() for explicit "job running"
-// callers (WiFi scan/connect, speed test, net query) and ledBusyScreen()
-// which loop() drives from currentScreen for the always-scanning screens.
-// Keeping them separate stops loop()'s per-iteration ledBusyScreen(false)
-// from stomping a scan's ledBusy(true). ledBusyAlt() makes each flash
-// alternate blue/green (Skimmer).
-static volatile bool s_busyReq = false, s_busyScreen = false, s_busyAlt = false;
+// Write values to all three LED channels. The system uses an active-low convention.
+void ledColorRGB(uint8_t r, uint8_t g, uint8_t b) {
+  ledcWrite(LED_STATUS, 255 - r);
+  ledcWrite(LED_BUSY,   255 - b);
+  ledcWrite(LED_GREEN,  255 - g);
+}
+
+// Apply the accent color to all LEDs. The intensity scales the output.
+void ledColorAccent(float intensity) {
+  uint8_t r, g, b;
+  accentRGB(accentFill(), r, g, b);
+  ledColorRGB((uint8_t)(r * intensity), (uint8_t)(g * intensity), (uint8_t)(b * intensity));
+}
+
+// Run a background task to render all LED channels. This prevents timer conflicts. The task follows a strict priority order. A suspension flag lets external code take full control.
+static volatile bool s_busyReq = false, s_busyScreen = false;
+static volatile bool s_alertActive = false;
+static volatile bool s_heartbeatOn = false;
+static volatile bool s_connectedActive = false;
+static volatile bool s_renderSuspended = false;
 
 static void ledBusyTask(void *) {
-  pinMode(LED_BUSY, OUTPUT);
-  digitalWrite(LED_BUSY, HIGH);            // off (active low)
-  bool green = false;
   for (;;) {
-    if (s_busyReq || s_busyScreen) {
-      int pin = (s_busyAlt && green) ? LED_GREEN : LED_BUSY;
-      digitalWrite(pin, LOW);  vTaskDelay(pdMS_TO_TICKS(50));
-      digitalWrite(pin, HIGH); vTaskDelay(pdMS_TO_TICKS(25));
-      green = !green;
+    if (s_renderSuspended) {
+      // do nothing -- a caller elsewhere owns the shared channels right now
+    } else if (s_alertActive) {
+      uint32_t cyclePos = millis() % 500;
+      bool isRed = cyclePos < 250;
+      uint32_t t = cyclePos % 250;
+      float k = (t < 125) ? (t / 125.0f) : ((250 - t) / 125.0f);
+      uint8_t v = (uint8_t)(255 * k);
+      if (isRed) ledColorRGB(v, 0, 0);
+      else       ledColorRGB(v, v, 0);
+    } else if (s_busyReq || s_busyScreen) {
+      uint32_t t = millis() % 750;
+      float k = (t < 500) ? (t / 500.0f) : 0.0f;
+      ledColorAccent(k);
+    } else if (s_connectedActive) {
+      ledColorAccent(1.0f);
     } else {
-      digitalWrite(LED_BUSY, HIGH);
-      vTaskDelay(pdMS_TO_TICKS(20));
+      ledColorRGB(s_heartbeatOn ? 255 : 0, 0, 0);
     }
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
 void ledBusy(bool on)       { s_busyReq = on; }
 void ledBusyScreen(bool on) { s_busyScreen = on; }
-void ledBusyAlt(bool on)    { s_busyAlt = on; if (!on) digitalWrite(LED_GREEN, HIGH); }
+void ledHeartbeat(bool on)  { s_heartbeatOn = on; }
+void ledAlert(bool on)      { s_alertActive = on; }
+void ledConnected(bool on)  { s_connectedActive = on; }
+void ledSuspendRender(bool suspend) {
+  s_renderSuspended = suspend;
+  if (suspend) ledColorRGB(0, 0, 0);   // hand off from a known-off state, not whatever was mid-fade
+}
 
-// "Target detected" cue: 3 quick chirps, each with a green blink. Blocks
-// ~0.25s -- meant to be fired on a detection edge, not every scan cycle.
+// Play a detection alert. The function blocks for a quarter second.
 void alertDetected() {
   for (int i = 0; i < 3; i++) {
     ledGreen(true);
@@ -922,11 +933,7 @@ void uiSetBeepVolume(int v) {
   p.end();
 }
 
-// PCM sine tone through the shared DAC channel (was a rail-to-rail LEDC
-// square -- the "PC speaker" timbre). A sine centred at mid-rail has no DC
-// component (the amp stays cool), amplitude scales cleanly with volume, and
-// a short attack/release stops the clicks. Blocks the caller until the
-// tone has played out.
+// Generate a PCM sine tone on the shared DAC. The mid-rail offset prevents DC current. The attack and release phases stop audio clicks.
 static int8_t s_sinLut[256];
 static bool   s_sinReady = false;
 static bool   s_held = false;   // amp + DAC kept powered between beeps
@@ -990,9 +997,7 @@ void beep(uint32_t ms, uint32_t toneHz) {
     size_t w = 0;
     esp_err_t e = dac_continuous_write(g_dac, bb, chunk, &w, 100);
     if (e != ESP_OK || w == 0) {
-      // Channel latched (DMA underrun -- often after a WiFi/SPI-heavy
-      // screen). Rebuild it so the *next* beep works, and bail rather than
-      // spin the whole tone at 100ms/chunk and stall the UI.
+      // Handle a DMA underrun. Rebuild the channel and exit to prevent UI stalls.
       uiAudioReset();
       return;
     }
@@ -1001,9 +1006,7 @@ void beep(uint32_t ms, uint32_t toneHz) {
   delay(2 + (uint32_t)nSamp * 1000 / SR);      // let the DMA tail play out
 
   if (own) {
-    // One-off beep: tear the channel down clean. No primeMidRail() here --
-    // queuing 512 bytes and then immediately disabling was underrunning the
-    // DMA and latching the channel.
+    // Disable the channel after a one-off beep. Skipping the silence queue prevents DMA latching.
     digitalWrite(AUDIO_EN, HIGH);
     dac_continuous_disable(g_dac);
   } else {
@@ -1011,11 +1014,7 @@ void beep(uint32_t ms, uint32_t toneHz) {
   }
 }
 
-// Full teardown + rebuild of the shared DAC channel. A DMA underrun (e.g.
-// the MOD task competing with a big SPI blit) or a task killed mid-write
-// can latch the continuous channel into a state where dac_continuous_enable()
-// quietly fails and every later beep() is silent until reboot. Deleting and
-// recreating the channel is the only reliable way back.
+// Rebuild the DAC channel to recover from errors. DMA underruns or killed tasks can latch the hardware. A full teardown restores normal operation.
 void uiAudioReset() {
   s_held = false;
   digitalWrite(AUDIO_EN, HIGH);
@@ -1038,19 +1037,13 @@ void rangeBeep(int rssi) {
   if (interval < 150) interval = 150;
   if (millis() - last < interval) return;
   last = millis();
-  // 45ms chirp -- a 12ms one was mostly swallowed by the amp unmute ramp
-  // and inaudible. Pitch kept off the very low end (quiet on this speaker).
+  // Play a chirp at a fixed duration. The pitch avoids the speaker's quiet range.
   uint32_t tone = 750 + (uint32_t)(s * s * 2050.0f);   // ~750 -> ~2800 Hz
   beep(45, tone);
 }
 
 // --- battery ---------------------------------------------------------------
-// CYD wires the LiPo through a ~2:1 divider to GPIO34 (BAT_ADC, ADC1_CH6).
-// analogReadMilliVolts() applies the chip's eFuse ADC calibration; x2 for
-// the divider (LCDWiki board's usual 100k/100k). The real divider + ADC cal
-// drift unit to unit, so a user factor (System > Hardware > Battery
-// calibrate) scales the result: uiBatteryMv() = raw * s_batCal.
-// No charge-status line is broken out to a GPIO on this board.
+// Read the battery voltage through a voltage divider. The system applies ADC calibration. A user factor scales the result. The board lacks a charge-status pin.
 static const float BAT_DIV = 2.0f;
 static float s_batCal  = 1.0f;
 static bool  s_batCalLoaded = false;
@@ -1097,9 +1090,7 @@ void uiBatterySetCalFromActual(int actualMv) {
   uiBatterySetCal((float)actualMv / (float)raw);
 }
 
-// Rough 1S state-of-charge from a resting-voltage LUT (no load compensation
-// -- reads low under a heavy scan). Returns -1 for "no cell": >4300mV is the
-// charger rail with nothing attached; <2800mV is a dead/absent pack.
+// Estimate charge from a resting voltage table. The function returns -1 for missing cells. High voltage indicates an unconnected charger. Low voltage indicates a dead pack.
 static int battPct(int mv) {
   if (mv > 4300 || mv < 2800) return -1;
   static const int lut[][2] = {
@@ -1122,10 +1113,7 @@ static uint32_t s_batReadAt = 0, s_batPaintAt = 0;
 static int s_batMv = 0;                 // s_batPct itself lives up top -- see the comment there
 static char s_batSig[8] = "";           // last-painted {pct, pulse-colour}
 
-// Bottom-right corner, rightmost. The clock (uiDrawClock) sits just to its
-// left. Drawn from loop() every iteration like the clock -- only the ADC
-// read is throttled (5s); the ~50px repaint is cheap and keeps the glyph
-// alive after any screen's uiClearBelow().
+// Draw the battery indicator in the bottom-right corner. The function throttles ADC reads but redraws frequently to survive screen clears.
 void uiDrawBatteryIndicator() {
   uint32_t now = millis();
   if (s_batPct == -2 || now - s_batReadAt > 5000) {
@@ -1143,10 +1131,7 @@ void uiDrawBatteryIndicator() {
   else if (s_batPct < 40)  col = ILI9341_YELLOW;
   else                     col = accentFill();   // "all is well" -- tied to the accent, see battStatusColor()
 
-  // Only repaint when the rendered content actually changes -- redrawing
-  // every loop() strobed the icon. Force one on a screen change, and one
-  // at least every 1.5s so a screen that clears this corner every frame
-  // (wardrive) gets the glyph back.
+  // Skip redraws when the content matches the previous frame. Force a refresh on screen changes and every 1.5 seconds.
   char sig[8];
   snprintf(sig, sizeof(sig), "%d", s_batPct * 16 + (low ? cycIdx : 8));
   bool changed = uiFieldChanged(s_batSig, sizeof(s_batSig), sig);
@@ -1158,9 +1143,7 @@ void uiDrawBatteryIndicator() {
   int bx = tft.width() - 3 - nubW - bodyW;    // body left edge
   int by = tft.height() - 3 - bodyH;
 
-  // Fixed 4-char label ("100%", " 42%", "  5%", " USB") drawn OPAQUE (fg on
-  // black) so no separate clear step -- the char cells always cover the
-  // same pixels regardless of value.
+  // Draw the percentage label over a black background. This covers the same pixels every time.
   char lbl[6];
   if (s_batPct < 0) snprintf(lbl, sizeof(lbl), " USB");
   else              snprintf(lbl, sizeof(lbl), "%3d%%", s_batPct);
@@ -1176,25 +1159,42 @@ void uiDrawBatteryIndicator() {
   if (fw > 0) tft.fillRect(bx + 2, by + 2, fw, bodyH - 4, col);        // charge bar
 }
 
+// Blink a demo mode indicator in the status bar. The function shares the left half with the toast ticker.
+static void uiTickDemoBadge() {
+  static int8_t lastState = -1;   // -1/0/1: not-yet-drawn / off / on -- forces a first draw
+  if (!demoModeEnabled() || s_toastScrolling || s_toastMsg.length()) { lastState = -1; return; }
+  // Throttle the blink rate to prevent flickering.
+  bool on = (millis() / 600) % 2 == 0;
+  if ((int8_t)on == lastState) return;
+  lastState = on;
+  int y = tft.height() - UI_STATUSBAR_H + 1;
+  // Leave space for the main menu gear icon. The fill rectangle starts after this clearance.
+  const int GEAR_CLEARANCE = 38;
+  int w = tft.width() - UI_RIGHTZONE_W - GEAR_CLEARANCE;
+  tft.fillRect(GEAR_CLEARANCE, y, w, UI_STATUSBAR_H - 1, ILI9341_BLACK);
+  if (on) {
+    tft.setTextWrap(false);
+    tft.setTextColor(ILI9341_RED);
+    tft.setTextSize(1);
+    // Centered within that same gear-clear zone.
+    int16_t bx, by; uint16_t bw, bh;
+    tft.getTextBounds("DEMO MODE", 0, 0, &bx, &by, &bw, &bh);
+    tft.setCursor(GEAR_CLEARANCE + (w - (int)bw) / 2 - bx, y + 3);
+    tft.print("DEMO MODE");
+  }
+}
+
 void uiServiceChrome() {
   uiDrawClock();
   uiDrawBatteryIndicator();
   uiTickToast();
+  uiTickDemoBadge();
 }
 
 // --- numeric keypad ------------------------------------------------------
-// Deliberately NOT folded into keyboard.cpp's uiTextInput(): that grid is
-// all about letter layers + case + punctuation for Wi-Fi passphrases, none
-// of which apply here, and an IP/port field wants far bigger tap targets
-// than the 10-per-row QWERTY. This is its own tiny modal: prompt line, a
-// size-2 field, and a 3-wide grid of 1-9 / . 0 <BKSP> / Cancel OK. Single-
-// fire per tap for every key (backspace included -- IP strings are short,
-// repeat-while-held isn't worth the state). Cancel and a tap in the top-
-// left back-button area both return `initial` unchanged, matching
-// uiTextInput()'s contract so callers can treat the two the same way.
+// Implement a dedicated numeric keypad. The grid uses large tap targets for IP addresses. Each key fires once per tap. Cancellation returns the initial value.
 String uiNumpadInput(const char *prompt, const String &initial) {
-  // 14 cells. Control codes that can never appear in a numeric string
-  // (\b, \n, ESC) share the label slot the way keyboard.cpp does it.
+  // Define 14 keypad cells. Control codes reuse label slots.
   const char C_BKSP = '\b', C_OK = '\n', C_CANCEL = 27;
   struct NKey { Btn b; char c; };
   NKey k[14];

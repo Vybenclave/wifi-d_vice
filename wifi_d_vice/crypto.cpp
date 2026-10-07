@@ -1,4 +1,5 @@
 #include "crypto.h"
+#include "debuglog.h"
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <string.h>
@@ -7,10 +8,8 @@
 static uint8_t sessionKey[32];
 static bool hasKey = false;
 
-// PBKDF2-HMAC-SHA256, dkLen == 32 (exactly one output block), hand-rolled
-// so it can yield a progress % as it runs. Reuses one HMAC context and
-// mbedtls_md_hmac_reset() between rounds -- the SHA256 is HW-accelerated on
-// the ESP32, so this is about as fast as mbedtls' own pbkdf2.
+// PBKDF2-HMAC-SHA256. This derives exactly one 32-byte block. It does not
+// support a longer key. A custom loop reports progress as it runs.
 void cryptoSetPassphraseEx(const String &passphrase, const String &salt,
                            uint32_t iters, void (*progress)(int pct)) {
   if (iters < 1) iters = 1;
@@ -67,13 +66,13 @@ bool cryptoEncryptRecord(const uint8_t *plaintext, size_t len,
   mbedtls_gcm_context ctx;
   mbedtls_gcm_init(&ctx);
   int rc = mbedtls_gcm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, sessionKey, 256);
-  if (rc != 0) { Serial.printf("[crypto] gcm_setkey rc=-0x%04X\n", -rc); mbedtls_gcm_free(&ctx); return false; }
+  if (rc != 0) { DLOG("crypto", "gcm_setkey rc=-0x%04X", -rc); mbedtls_gcm_free(&ctx); return false; }
 
   uint8_t tag[16];
   rc = mbedtls_gcm_crypt_and_tag(&ctx, MBEDTLS_GCM_ENCRYPT, len, nonce, nonceLen,
                                   aad, aadLen, plaintext, out + nonceLen, tagLen, tag);
   mbedtls_gcm_free(&ctx);
-  if (rc != 0) { Serial.printf("[crypto] gcm_crypt_and_tag rc=-0x%04X len=%u aadLen=%u\n", -rc, (unsigned)len, (unsigned)aadLen); return false; }
+  if (rc != 0) { DLOG("crypto", "gcm_crypt_and_tag rc=-0x%04X len=%u aadLen=%u", -rc, (unsigned)len, (unsigned)aadLen); return false; }
 
   memcpy(out, nonce, nonceLen);
   memcpy(out + nonceLen + len, tag, tagLen);
@@ -98,8 +97,8 @@ bool cryptoDecryptRecord(const uint8_t *in, size_t inLen,
   rc = mbedtls_gcm_auth_decrypt(&ctx, ctLen,
                                  in, nonceLen,
                                  aad, aadLen,
-                                 in + nonceLen + ctLen, tagLen,   // tag
-                                 in + nonceLen,                   // ciphertext
+                                 in + nonceLen + ctLen, tagLen,
+                                 in + nonceLen,
                                  out);
   mbedtls_gcm_free(&ctx);
   if (rc != 0) return false;

@@ -34,9 +34,9 @@ learning and for field reconnaissance.
 
 - WiFi scan and connect, plus an access-point direction finder that uses
   a tone that changes with signal strength.
-- WiFi IDS (intrusion detection): one shared promiscuous-mode capture core
-  with four detectors: deauthentication and disassociation flood; beacon
-  flood; authentication and association flood; rogue access point.
+- WiFi IDS (intrusion detection): one shared promiscuous-mode capture
+  core with four detectors -- deauthentication/disassociation flood,
+  beacon flood, authentication/association flood, and rogue access point.
 - Rogue access point and evil twin: learn a known-good baseline of your
   access points to the SD card. Get an alert when a known network name
   comes from an unknown radio, or with weaker security, or on a different
@@ -50,12 +50,12 @@ learning and for field reconnaissance.
   the traffic that the node hears.
 - GPS wardriving, with Log
 - Optional AES-256-GCM encrypted logs. *see engagement section*
-- The GPS module drives the device clock: it retries every 15s from boot until it
-  gets a fix-derived UTC time, then resyncs hourly. Every SD log timestamps
-  rows in that UTC clock; the bottom-bar clock shows it in 12h or 24h
-  format, in the timezone set under System > Display > Timezone (display
-  only, doesn't affect logs), with automatic DST compensation for the
-  zones that observe it.
+- The GPS module drives the device clock. It retries every 15s from boot
+  until it gets a fix-derived UTC time, then resyncs hourly. Every SD log
+  timestamps rows in that UTC clock. The bottom-bar clock shows the time
+  in 12h or 24h format, shifted to the timezone set under System >
+  Display > Timezone, with automatic DST compensation where it applies.
+  This display timezone never changes the logs.
 - Net stats: internet and local-network throughput tests, connection
   information, and a NAT (network address translation) test.
 - Engagement: operator tracking and scan-data protection for authorized
@@ -162,12 +162,12 @@ See [`wifi_d_vice/DESIGN.md`](wifi_d_vice/DESIGN.md) for details.
 This is an enthusiast project, built for fun and as an experiment. I leaned
 on AI coding assistants to explore what a tool of this kind can do on cheap
 hardware, and to learn first-hand where "vibe coding" pays off and where it
-bites back. It moved the UI and detector work along quickly and put a
+bites back. It moved the UI and detector work along quickly. It put a
 working device on the bench sooner than I would have managed alone. It also
 produced a few subtle bugs that only hardware testing exposed, some dead
 ends, and code that needed a cleanup pass for consistency. Take it as a
-learning project first and a field tool second, and read the code before
-you rely on it.
+learning project first and a field tool second. Read the code before you
+rely on it.
 
 ## Credits
 

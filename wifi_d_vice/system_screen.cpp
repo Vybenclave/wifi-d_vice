@@ -1,8 +1,5 @@
-// Device-level settings (setup/maintenance, not detection tools) -- reached
-// from the gear icon, not the feature menu. The top level is grouped:
-// "Display" (orientation, themes, touch recal), "Hardware" (SPI/IRQ pins,
-// GPS test, SD format), then Modules / Beep volume / setup wizard / About
-// flat. Each leaf is its own blocking sub-screen that returns on Back.
+// Place the power icon in the bottom-left corner. This corner stays free on this screen.
+// Users access it frequently.
 #include "system_screen.h"
 #include <SD.h>
 #include <Preferences.h>
@@ -13,12 +10,13 @@
 #include "onboarding.h"
 #include "engstore.h"
 #include "engagement.h"
+#include "power.h"
 #include "ble_2fa.h"
-// #include "demo.h"   // Outrun easter egg -- retired, kept for reference
 #include "splash.h"
 #include "theme.h"
 #include "accent.h"
 #include "tz.h"
+#include "demomode.h"
 #include "devtime.h"
 #include "modvis.h"
 #include "pincfg.h"
@@ -26,48 +24,79 @@
 
 static const char *REPO_URL = "https://github.com/Vybenclave/wifi-d_vice";
 
-// Top-level System menu is grouped: display-feel settings live behind
-// "Display", add-on/hardware maintenance behind "Hardware"; the rest stay
-// flat. The group pages (systemShowDisplayMenu / systemShowHardwareMenu)
-// just nest the existing blocking sub-screens.
 static Btn displayBtn, hwBtn, modsBtn, volBtn, wizardBtn, aboutBtn;
+static Btn mainPrevBtn, mainNextBtn;
+static int mainPage = 0, mainPages = 1;
 static bool sdOk = false;
 
+// Power icon, bottom-left corner -- reached constantly, unlike the other
+// System sub-pages, so it gets the same corner the main menu's gear claims.
+static const int PWR_ICON_R = 10;
+static void powerIconCenter(int &cx, int &cy) { cx = 18; cy = tft.height() - 18; }
+
+static void drawPowerIcon() {
+  int cx, cy; powerIconCenter(cx, cy);
+  const int R = PWR_ICON_R;
+  const int PUCK_R = R + 6;                 // 16 -- unchanged, this is the correct puck size
+  tft.fillCircle(cx, cy, PUCK_R, ILI9341_BLACK);   // opaque puck against the scene bg
+
+  const int RING_R = PUCK_R - 2;            // 14 -- close to the puck edge, 2px black margin
+  const uint16_t glyph = ILI9341_DARKGREY;
+  for (int rr = RING_R - 2; rr <= RING_R; rr++) tft.drawCircle(cx, cy, rr, glyph);
+
+  // Cut a gap at the top. Draw the stem through the gap into the ring.
+  tft.fillRect(cx - 4, cy - RING_R - 1, 8, 6, ILI9341_BLACK);
+  tft.fillRect(cx - 1, cy - RING_R - 1, 3, RING_R - 1, glyph);
+}
+
+static bool touchInPowerIcon(const TouchPoint &t) {
+  int cx, cy; powerIconCenter(cx, cy);
+  int dx = t.x - cx, dy = t.y - cy;
+  int rr = PWR_ICON_R + 8;
+  return dx * dx + dy * dy <= rr * rr;
+}
+
+// Use standard button dimensions. This list uses real pagination when rows exceed screen height.
+// Landscape mode requires this layout. The power icon sits separately.
 static void drawButtons() {
   uiSetBgMode(UI_BG_IMAGE);   // button screen -> scene background
   uiClearBelow(29);
-  int y = 34;
-  const int h = 26, gap = 4;
-  const int w = tft.width() - 16;
-  displayBtn = {8, y, w, h, "Display"};          y += h + gap;
-  hwBtn      = {8, y, w, h, "Hardware"};         y += h + gap;
-  modsBtn    = {8, y, w, h, "Modules"};          y += h + gap;
-  volBtn     = {8, y, w, h, "Beep volume"};      y += h + gap;
-  wizardBtn  = {8, y, w, h, "Run setup wizard"}; y += h + gap;
-  aboutBtn   = {8, y, w, h, "About"};            y += h + gap;
-  uiDrawMenuButton(displayBtn); uiDrawMenuButton(hwBtn);   uiDrawMenuButton(modsBtn);
-  uiDrawMenuButton(volBtn);   uiDrawMenuButton(wizardBtn); uiDrawMenuButton(aboutBtn);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(1);
-  tft.setCursor(8, y + 3);
-  tft.printf("SD: %s   theme: %s", sdOk ? "ok" : "not found", themeName(themeGet()));
+
+  static const char *kLabels[6] = {"Display", "Hardware", "Modules", "Beep volume", "Run setup wizard", "About"};
+  Btn *const kBtns[6] = {&displayBtn, &hwBtn, &modsBtn, &volBtn, &wizardBtn, &aboutBtn};
+
+  // Set bottom margin to 36 pixels. This clears space for the power icon.
+  // The icon extends above the standard status bar margin.
+  const int y0 = 34, rowH = 36, gap = 6, bottomMargin = 36, pagerGap = 6;
+  int itemsPerPage, pages, pagerY;
+  uiPagerLayout(y0, rowH, gap, bottomMargin, pagerGap, 6, 6, 1, itemsPerPage, pages, pagerY);
+  mainPages = pages;
+  if (mainPage >= pages) mainPage = pages - 1;   // an orientation change can shrink the page count
+  if (mainPage < 0) mainPage = 0;
+
+  int base = mainPage * itemsPerPage;
+  int n = min(itemsPerPage, 6 - base);
+  int y = y0;
+  for (int i = 0; i < 6; i++) *kBtns[i] = {0, 0, 0, 0, kLabels[i]};   // off-page buttons never match touch
+  for (int i = 0; i < n; i++) {
+    int idx = base + i;
+    *kBtns[idx] = {8, y, tft.width() - 16, rowH, kLabels[idx]};
+    uiDrawMenuButton(*kBtns[idx]);
+    y += rowH + gap;
+  }
+  uiDrawPager(pagerY, mainPage, pages, mainPrevBtn, mainNextBtn);
+  drawPowerIcon();
 }
 
-// esp_qrcode_generate()'s display_func gets only the finished handle, no
-// user-data pointer -- drawing straight to the shared `tft` from here
-// (rather than stashing the handle for the caller to draw later) is fine
-// since this whole call is synchronous and single-threaded, unlike the BLE
-// pairing screen's cross-task case. `s_qrTop` is the wanted top edge (set
-// by drawAbout); `s_qrBottom` is handed back so drawAbout knows where the
-// centred code ends and the text can start.
+// Draw the QR code directly to the display. The function runs synchronously on one thread.
+// This avoids cross-task conflicts. `s_qrTop` marks the start position. `s_qrBottom` marks the end position.
 static int s_qrTop = 34;
 static int s_qrBottom = 34;
 static int s_qrX = 0, s_qrPx = 0;   // QR bounding box (for the easter-egg hit test)
 
 static void qrDisplay(esp_qrcode_handle_t qrcode) {
   int side = esp_qrcode_get_size(qrcode);
-  // Integer px-per-module only -- uniform, crisp, reliably scannable. For a
-  // github-URL QR (v3/v4, 29-33 modules) scale 3 lands at ~87-99px.
+  // Use integer pixel scaling. This keeps the code crisp and scannable.
   int scale = 100 / side;
   if (scale < 1) scale = 1;
   int px = side * scale;
@@ -118,17 +147,17 @@ static void drawAbout() {
     centerLine(y, ILI9341_WHITE, batl);                              y += 16;
     centerLine(y, ILI9341_YELLOW, "scan the code for source + license");
 
-    // No "done" button -- the top bar's universal back button closes this.
-    // Tapping the QR code shows the splash art (was the Miami Vice demo).
+    // Use the top bar back button to exit. Tap the QR code to show splash art.
     for (;;) {
       TouchPoint t = uiReadTouch();
       uiServiceChrome();
+      if (t.pressed) powerNoteActivity();
+      powerServiceAutoOff();
       if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
       if (t.pressed && t.x >= s_qrX && t.x < s_qrX + s_qrPx &&
           t.y >= s_qrTop && t.y < s_qrTop + s_qrPx) {
         uiWaitForRelease();
         showSplashArt();
-        // demoRun();   // Outrun easter egg -- retired, see demo.cpp
         break;   // fall out to the outer loop -> full redraw
       }
       delay(15);
@@ -144,29 +173,22 @@ void systemEnter() {
     sdBusBegin();
     sdOk = SD.begin(SD_CS, sdSPI);
   }
+  mainPage = 0;
   drawButtons();
 }
 
 void systemLoop() {}
 
-// Live GPS bring-up: shows sentence count, sats, fix, position, HDOP and
-// time off the shared background reader (gps_shared.h) -- it's been
-// running the UART since boot for the GPS time sync, so this just reads
-// its live TinyGPSPlus state instead of opening a second reader on top of
-// it (that would have starved whichever one lost the race for bytes).
-// Back to exit.
+// Read GPS data from the shared background reader. This avoids UART starvation.
+// The reader runs continuously for time sync. Tap the back button to exit.
 static void systemTestGps() {
   uiDrawTopBar("Test GPS");
   uiClearBelow(29);
   TinyGPSPlus &gps = gpsShared();
   uint32_t lastDraw = 0;
 
-  // Diagnostic lines, row-diffed via uiDrawListIfChanged() -- the set shown
-  // varies (lat/lon/alt only once there's a fix, UTC only once GPS time is
-  // valid), so this is the row-list case, not a handful of fixed fields.
-  // function-local `static` so these persist across ticks of this screen's
-  // own blocking loop below, reset once per Enter since this function IS
-  // that screen's whole Enter/Loop/Exit lifecycle.
+  // Use a static array to track previous rows. This persists across loop ticks.
+  // The screen resets it on entry. The row list changes based on GPS state.
   static char prevRow[10][UI_LIST_SIG_LEN];
   static char prevFooter[48];
   memset(prevRow, 0, sizeof(prevRow));
@@ -176,6 +198,8 @@ static void systemTestGps() {
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); break; }
 
     if (millis() - lastDraw > 400) {
@@ -230,36 +254,14 @@ static void systemTestGps() {
   }
 }
 
-// Black or white, whichever reads better on an arbitrary RGB565 fill --
-// so a swatch's label stays legible no matter how bright/dark a future
-// accent color's fill turns out to be, without hand-tuning per color.
-static uint16_t contrastTextFor(uint16_t c) {
-  int r = (c >> 11) & 0x1F, g = (c >> 5) & 0x3F, b = c & 0x1F;
-  int luma = (r * 255 / 31) * 299 + (g * 255 / 63) * 587 + (b * 255 / 31) * 114;
-  return luma / 1000 > 140 ? ILI9341_BLACK : ILI9341_WHITE;
-}
-
-// Swatch-grid picker for the accent color (accent.h) -- each cell IS
-// that color's actual fill, so the name alone doesn't have to explain
-// it. 2 columns, row height pinned close to the app's normal ~30px
-// button-row height (not a big square swatch) rather than stretching to
-// fill the screen. Dropdown-style: tapping a cell selects it and returns
-// immediately, no separate Apply step. Paged with the project's standard
-// pager (uiDrawPager()) -- real prev/next buttons, not a tap gesture.
+// Pick an accent color from a swatch grid. Tapping a cell applies it immediately.
+// Use standard pager buttons for navigation.
 static int pickAccentColor(int current) {
   const int y0 = 34, cols = 2, gap = 8, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
   const int MIN_CELL_H = 32, MAX_CELL_H = 36;
-  // Room is always reserved for the pager row (see uiDrawPager()), and
-  // cellH is fixed from the full row budget (rowsFit) rather than
-  // recomputed per page -- a short last page (fewer items = fewer rows)
-  // just leaves blank space above the pager instead of stretching its
-  // cells taller, so the pager sits in the same place on every page.
-  // hardCap is generous (not MAX_ROWS-style array sizing -- cell[] below is
-  // sized ACCENT_N) since rowsFit itself must stay unclamped by count/page
-  // for that same "pager doesn't move" property. pagerY from the helper
-  // assumes un-stretched MIN_CELL_H rows, so it's not used here -- cellH
-  // gets stretched below to fill the exact budget, and the pager has to
-  // sit snug against THAT, not against the unstretched row height.
+  // Reserve space for the pager row. Calculate cell height from the total budget.
+  // This keeps the pager in a fixed position. Stretch cells to fill the space.
+  // Ignore the helper pager Y value.
   int perPage, pages, unstretchedPagerY;
   int rowsFit = uiPagerLayout(y0, MIN_CELL_H, gap, bottomMargin, pagerGap, ACCENT_N, 999, cols, perPage, pages, unstretchedPagerY);
   int cellH = (tft.height() - bottomMargin - UI_PAGER_H - pagerGap - y0 - gap * (rowsFit - 1)) / rowsFit;
@@ -283,17 +285,13 @@ static int pickAccentColor(int current) {
       int y = y0 + row * (cellH + gap);
       cell[i] = {x, y, cellW, cellH, accentName(id)};
 
-      // Match the ACTIVE theme's own button rendering, not a fixed swatch
-      // look: Vice gets its usual rounded, filled pill (uiDrawButton's
-      // style); Basic gets a plain square outline on black, same as
-      // every other Basic button -- the outline itself is this color, so
-      // it still previews the hue without contradicting Basic's "no
-      // filled buttons" look everywhere else.
+      // Render swatches using the active theme. Vice uses filled rounded buttons.
+      // Basic uses plain square outlines. The outline color previews the selection.
       uint16_t fill = accentFillFor(id);
       if (themeIsVice()) {
         tft.fillRoundRect(x, y, cellW, cellH, 8, fill);
         tft.drawRoundRect(x, y, cellW, cellH, 8, accentEdgeFor(id));
-        tft.setTextColor(contrastTextFor(fill));
+        tft.setTextColor(uiContrastText(fill));
       } else {
         tft.drawRect(x, y, cellW, cellH, fill);
         tft.setTextColor(fill);
@@ -316,6 +314,8 @@ static int pickAccentColor(int current) {
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return current; }
     int base = page * perPage;
     for (int i = 0; i < n; i++)
@@ -326,11 +326,8 @@ static int pickAccentColor(int current) {
   }
 }
 
-// Theme (structural: Basic/Vice, theme.h) and Accent Color (universal
-// color, accent.h) are INDEPENDENT settings -- switching one never
-// touches the other. Each gets its own pull-down row; picking an option
-// applies immediately and closes the dropdown, so there's no separate
-// Apply step or pending-vs-active distinction to track here.
+// Treat theme and accent color as independent settings. Changes apply immediately.
+// No pending state requires tracking.
 static void systemShowThemeColor() {
   Btn themeBtn, accentBtn, listBgBtn;
   auto draw = [&]() {
@@ -341,17 +338,15 @@ static void systemShowThemeColor() {
     snprintf(albl, sizeof(albl), "Accent: %s", accentName(accentGet()));
     themeBtn  = {8, 40, tft.width() - 16, 40, tlbl};
     accentBtn = {8, 88, tft.width() - 16, 40, albl};
-    // Vice-only (uiListBgEnabled() has no effect under Basic, same as the
-    // menu screens' existing scene background); shown either way so the
-    // setting is discoverable and simply does nothing yet under Basic.
+    // Show the list background option in all themes. It only works in Vice mode.
+    // Basic mode ignores it.
     listBgBtn = {8, 136, tft.width() - 16, 40,
                  uiListBgEnabled() ? "List screens: blurred scene bg"
                                    : "List screens: gradient bg"};
     uiDrawButton(themeBtn);
     uiDrawButton(accentBtn);
     uiDrawButton(listBgBtn);
-    // A live swatch of the current accent next to its row, in the active
-    // theme's own style (see pickAccentColor()'s swatches for why).
+    // Draw a live swatch next to the accent row. Match the active theme style.
     int sw = 24;
     int sx = accentBtn.x + accentBtn.w - sw - 10, sy = accentBtn.y + (accentBtn.h - sw) / 2;
     if (themeIsVice()) {
@@ -366,6 +361,8 @@ static void systemShowThemeColor() {
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
     if (uiTouchInButton(t, themeBtn)) {
       uiWaitForRelease();
@@ -391,25 +388,15 @@ static void systemShowThemeColor() {
   }
 }
 
-// Display-only UTC offset + 12h/24h format + auto-DST for the bottom-bar
-// clock (tz.h) -- never touches devtime.h or any SD log, which always stay
-// UTC. Paged since the offset list is too long for one page on this
-// display; ROWS is computed from the screen height (not a fixed constant)
-// so this doesn't overrun the Apply button in landscape's shorter 240px
-// height.
+// Adjust only the display clock. System logs stay in UTC.
+// Compute row count from screen height. This prevents layout overlap in landscape mode.
 static void systemShowTimezone() {
   const int y0 = 34, rowH = 22, gap = 3;
-  // BOTTOM_MARGIN clears the full status bar -- see the comment on
-  // pickAccentColor()'s copy of this same constant.
+  // Clear the full status bar at the bottom. Pin toggle buttons from the screen bottom.
+  // This keeps them in a fixed position. Ignore the helper pager Y value.
+  // Recompute page count locally.
   const int TOGGLE_H = 28, APPLY_H = 34, STACK_GAP = 6, BOTTOM_MARGIN = UI_STATUSBAR_H + 4;
   const int MAX_ROWS = 10;
-  // Two toggle rows now (12h/24h and Auto DST) between the pager and Apply.
-  // stackTop is pinned from the screen bottom (fixed regardless of row
-  // count, so the toggles/Apply never move) and used directly as pagerY
-  // below -- NOT uiPagerLayout()'s own pagerY out-param (that assumes the
-  // pager sits snug against the row stack, not a fixed-from-the-bottom
-  // position), so only its return value (the row capacity) is used here;
-  // `pages` is recomputed locally from ROWS below, as it already was.
   int stackTop = tft.height() - BOTTOM_MARGIN - APPLY_H - STACK_GAP
                  - TOGGLE_H - STACK_GAP - TOGGLE_H - STACK_GAP - UI_PAGER_H;
   int ignoredItemsPerPage, ignoredPages, ignoredPagerY;
@@ -466,6 +453,8 @@ static void systemShowTimezone() {
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
     if (t.pressed && uiTouchInButton(t, applyBtn)) {
       uiWaitForRelease();
@@ -520,10 +509,6 @@ void systemShowRotationPicker() {
   for (int i = 0; i < 4; i++) {
     int col = i % 2, row = i / 2;
     cells[i] = {4 + col * cw, 20 + row * ch, cw - 4, ch - 4, kLabels[i]};
-    // Border only, NOT uiDrawButton() -- that also prints its own
-    // unrotated white label, which was landing right on top of the
-    // rotated cyan one drawn just below and looked like corrupted
-    // double-exposed text (confirmed report, not a photo artifact).
     tft.drawRect(cells[i].x, cells[i].y, cells[i].w, cells[i].h, ILI9341_WHITE);
     uiDrawRotatedText(cells[i].x + cells[i].w / 2, cells[i].y + cells[i].h / 2,
                        kLabels[i], i, 2, accentLabel());
@@ -532,6 +517,8 @@ void systemShowRotationPicker() {
   while (true) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (!t.pressed) { delay(15); continue; }
     for (int i = 0; i < 4; i++) {
       if (uiTouchInButton(t, cells[i])) {
@@ -559,15 +546,16 @@ void systemShowVolumePicker() {
     uiDrawMenuButton(plusBtn);
     uiDrawMenuButton(testBtn);
   };
-  // Hold the DAC channel open for the whole page. This screen fires rapid
-  // one-off beeps; letting each beep() enable+disable the continuous channel
-  // latches the DMA after a few cycles (sound cuts out until reboot / reset).
+  // Keep the DAC channel open during this screen. Rapid beep calls latch the DMA.
+  // This prevents audio cutoff until reboot.
   beepHold(true);
   draw();
 
   while (true) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (!t.pressed) { delay(15); continue; }
     if (uiTouchInBackButton(t)) { uiWaitForRelease(); beepHold(false); return; }
     if (uiTouchInButton(t, minusBtn)) {
@@ -587,11 +575,7 @@ void systemShowVolumePicker() {
   }
 }
 
-// Recursive wipe -- this is NOT a low-level FAT reformat (the bundled SD
-// library doesn't expose one), it's a full delete of everything on the
-// card. Framed to the user as "format" since that's the effect that
-// matters, but worth being precise about in code: the filesystem
-// structure itself is untouched, just its contents.
+// Delete all files recursively. This mimics a format without touching the filesystem structure.
 static void wipeDir(const String &path) {
   File dir = SD.open(path);
   if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
@@ -614,9 +598,8 @@ static void doFormat() {
   tft.setCursor(10, 100);
   tft.print("Erasing SD card...");
   wipeDir("/");
-  // The card wipe is also the "clear everything" gesture: forget saved
-  // Wi-Fi profiles + the engagement marker (both lived under /eng/, now
-  // gone), drop the BLE bond, and zero any loaded key.
+  // Clear all saved data after wiping the card. This removes Wi-Fi profiles,
+  // engagement markers, BLE bonds, and loaded keys.
   engStoreClear();
   engagementResetAll();
   ble2faBegin();
@@ -627,9 +610,7 @@ static void doFormat() {
   delay(600);
 }
 
-// Typing the word, not just tapping a button -- a tap-only "ERASE
-// EVERYTHING" confirm button is exactly the kind of thing a misclick could
-// hit by accident on a touchscreen.
+// Require typing to confirm deletion. This prevents accidental taps on the touchscreen.
 static bool confirmFormat() {
   uiClearBelow(0);
   tft.setTextColor(ILI9341_RED);
@@ -644,8 +625,7 @@ static bool confirmFormat() {
   tft.print("folder on the SD card. This");
   tft.setCursor(10, 132);
   tft.print("cannot be undone.");
-  // cancelBtn's bottom edge must clear UI_STATUSBAR_H (+ a small gap) --
-  // it used to sit at height-44 (bottom = height-8), inside the status bar.
+  // Position the cancel button below the status bar. Add a small gap for clarity.
   const int cancelY = tft.height() - UI_STATUSBAR_H - 4 - 36;
   Btn confirmBtn = {10, cancelY - 8 - 36, tft.width() - 20, 36, "type ERASE to confirm"};
   Btn cancelBtn = {10, cancelY, tft.width() - 20, 36, "cancel"};
@@ -654,6 +634,8 @@ static bool confirmFormat() {
   while (true) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (!t.pressed) { delay(15); continue; }
     if (uiTouchInButton(t, confirmBtn)) {
       uiWaitForRelease();
@@ -664,12 +646,8 @@ static bool confirmFormat() {
   }
 }
 
-// Per-module show/hide. Hidden modules drop out of their WiFi/BLE/Privacy
-// submenu; an emptied category hides its top-level button too. Paged with
-// the project's standard pager (uiDrawPager() via uiPagerLayout()) -- at
-// MOD_N=17 modules and a 25px row pitch, more than fit on a 240px-tall
-// screen used to just draw off the bottom of the screen, unreachable by
-// touch.
+// Hide modules from their submenus. Use standard pagination.
+// This prevents rows from drawing off the screen.
 static void systemShowModules() {
   const int y0 = 38, rowH = 22, gap = 3, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
   const int MAX_ROWS = 10;
@@ -705,6 +683,8 @@ static void systemShowModules() {
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
     if (t.pressed && uiTouchInButton(t, prevBtn) && page > 0) {
       uiWaitForRelease(); page--; drawPage(); continue;
@@ -724,9 +704,8 @@ static void systemShowModules() {
   }
 }
 
-// Which add-on radios are installed + the SPI/IRQ GPIOs they use. A pin row
-// is dimmed when its radio is not selected. Everything persists in NVS and
-// takes effect on the next boot; holding BOOT at power-on wipes it.
+// Configure add-on radio pins. Dim rows for unselected radios.
+// Settings save to NVS. Changes apply on reboot. Hold BOOT to reset.
 static void systemShowPins() {
   Btn cc1101Box, r24Btn[3], setBtn[PIN_N], resetBtn;
   static const char *R24[3] = { "none", "nRF24", "CC2500" };
@@ -800,6 +779,8 @@ static void systemShowPins() {
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (!t.pressed) { delay(15); continue; }
     if (uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
 
@@ -835,37 +816,52 @@ static void systemShowPins() {
   }
 }
 
-// A grouped System sub-page: a short vertical list, each row runs one of
-// the existing blocking sub-screens and comes back. Modelled on
-// systemShowModules().
+// Group sub-screens in a paginated list. Use standard row dimensions.
+// Pagination replaces the old fixed array.
 // label_fn (optional) overrides `label` at draw time -- used for toggle
 // rows so the button text tracks the setting after run() flips it.
 struct SysItem { const char *label; void (*run)(); const char *(*label_fn)(); };
 
 static void systemSubPage(const char *title, const SysItem *items, int n) {
-  Btn rows[6];
+  const int y0 = 38, rowH = 36, gap = 6, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
+  const int MAX_ROWS = 10;
+  int itemsPerPage, pages, pagerY;
+  uiPagerLayout(y0, rowH, gap, bottomMargin, pagerGap, n, MAX_ROWS, 1, itemsPerPage, pages, pagerY);
+
+  Btn rows[MAX_ROWS], prevBtn, nextBtn;
+  int page = 0;
+  int shown = 0;   // rows actually drawn on the current page -- read back in the touch loop below
+
   auto draw = [&]() {
     uiDrawTopBar(title);
     uiSetBgMode(UI_BG_IMAGE);   // button screen -> scene background
     uiClearBelow(29);
-    int y = 38;
-    const int h = 30, gap = 4;
-    for (int i = 0; i < n; i++) {
-      rows[i] = {8, y, tft.width() - 16, h,
-                 items[i].label_fn ? items[i].label_fn() : items[i].label};
+    int base = page * itemsPerPage;
+    shown = min(itemsPerPage, n - base);
+    int y = y0;
+    for (int i = 0; i < shown; i++) {
+      int idx = base + i;
+      rows[i] = {8, y, tft.width() - 16, rowH,
+                 items[idx].label_fn ? items[idx].label_fn() : items[idx].label};
       uiDrawMenuButton(rows[i]);
-      y += h + gap;
+      y += rowH + gap;
     }
+    uiDrawPager(pagerY, page, pages, prevBtn, nextBtn);
   };
   draw();
   for (;;) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
-    for (int i = 0; i < n; i++) {
-      if (t.pressed && uiTouchInButton(t, rows[i])) {
+    if (uiTouchInButton(t, prevBtn) && page > 0) { uiWaitForRelease(); page--; draw(); continue; }
+    if (uiTouchInButton(t, nextBtn) && page < pages - 1) { uiWaitForRelease(); page++; draw(); continue; }
+    int base = page * itemsPerPage;
+    for (int i = 0; i < shown; i++) {
+      if (uiTouchInButton(t, rows[i])) {
         uiWaitForRelease();
-        items[i].run();
+        items[base + i].run();
         draw();
       }
     }
@@ -881,18 +877,18 @@ static const char *splashLbl()  { return splashEnabled() ? "Boot splash (on)"
 
 static void systemShowDisplayMenu() {
   static const SysItem items[] = {
-    {"Screen orientation", systemShowRotationPicker, nullptr},
-    {"Theme & Color",      systemShowThemeColor,     nullptr},
-    {"Timezone",           systemShowTimezone,       nullptr},
-    {"Recalibrate touch",  uiRunCalibration,         nullptr},
-    {nullptr,              sysToggleSplash,          splashLbl},
+    {"Screen orientation", systemShowRotationPicker,          nullptr},
+    {"Theme & Color",      systemShowThemeColor,              nullptr},
+    {"Timezone",           systemShowTimezone,                nullptr},
+    {"Recalibrate touch",  uiRunCalibration,                  nullptr},
+    {nullptr,              sysToggleSplash,                   splashLbl},
+    {"Display Timeout",    powerShowDisplayTimeoutSettings,   nullptr},
   };
-  systemSubPage("Display", items, 5);
+  systemSubPage("Display", items, 6);
 }
 
-// V_bat calibration. The reading is raw_ADC * BAT_DIV * factor; this page
-// tunes `factor`. "Set from meter": type the pack voltage read on a
-// multimeter and factor becomes measured/raw. Or nudge it by hand.
+// Calibrate battery voltage. Adjust the scaling factor.
+// Type a multimeter reading to set it. Or nudge it manually.
 static void systemShowBatteryCal() {
   Btn minusBtn = {8, 92, 70, 34, "-"};
   Btn plusBtn  = {tft.width() - 78, 92, 70, 34, "+"};
@@ -926,6 +922,8 @@ static void systemShowBatteryCal() {
   while (true) {
     TouchPoint t = uiReadTouch();
     uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (!t.pressed) {
       if (millis() - lastLive > 800) { drawLive(); lastLive = millis(); }
       delay(15);
@@ -951,17 +949,100 @@ static void systemShowBatteryCal() {
   }
 }
 
+// Show static SD card space. Values do not change while this screen is open.
+static void systemShowSdInfo() {
+  uiDrawTopBar("SD Card");
+  uiClearBelow(29);
+  sdBusBegin();
+  bool ok = SD.begin(SD_CS, sdSPI);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  if (ok) {
+    // Use filesystem-level byte counts. This keeps the free space calculation consistent.
+    uint64_t total = SD.totalBytes();
+    uint64_t used  = SD.usedBytes();
+    uint64_t freeB = total - used;
+    tft.setCursor(6, 40);  tft.printf("Total: %.1f MB", total / 1048576.0);
+    tft.setCursor(6, 56);  tft.printf("Used:  %.1f MB", used / 1048576.0);
+    tft.setCursor(6, 72);  tft.printf("Free:  %.1f MB", freeB / 1048576.0);
+  } else {
+    tft.setCursor(6, 40);  tft.print("SD card not found");
+  }
+
+  while (true) {
+    TouchPoint t = uiReadTouch();
+    uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
+    if (!t.pressed) { delay(15); continue; }
+    if (uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
+  }
+}
+
+static void systemShowDemoMode() {
+  uiDrawTopBar("Demo Mode");
+  uiClearBelow(29);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(6, 38);  tft.print("Every detector screen injects");
+  tft.setCursor(6, 54);  tft.print("fake sample hits on a timer");
+  tft.setCursor(6, 70);  tft.print("instead of scanning real WiFi/");
+  tft.setCursor(6, 86);  tft.print("BLE -- for demos/testing without");
+  tft.setCursor(6, 102); tft.print("needing real activity nearby.");
+
+  Btn toggle = {8, 136, tft.width() - 16, 34, ""};
+  auto drawToggle = [&]() {
+    toggle.label = demoModeEnabled() ? "Demo Mode: ON" : "Demo Mode: OFF";
+    uiDrawButtonColored(toggle, demoModeEnabled() ? ILI9341_GREEN : ILI9341_DARKGREY);
+  };
+  drawToggle();
+
+  while (true) {
+    TouchPoint t = uiReadTouch();
+    uiServiceChrome();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
+    if (!t.pressed) { delay(15); continue; }
+    if (uiTouchInBackButton(t)) { uiWaitForRelease(); return; }
+    if (uiTouchInButton(t, toggle)) {
+      uiWaitForRelease();
+      demoModeSetEnabled(!demoModeEnabled());
+      drawToggle();
+    }
+  }
+}
+
 static void systemShowHardwareMenu() {
   static const SysItem items[] = {
     {"SPI / IRQ pins", systemShowPins},
     {"Battery Info",   systemShowBatteryCal},
     {"Test GPS",       systemTestGps},
     {"Format SD card", sysFormat},
+    {"SD Card",        systemShowSdInfo},
+    {"Demo Mode",      systemShowDemoMode},
   };
-  systemSubPage("Hardware", items, 4);
+  systemSubPage("Hardware", items, 6);
 }
 
 void systemTouch(const TouchPoint &t) {
+  // Check the power icon first. It uses a circular hit test.
+  // The popup draws over the current screen. Redraw clears the popup pixels.
+  if (t.isNewPress && touchInPowerIcon(t)) {
+    // Wait for finger release before opening the menu. This prevents the popup
+    // from reading the lingering touch as a dismiss command.
+    uiWaitForRelease();
+    powerShowMenu();
+    uiDrawTopBar("System");
+    drawButtons();
+    uiWaitForRelease();
+    return;
+  }
+  if (uiTouchInButton(t, mainPrevBtn) && mainPage > 0) {
+    uiWaitForRelease(); mainPage--; drawButtons(); return;
+  }
+  if (uiTouchInButton(t, mainNextBtn) && mainPage < mainPages - 1) {
+    uiWaitForRelease(); mainPage++; drawButtons(); return;
+  }
   static const struct { Btn *b; void (*run)(); } route[] = {
     {&displayBtn, systemShowDisplayMenu},
     {&hwBtn,      systemShowHardwareMenu},

@@ -1,44 +1,24 @@
-// WIFI D_VICE -- passive WiFi / BLE / sub-GHz
-// detection toolkit for the 2.8" ESP32 CYD. See README.md for the build,
-// the global rules the code leans on (radio coexistence, single-screen
-// ownership, UI conventions), and ~/.claude/skills/esp32-cyd + pins.h for
-// the board / addon wiring.
+// WIFI D_VICE -- a passive WiFi / BLE / sub-GHz detection toolkit for the
+// 2.8" ESP32 CYD. See README.md for the build steps and the global rules
+// (radio coexistence, single-screen ownership, UI conventions) the code
+// leans on, and pins.h for the board/addon wiring.
 //
-// Features: WiFi + BLE scanning, a WiFi IDS (deauth/disassoc, beacon-flood,
-// auth/assoc-flood, Pwnagotchi and a baseline-free evil-twin score on one
-// shared promiscuous core), rogue-AP / evil-twin detection against an SD
-// baseline, a WiFi-scan RSSI direction finder, Flock Safety camera
-// detection, BLE tracker detection (incl. Google FMDN), Bluetooth skimmer
-// detection, Flipper Zero / Meta-glasses tagging in the BLE scan, a CC1101
-// SubGHz screen (sweep / frequency analyzer / GDO0-gated raw OOK capture to
-// .sub), a Meshtastic mesh monitor, GPS-tagged wardriving, and a Recon
-// category: probe-request watch, client/station map, WiFi camera-OUI
-// detector, drone Remote ID (WiFi+BLE), and a BLE advertisement-spam watch.
-// Analysis of received traffic -- no attack traffic is generated here (see
-// DESIGN.md). NFC/RFID detection (PN532) was tried and dropped -- low value
-// on its own, and covered better by a dedicated Chameleon-style tool over
-// BLE.
+// This firmware only analyzes received traffic. It never transmits attack
+// traffic (see DESIGN.md).
 //
-// The Engagement Page (client/tester/passphrase, gated by native BLE
-// Secure Connections passkey pairing + bonding as a second factor -- see
-// ble_2fa.h) is arming infrastructure for whenever an active/offensive
-// module gets added later with real engagement details; right now nothing
-// in this build is offensive, so arming's only concrete effect today is
-// switching gps_wardrive's SD logs from plaintext CSV to AES-256-GCM-
-// encrypted records keyed from the passphrase. The same BLE connection also
-// syncs wall-clock time from the phone/laptop via the standard Current Time
-// Service (devtime.h) -- most OSes push this automatically, no extra step.
-// The GPS module (gps_shared.h) is a second, WiFi/BLE-independent time
-// source: it retries every 15s from boot until it gets a fix-derived UTC
-// time, then resyncs hourly to correct drift. Every SD log timestamps rows
-// in that same UTC clock (devTimeNowString()) regardless of which source
-// set it; the bottom-bar clock shows it shifted by System > Display >
-// Timezone, a display-only preference (tz.h) that never touches the logs.
+// The Engagement page (client/tester/passphrase, armed by a BLE Secure
+// Connections pairing as the second factor -- ble_2fa.h) is arming
+// infrastructure for a future active module; today its only effect is
+// switching gps_wardrive's SD logs to AES-256-GCM encryption keyed from
+// the passphrase. The same BLE link also syncs wall-clock time from the
+// phone/laptop (devtime.h). The GPS module (gps_shared.h) is a second,
+// independent time source that resyncs hourly once it has a fix. Every SD
+// log timestamps in that UTC clock regardless of source; the bottom-bar
+// clock applies a display-only timezone offset (tz.h) that never touches
+// the logs.
 //
-// Everything here is unverified on physical hardware -- see pins.h and the
-// esp32-cyd skill for the sourcing/caveats on the base pin map, and treat
-// the addon (CC1101/GPS) wiring, and the BLE pairing-prompt behavior on
-// your actual phone/laptop OS, as first-power-on territory.
+// Add-on radio wiring (CC1101/GPS) and BLE pairing-prompt behavior vary by
+// phone/laptop OS -- verify both on your own hardware.
 
 #include <WiFi.h>
 #include <nvs.h>
@@ -46,6 +26,7 @@
 #include "ui.h"
 #include "screens.h"
 #include "system_screen.h"
+#include "power.h"
 #include "onboarding.h"
 #include "devtime.h"
 #include "tz.h"
@@ -56,17 +37,17 @@
 #include "engstore.h"
 #include "theme.h"
 #include "accent.h"
+#include "demomode.h"
 #include "splash.h"
 #include "modvis.h"
 #include "pincfg.h"
 #include "wifiauto.h"
 
-// Two-level menu: the top level has Engagement and Meshtastic as standalone
-// items, plus two categories (WiFi, Privacy) that open a submenu of their
-// own items. System settings are reached from the gear icon in the menu's
-// bottom-left corner, not a menu button. "Privacy" is the short label for
-// "detecting surveillance aimed at you" -- Flock / Tracker / Skimmer / BLE
-// scan / SubGHz are about spotting that, not opsec in general.
+// Two-level menu: Engagement and Meshtastic are standalone top items;
+// WiFi, Privacy, and Recon are categories that open a submenu. System
+// settings sit behind the gear icon, not a menu button. "Privacy" means
+// detecting surveillance aimed at you (Flock/Tracker/Skimmer/BLE/SubGHz),
+// not general opsec.
 enum Screen {
   MENU,
   SUB_WIFI, SUB_CS, SUB_RECON,
@@ -153,9 +134,8 @@ static bool topItemVisible(const TopItem &it) {
   return catHasVisibleChild(it.target);               // category container
 }
 
-// Which screen the back button goes to from any given screen -- leaf
-// screens go up to their category's submenu; submenus and the standalone
-// top-level items (Engagement, Meshtastic) go to the root menu.
+// Leaf screens back up to their category's submenu; submenus and the
+// standalone top items (Engagement, Meshtastic) back up to the root menu.
 static Screen parentOf(Screen s) {
   switch (s) {
     case WIFI_SCAN: case NET_STATS: case WIFI_IDS: case ROGUE_AP: case GPS_WARDRIVE: return SUB_WIFI;
@@ -165,9 +145,8 @@ static Screen parentOf(Screen s) {
   }
 }
 
-// A feature that needs an add-on radio is greyed out (not hidden) in the
-// menu until that radio is marked installed in System > Hardware > SPI/IRQ
-// pins. Deselecting a radio there dims every screen that depends on it.
+// A feature needing an add-on radio is greyed out, not hidden, until that
+// radio is marked installed in System > Hardware > SPI/IRQ pins.
 static bool itemAvailable(Screen s) {
   switch (s) {
     case SUBGHZ: return pincfgCC1101();
@@ -175,9 +154,7 @@ static bool itemAvailable(Screen s) {
   }
 }
 
-// Gear icon in the menu's bottom-left corner -- opens System settings.
-// Replaces the old "System" menu button so the top level is just the
-// functional items.
+// Gear icon, bottom-left corner -- opens System settings.
 static const int GEAR_R = 10;
 static void gearCenter(int &cx, int &cy) { cx = 18; cy = tft.height() - 18; }
 
@@ -216,12 +193,9 @@ void drawMenu() {
   tft.print("v0.9");
   tft.setTextSize(2);
 
-  // One column when the display is taller than wide (0/180 orientations),
-  // two when it's wider than tall (90/270). Buttons are then spread to fill
-  // the space between the title and the gear row with equal gaps, rather
-  // than a fixed row height that leaves dead space in one orientation.
-  // Only the visible top items get laid out; hidden ones (and empty
-  // categories) get a zeroed rect so the touch handler never matches them.
+  // One column in portrait, two in landscape. Buttons spread to fill the
+  // space between the title and the gear row with equal gaps. Hidden
+  // items get a zeroed rect so the touch handler never matches them.
   int vis[kTopCount], nvis = 0;
   for (int i = 0; i < kTopCount; i++) {
     if (topItemVisible(kTop[i])) vis[nvis++] = i;
@@ -284,6 +258,7 @@ void drawSubMenu(Screen sub) {
 }
 
 void exitScreen(Screen s) {
+  DLOG("heap", "exitScreen(%d) enter: free=%u", (int)s, (unsigned)ESP.getFreeHeap());
   uiClearToast();   // stop any ticker this screen left running -- see ui.h
   switch (s) {
     case WIFI_SCAN:     wifiScanExit(); break;
@@ -306,11 +281,12 @@ void exitScreen(Screen s) {
     case SYSTEM:        systemExit();     break;
     default: break;   // submenus have no exit handler
   }
+  DLOG("heap", "exitScreen(%d) done:  free=%u", (int)s, (unsigned)ESP.getFreeHeap());
 }
 
-// Screens that switch the 2.4 GHz radio into a mode incompatible with an
-// active WiFi STA link (BLE stack up, or promiscuous sniffer). Entering one
-// while connected silently drops the link / any running transfer -- so ask.
+// These screens switch the 2.4 GHz radio into a mode incompatible with an
+// active WiFi link (BLE up, or a promiscuous sniffer). Ask before entering
+// one while connected, since it silently drops the link.
 static bool screenDropsWifi(Screen s) {
   switch (s) {
     case BLE_SCAN: case TRACKER: case FLOCK: case SKIMMER:
@@ -349,6 +325,7 @@ static bool confirmRadioSwitch(Screen target) {
 
 void enterScreen(Screen s) {
   currentScreen = s;
+  DLOG("heap", "enterScreen(%d) start: free=%u", (int)s, (unsigned)ESP.getFreeHeap());
   switch (s) {
     case SUB_WIFI: case SUB_CS: case SUB_RECON: drawSubMenu(s); return;
     case WIFI_SCAN:     wifiScanEnter(); break;
@@ -371,6 +348,7 @@ void enterScreen(Screen s) {
     case SYSTEM:        systemEnter();    break;
     default: break;
   }
+  DLOG("heap", "enterScreen(%d) done:  free=%u", (int)s, (unsigned)ESP.getFreeHeap());
 }
 
 void setup() {
@@ -378,18 +356,16 @@ void setup() {
   delay(200);
   Serial.println("\n=== WIFI D_VICE boot ===");
 
-  // This build is BLE-only -- never Classic BT. Release the Classic-BT
-  // controller's DRAM up front (~28 KB, permanent). Must happen before any
-  // BT/BLE init. Matters because Flock scans WiFi + BLE co-resident and the
-  // WROOM-32's DRAM is tight.
+  // This build is BLE-only, never Classic BT. Release the Classic-BT
+  // controller's DRAM (~28 KB, permanent) before any BT/BLE init -- the
+  // WROOM-32's DRAM is tight, and Flock detect needs WiFi and BLE
+  // co-resident.
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   Serial.printf("boot free heap %u\n", (unsigned)ESP.getFreeHeap());
 
-  // BEFORE any WiFi call: wipe the esp_wifi NVS namespace. An earlier
-  // build's SoftAP session left a config there that makes esp_wifi_start()
-  // bring up hostap and panic (ieee80211_hostap_attach, null deref). This
-  // project never relies on the radio remembering anything across a
-  // reboot, so clearing it every boot is safe and self-healing.
+  // Wipe the esp_wifi NVS namespace before any WiFi call. A stale SoftAP
+  // config there makes esp_wifi_start() panic on a null deref. The radio
+  // never needs to remember anything across a reboot.
   {
     nvs_handle_t h;
     if (nvs_open("nvs.net80211", NVS_READWRITE, &h) == ESP_OK) {
@@ -401,8 +377,8 @@ void setup() {
   WiFi.persistent(false);
 
   // Pin overrides must load before uiInit() wires the touch IRQ. Holding
-  // BOOT while powering on wipes them -- the escape hatch if a bad pin
-  // number left touch dead.
+  // BOOT at power-on wipes them -- the escape hatch if a bad pin number
+  // left touch dead.
   pinMode(BOOT_KEY, INPUT_PULLUP);
   pincfgLoad();
   if (digitalRead(BOOT_KEY) == LOW) {
@@ -413,51 +389,43 @@ void setup() {
   uiInit();
   themeLoad();
   accentLoad();
+  powerDisplayTimeoutLoad();
+  demoModeLoad();
   tzLoad();
   modvisLoad();
   engStoreBegin();
   engagementBootUnlock();      // no-op unless the SD card marks an engagement active
   bootWifiPending = wifiAutoConnectOnBoot();   // non-blocking; link comes up during the splash
   // GPS is receive-only on its own UART (GPS_RX, see pins.h) -- safe to
-  // open at boot and leave running the whole session. gpsSharedLoop() (see
-  // loop() below) drains it continuously and drives the GPS time sync
-  // (every 15s until the clock is set, then hourly) regardless of which
-  // screen is up; the Wardrive screen and the Hardware > Test GPS page
-  // both just read the same live fix instead of opening their own UART.
+  // open at boot and leave running all session. gpsSharedLoop() (see
+  // loop() below) drains it and drives the time sync regardless of which
+  // screen is up; other screens just read the same live fix.
   gpsSharedBegin();
   meshAlertLoad();            // load the alert-channel/code/armed state before the check below reads it
-  // A "<code> ids on" Meshtastic alert-channel command arms this (see
-  // meshtastic_mon.cpp) and it's persisted, so a reboot (remote "<code>
-  // reboot" included) needs to restore the held wifiIdsBegin() ref here --
-  // same reasoning as gpsSharedBegin() above, just conditional.
+  // A remote "<code> ids on" command arms this and persists it, so a
+  // reboot (including a remote "<code> reboot") must restore it here too.
   if (meshIdsArmed()) wifiIdsBegin();
   showSplash(2600);           // WIFI D_VICE splash, tap to skip
   onboardingRunIfNeeded();
   drawMenu();
 }
 
-// Armed indicator: a brief 50ms blip every 3000ms (period 3050ms) rather
-// than a solid light. Skipped on the detection screens that drive
-// LED_STATUS themselves for alerts -- they call ledSet(false) on exit, so
-// the blip resumes automatically.
+// Status LED heartbeat: a 50ms blip every 3050ms. Armed adds a second
+// 50ms blip 50ms after the first, so armed reads as a double-blip at a
+// glance. The early return for WIFI_IDS/FLOCK/SKIMMER is belt-and-
+// suspenders -- ledBusyTask() (ui.cpp) already ranks ledAlert() above the
+// heartbeat regardless.
 static void serviceArmedLed() {
-  static bool wasArmed = false;
-  bool armed = engagementIsArmed();
   bool ledScreen = (currentScreen == WIFI_IDS || currentScreen == FLOCK || currentScreen == SKIMMER);
-  if (!armed || ledScreen) {
-    if (wasArmed && !ledScreen) ledSet(false);   // just disarmed: make sure it's off
-    wasArmed = armed;
-    return;
-  }
-  wasArmed = true;
-  ledSet((millis() % 3050) < 50);
+  if (ledScreen) return;
+
+  uint32_t t = millis() % 3050;
+  bool on = (t < 50) || (engagementIsArmed() && t >= 100 && t < 150);
+  ledHeartbeat(on);
 }
 
 // Hold BOOT for 1.5s from anywhere to force recalibration -- a physical
-// escape hatch that doesn't depend on touch already working, since touch
-// being badly miscalibrated is exactly the situation this needs to recover
-// from (e.g. right after rotating to an orientation with no calibration
-// data of its own).
+// escape hatch that doesn't depend on touch already working.
 static uint32_t bootHeldSince = 0;
 static bool bootHoldFired = false;
 static const uint32_t BOOT_HOLD_MS = 1500;
@@ -484,37 +452,34 @@ void loop() {
   }
   devTimePoll();           // promote to synced once an SNTP reply lands
   gpsSharedLoop();         // drain the GPS UART + run its own 15s/1hr time-sync schedule
-  // Background WiFi IDS raw capture, armed by a Meshtastic "<code> ids on"
-  // command (meshIdsArmed()) independent of whatever screen is up -- the
-  // WIFI_IDS guard skips this when that screen is itself open and already
-  // draining the same ring every frame via its own widsLoop() call, so the
-  // two never double-pump. This is raw capture only (wifi_ids.cpp's
-  // promiscuous sniffer + ring); the deauth/beacon/karma/etc. detectors
-  // and alerting still live entirely in wifi_ids_screen.cpp, so they only
-  // run while that screen is the one on screen -- same as today.
+  // Background WiFi IDS raw capture, armed by a remote "<code> ids on"
+  // command, independent of whatever screen is up. Skip it when the
+  // WIFI_IDS screen is itself open and already draining the same ring,
+  // so the two never double-pump. This only runs the raw capture; the
+  // detectors and alerting still live in wifi_ids_screen.cpp and only run
+  // while that screen is active.
   if (meshIdsArmed() && currentScreen != WIFI_IDS) wifiIdsLoop();
-  serviceArmedLed();       // 250ms/1250ms pulse while an engagement is armed
+  serviceArmedLed();       // red heartbeat, always; doubles up when armed
 
-  // Blue "working" heartbeat on the continuously-scanning screens. The
-  // async jobs (WiFi list scan/connect, speed test, network-info query)
-  // drive ledBusy() themselves for "waiting for results"; this OR's in the
-  // screens that scan the entire time they're open.
+  // Blue "working" heartbeat for screens that scan the entire time
+  // they're open. Async jobs (list scan/connect, speed test) drive
+  // ledBusy() themselves for "waiting for results" instead.
   ledBusyScreen(currentScreen == FLOCK || currentScreen == SKIMMER ||
                 currentScreen == SUBGHZ || currentScreen == TRACKER ||
                 currentScreen == BLE_SCAN || currentScreen == GPS_WARDRIVE ||
                 currentScreen == PROBE_WATCH || currentScreen == CLIENT_MAP ||
                 currentScreen == CAMERA_DET || currentScreen == DRONE_DET ||
-                currentScreen == BLE_SPAM);
-  uiServiceChrome();       // bottom-right clock + battery glyph + the toast ticker's
-                           // next scroll step, every screen (note: doesn't
-                           // appear during modal sub-loops like the
-                           // keyboard, calibration, or BLE pairing wait -- those
-                           // don't return to this loop() until they finish)
+                currentScreen == BLE_SPAM || currentScreen == WIFI_IDS);
+  uiServiceChrome();       // clock/battery glyph + toast ticker -- doesn't run during
+                           // a screen's own modal sub-loop (keyboard, calibration,
+                           // BLE pairing wait), since those don't return here until done
   TouchPoint t = uiReadTouch();
+  if (t.pressed) powerNoteActivity();
+  powerServiceAutoOff();   // same modal-sub-loop blind spot as uiServiceChrome() above
 
-  // Back button: a quick tap steps up one level (per-screen HandleBack
-  // consulted first); holding it ~600ms jumps straight to the home menu.
-  // The action is deferred to release so tap vs hold can be told apart.
+  // Back button: a quick tap steps up one level; holding it ~600ms jumps
+  // to the home menu. The action waits for release so tap vs. hold can
+  // be told apart.
   static uint32_t backDownAt = 0;
   if (currentScreen != MENU) {
     bool inArea = uiTouchInBackArea(t);
@@ -630,7 +595,17 @@ void loop() {
     case MESHTASTIC:    meshLoop();      if (t.pressed) meshTouch(t);      break;
     case GPS_WARDRIVE:  gpsLoop();       if (t.pressed) gpsTouch(t);       break;
     case ENGAGEMENT:    engagementLoop(); if (t.pressed) engagementTouch(t); break;
-    case SYSTEM:        systemLoop();    if (t.pressed) systemTouch(t);    break;
+    case SYSTEM: {
+      systemLoop();
+      if (t.pressed) systemTouch(t);
+      if (powerTakePendingWake()) {   // "Sleep" tier woke -- go to the main menu, not back to System
+        exitScreen(SYSTEM);
+        enterScreen(MENU);
+        drawMenu();   // enterScreen(MENU) doesn't draw anything itself -- every other
+                       // place that jumps back to MENU programmatically calls this too
+      }
+      break;
+    }
     default: break;
   }
 }

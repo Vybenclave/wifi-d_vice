@@ -1,18 +1,4 @@
-// Drone Remote ID detector (Wireless Wizard "Drone Detect"). Passive decode
-// of the ASTM F3411 / open-drone-id broadcast that FAA / EU rules now
-// require most drones to transmit in the clear. Two transports, picked with
-// the WiFi / BLE tab (the WROOM-32 cannot run promiscuous WiFi and the BLE
-// stack at once):
-//
-//   WiFi  -- beacon vendor IE, OUI FA:0B:BC (ASTM) or the DJI OUI
-//            26:37:12, carrying a Remote ID message pack. Runs on the
-//            shared wifi_ids promiscuous core.
-//   BLE   -- service data for UUID 0xFFFA (ASTM) with a 25-byte Remote ID
-//            message, or DJI's 0xFFE0 manufacturer data.
-//
-// Decodes the Basic ID message (the UAS / serial id) and, when the Location
-// message is in the same advert, the operator-reported lat/lon. Everything
-// is receive-only.
+// The WROOM-32 chip cannot run promiscuous WiFi and the BLE stack at once.
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -21,12 +7,16 @@
 #include "ui.h"
 #include "wifi_ids.h"
 #include "accent.h"
+#include "devtime.h"
+#include "flagfinding.h"
+#include "demomode.h"
+#include <esp_random.h>
 
 struct Drone {
-  char    id[21];       // UAS ID / serial (ASCII, from a Basic ID message)
-  char    src;          // 'W' wifi, 'B' ble
+  char    id[21];
+  char    src;
   int     rssi;
-  double  lat, lon;     // 0 = not reported in this advert
+  double  lat, lon;
   uint16_t hits;
   uint32_t seen;
 };
@@ -38,7 +28,6 @@ enum Tab { T_WIFI, T_BLE };
 static Tab tab = T_WIFI;
 static Btn wifiTab, bleTab;
 
-// ---- shared decode ------------------------------------------------
 static Drone *drFind(const char *id) {
   for (int i = 0; i < DR_N; i++) if (dr[i].hits && strcmp(dr[i].id, id) == 0) return &dr[i];
   return nullptr;
@@ -49,8 +38,6 @@ static Drone *drSlot() {
   return &dr[lru];
 }
 
-// One 25-byte ASTM message. Returns via *idOut / *lat / *lon what it found
-// (Basic ID fills idOut; Location fills lat/lon).
 static void astmMessage(const uint8_t *m, char *idOut, size_t idN, double *lat, double *lon) {
   uint8_t type = m[0] >> 4;
   if (type == 0x0 && idOut && idN) {       // Basic ID: bytes 2..21 = UAS ID
@@ -69,8 +56,6 @@ static void astmMessage(const uint8_t *m, char *idOut, size_t idN, double *lat, 
   }
 }
 
-// Decode a Remote ID payload that is either a single 25-byte message or a
-// message pack (type 0xF: [0]=0xF., [1]=msg size, [2]=count, then messages).
 static void decodeRid(const uint8_t *p, int len, char src, int rssi) {
   if (len < 25) return;
   char id[21] = "";
@@ -96,7 +81,6 @@ static void decodeRid(const uint8_t *p, int len, char src, int rssi) {
   if (lat != 0 || lon != 0) { d->lat = lat; d->lon = lon; }
 }
 
-// ---- WiFi path (wifi_ids core) ----------------------------------
 static int hBeacon = -1, hAction = -1;
 static const uint8_t OUI_ASTM[3] = { 0xFA, 0x0B, 0xBC };
 static const uint8_t OUI_DJI[3]  = { 0x26, 0x37, 0x12 };
@@ -109,7 +93,7 @@ static void scanIesForRid(const uint8_t *ie, int n, int rssi) {
     if (id == 0xDD && l >= 4) {
       const uint8_t *v = ie + i + 2;
       if (!memcmp(v, OUI_ASTM, 3))
-        decodeRid(v + 4, l - 4, 'W', rssi);          // vendor type at v[3], payload after
+        decodeRid(v + 4, l - 4, 'W', rssi);
       else if (!memcmp(v, OUI_DJI, 3)) {
         Drone *d = drFind("DJI-drone");
         gMsgs++;
@@ -125,9 +109,10 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
   scanIesForRid(f.raw + 36, f.rawLen - 36, f.rssi);
 }
 static void onAction(const WifiIdsFrame &f, void *) {
-  // NaN Remote ID: a public action frame carrying the open-drone-id service.
-  // Full NaN SDF parsing is deep; key on the service name that rides in the
-  // clear, then hand the trailing bytes to the RID decoder.
+  // NaN Remote ID uses public action frames.
+  // Full parsing is complex.
+  // We search for the service name.
+  // We pass the trailing bytes to the decoder.
   if (f.rawLen < 32) return;
   for (int i = 24; i + 11 < f.rawLen; i++) {
     if (memcmp(f.raw + i, "opendroneid", 11) == 0) {
@@ -137,7 +122,6 @@ static void onAction(const WifiIdsFrame &f, void *) {
   }
 }
 
-// ---- BLE path -------------------------------------------------
 static BLEScan *pScan = nullptr;
 class Cb : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice d) override {
@@ -146,14 +130,14 @@ class Cb : public BLEAdvertisedDeviceCallbacks {
       String u = d.getServiceDataUUID(i).toString(); u.toLowerCase();
       if (u.indexOf("fffa") < 0) continue;
       String sd = d.getServiceData(i);
-      if (sd.length() >= 26)                       // 1 msg-counter byte + 25-byte message
+      if (sd.length() >= 26)
         decodeRid((const uint8_t *)sd.c_str() + 1, sd.length() - 1, 'B', rssi);
     }
     if (d.haveManufacturerData()) {
       String md = d.getManufacturerData();
       if (md.length() >= 2) {
         uint16_t cid = (uint8_t)md[0] | ((uint16_t)(uint8_t)md[1] << 8);
-        if (cid == 0xFFE0 || cid == 0x1AE8) {     // DJI
+        if (cid == 0xFFE0 || cid == 0x1AE8) {
           Drone *dr2 = drFind("DJI-drone");
           gMsgs++;
           if (!dr2) { dr2 = drSlot(); memset(dr2, 0, sizeof(*dr2)); strcpy(dr2->id, "DJI-drone"); }
@@ -165,8 +149,29 @@ class Cb : public BLEAdvertisedDeviceCallbacks {
 };
 static Cb cb;
 
-// ---- radio bring-up / teardown per tab ------------------------
+// Demo mode mimics real decode paths.
+// This keeps UI logic unchanged.
+// The code skips the radio.
+// It fabricates inputs instead.
+static uint32_t lastDemoSpawn = 0;
+static void spawnDemoDrone() {
+  static const char *kIds[] = {"DJI-drone", "SIM-UAS-01", "Parrot-X"};
+  const char *id = demoRandPick(kIds, 3);
+  Drone *d = drFind(id);
+  if (!d) { d = drSlot(); memset(d, 0, sizeof(*d)); strncpy(d->id, id, sizeof(d->id) - 1); }
+  d->src = (tab == T_WIFI) ? 'W' : 'B';
+  d->rssi = demoRandRssi();
+  d->hits++;
+  d->seen = millis();
+  if ((esp_random() % 2) == 0) {
+    d->lat = 37.7749 + (double)((int)(esp_random() % 1000) - 500) / 100000.0;
+    d->lon = -122.4194 + (double)((int)(esp_random() % 1000) - 500) / 100000.0;
+  }
+  gMsgs++;
+}
+
 static void startWifi() {
+  if (demoModeEnabled()) return;
   wifiIdsBegin();
   wifiIdsSetDwell(250);
   hBeacon = wifiIdsRegister(&onBeacon, nullptr, WIDS_BIT(WIDS_BEACON));
@@ -179,8 +184,9 @@ static void stopWifi() {
   if (wifiIdsActive()) wifiIdsEnd();
 }
 static void startBle() {
+  if (demoModeEnabled()) return;
   if (!pScan) {
-    WiFi.disconnect(true, false);   // radio coexistence -- see README
+    WiFi.disconnect(true, false);   // Radio coexistence requires this order.
     WiFi.mode(WIFI_OFF);
     delay(50);
     BLEDevice::init("");
@@ -194,10 +200,9 @@ static void startBle() {
 }
 static void stopBle() {
   if (pScan) { pScan->stop(); pScan->setAdvertisedDeviceCallbacks(nullptr); pScan = nullptr; }
-  BLEDevice::deinit(false);        // radio coexistence -- see README
+  if (BLEDevice::getInitialized()) BLEDevice::deinit(false);        // radio coexistence -- see README
 }
 
-// ---- UI -----------------------------------------------------
 static const int TABS_Y = 29, TABS_H = 24, CY = TABS_Y + TABS_H + 2;
 static uint32_t lastDraw;
 
@@ -212,6 +217,15 @@ static void drawTabs() {
   tft.fillRect(ax, TABS_Y + TABS_H - 4, aw, 3, ILI9341_GREEN);
 }
 
+// Rows use variable heights.
+// The code tracks a running y cursor.
+// Touch handling needs exact row geometry.
+// We store each row as a button.
+// This matches the client picker convention.
+static Btn hitRows[DR_N];
+static int hitRowIdx[DR_N];
+static int hitRowCount;
+
 static void draw() {
   uiClearBelow(CY);
   tft.setTextSize(1);
@@ -220,6 +234,7 @@ static void draw() {
   tft.printf("%s   %lu RID msgs", tab == T_WIFI ? "WiFi beacon/NaN" : "BLE 0xFFFA/DJI",
              (unsigned long)gMsgs);
 
+  hitRowCount = 0;
   int n = 0;
   for (int i = 0; i < DR_N; i++) if (dr[i].hits) n++;
   int y = CY + 16;
@@ -233,6 +248,12 @@ static void draw() {
     if (!dr[i].hits) continue;
     const Drone &d = dr[i];
     bool fresh = millis() - d.seen < 10000;
+    int rowH = (d.lat != 0 || d.lon != 0) ? 22 : 12;
+    if (hitRowCount < DR_N) {
+      hitRows[hitRowCount] = {4, y - 2, tft.width() - 8, rowH};
+      hitRowIdx[hitRowCount] = i;
+      hitRowCount++;
+    }
     tft.setTextColor(fresh ? ILI9341_RED : accentLabel());
     tft.setCursor(4, y);
     tft.printf("[%c] %-20.20s %ddBm x%u", d.src, d.id, d.rssi, d.hits);
@@ -256,11 +277,17 @@ void droneEnter() {
   drawTabs();
   startWifi();
   lastDraw = 0;
+  lastDemoSpawn = 0;
   draw();
 }
 
 void droneLoop() {
-  if (tab == T_WIFI) wifiIdsLoop();
+  if (demoModeEnabled()) {
+    uint32_t now = millis();
+    if (now - lastDemoSpawn > 5000) { spawnDemoDrone(); lastDemoSpawn = now; }
+  } else if (tab == T_WIFI) {
+    wifiIdsLoop();
+  }
   uint32_t now = millis();
   if (now - lastDraw > 900) { draw(); lastDraw = now; }
 }
@@ -270,7 +297,23 @@ void droneTouch(const TouchPoint &t) {
   Tab want = tab;
   if (uiTouchInButton(t, wifiTab)) want = T_WIFI;
   else if (uiTouchInButton(t, bleTab)) want = T_BLE;
-  else { // tap in body clears the list
+  else {
+  // Tapping a drone row opens its detail view.
+  // This overrides the clear-list gesture.
+    for (int k = 0; k < hitRowCount; k++) {
+      if (uiTouchInButton(t, hitRows[k])) {
+        const Drone &d = dr[hitRowIdx[k]];
+        bool hasGps = (d.lat != 0 || d.lon != 0);
+        char headline[32];
+        snprintf(headline, sizeof(headline), "[%c] %s", d.src, d.id);
+        showDetectionDetail(headline, UI_SEV_ALERT, devTimeNowString().c_str(),
+                             nullptr, nullptr, hasGps, (float)d.lat, (float)d.lon, "drone");
+        uiDrawTopBar("Drone Detect");
+        drawTabs();
+        draw();
+        return;
+      }
+    }
     if (t.y > CY) { memset(dr, 0, sizeof dr); gMsgs = 0; draw(); }
     return;
   }

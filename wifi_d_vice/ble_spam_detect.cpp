@@ -1,12 +1,9 @@
-// BLE advertisement-spam watch (Wireless Wizard "Spam Detect"). Passive: a
-// continuous duplicate-allowing BLE scan, counting advertisement rate,
-// distinct source addresses, and the specific payload shapes the common
-// spam tools flood -- Apple Continuity proximity-pairing / nearby-action
-// (Flipper "BLE Spam" / Sour Apple), Microsoft SwiftPair, Google Fast Pair.
-// A short window feeds one severity verdict + banner, like the WiFi IDS.
-//
-// This is the "spoofed / flooded beacon" half of the roadmap's Guardian
-// "BLE anomaly" monitor. Receive-only: nothing here advertises.
+// This module monitors BLE advertisement spam. It runs a passive scan.
+// It counts advertisement rates and distinct source addresses. It tracks
+// common spam payloads. These include Apple Continuity, Microsoft
+// SwiftPair, and Google Fast Pair frames. A short time window produces
+// a severity verdict. The system displays a banner. This module only
+// receives data. It never sends advertisements.
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -19,9 +16,9 @@
 static BLEScan *pScan = nullptr;
 static bool running = false;
 
-// Callback-side counters (BLE host task). Plain uint32 increments; read and
-// zeroed from the main task once per window -- a lost count at the edge
-// doesn't matter for a rate estimate.
+// The BLE host task updates these counters. The main task reads and clears
+// them once per window. A lost count at the window edge does not affect
+// the rate estimate.
 static volatile uint32_t cAdv, cApple, cContSpam, cMs, cGfp;
 static const int ADDR_BLOOM = 64;          // 512-bit distinct-address estimate
 static uint8_t addrBloom[ADDR_BLOOM];
@@ -53,8 +50,8 @@ class Cb : public BLEAdvertisedDeviceCallbacks {
     uint8_t  t   = (uint8_t)md[2];
     if (cid == 0x004C) {                 // Apple
       cApple++;
-      // 0x07 proximity pairing, 0x0F nearby action, 0x10 nearby info --
-      // 0x07/0x0F at volume is the AirPods / "Sour Apple" popup flood.
+      // Byte 0x07 indicates proximity pairing. Byte 0x0F indicates nearby action.
+      // High volumes of these bytes trigger AirPods popup floods.
       if (t == 0x07 || t == 0x0F) cContSpam++;
     } else if (cid == 0x0006) {          // Microsoft -- SwiftPair beacon (type 0x03)
       if (t == 0x03) cMs++;
@@ -83,9 +80,8 @@ static void computeWindow() {
   vCont = cont; vMs = ms; vGfp = gfp; vAddr = addr;
   (void)apple;
 
-  // Ambient BLE even in a crowd is well under 100 adv/s and a handful of
-  // SwiftPair/Continuity frames. Spam tools push hundreds/s from dozens of
-  // rotating addresses.
+  // Normal BLE traffic stays below 100 advertisements per second. Spam tools
+  // push hundreds per second. They use dozens of rotating addresses.
   if (vRate >= 250 || cont >= 40 || (cont >= 15 && addr >= 20) || ms >= 40 || gfp >= 60)
     sev = SV_ALERT;
   else if (vRate >= 110 || cont >= 12 || ms >= 12 || gfp >= 20)
@@ -122,12 +118,12 @@ static void draw() {
     tft.setTextSize(1);
     tft.setCursor(10, 134);
     tft.print(vCont >= 15 ? "Apple proximity popup flood" : "advertisement flood");
-    if (!alerted) { alerted = true; ledSet(true); beep(350, 1400); }
+    if (!alerted) { alerted = true; ledAlert(true); beep(350, 1400); }
   } else {
     tft.setTextColor(sevCol(sev));
     tft.setCursor(10, 120);
     tft.print(sev == SV_WATCH ? "elevated advertisement activity" : "no advertisement flood");
-    if (alerted) { alerted = false; ledSet(false); }
+    if (alerted) { alerted = false; ledAlert(false); }
   }
 }
 
@@ -140,7 +136,7 @@ void bleSpamEnter() {
   sev = SV_OK; lastSev = 255; alerted = false;
 
   if (!pScan) {
-    WiFi.disconnect(true, false);   // radio coexistence -- see README
+    WiFi.disconnect(true, false);   // The radio requires coexistence handling. See the README.
     WiFi.mode(WIFI_OFF);
     delay(50);
     BLEDevice::init("");
@@ -168,7 +164,6 @@ void bleSpamLoop() {
     draw();
     lastDraw = now;
   } else if (now - lastDraw > 1000) {
-    // keep the rate line lively between windows
     draw();
     lastDraw = now;
   }
@@ -177,7 +172,7 @@ void bleSpamLoop() {
 void bleSpamTouch(const TouchPoint &t) {
   if (!t.isNewPress) return;
   alerted = false;
-  ledSet(false);
+  ledAlert(false);
   lastSev = 255;
   draw();
 }
@@ -186,7 +181,7 @@ void bleSpamExit() {
   if (!running) return;
   running = false;
   beepHold(false);
-  ledSet(false);
+  ledAlert(false);
   if (pScan) { pScan->stop(); pScan->setAdvertisedDeviceCallbacks(nullptr); pScan = nullptr; }
-  BLEDevice::deinit(false);   // radio coexistence -- see README
+  BLEDevice::deinit(false);   // The radio requires coexistence handling. See the README.
 }

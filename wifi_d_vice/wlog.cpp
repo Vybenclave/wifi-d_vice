@@ -5,14 +5,29 @@
 #include "crypto.h"
 #include "engagement.h"
 #include "devtime.h"
+#include "debuglog.h"
+#include <mbedtls/sha256.h>
 
-// One file, one AAD, one fail counter -- these screens run one at a time.
+// The code processes one file at a time.
+// Each file uses a single AAD value.
+// Each file tracks one fail counter.
 static File     s_file;
-static String   s_aad;          // engagement header, verbatim -- the GCM AAD for every row
+static String   s_aad;          // The code reads the AAD value from the engagement header.
 static uint32_t s_encFails = 0;
 
-// Sanitized for FAT32 path safety -- the client folder name comes from an
-// operator-typed engagement field, not a fixed set of values.
+// The code tracks a running SHA-256 hash over every data row.
+// It excludes the three header lines.
+// The hash finalizes on close.
+// The code appends the hash to a manifest file.
+// This allows offline tamper checks without the decryption key.
+static mbedtls_sha256_context s_sha256_ctx;
+static uint32_t               s_rowCount = 0;
+static String                 s_dir;        // The directory path stores the file location.
+static String                 s_bareName;   // The filename stores the name without the directory path.
+
+// The function sanitizes strings for FAT32 paths.
+// The client folder name comes from an operator field.
+// The code replaces unsafe characters with underscores.
 static String sanitizeForPath(const String &s) {
   String out;
   for (size_t i = 0; i < s.length(); i++) {
@@ -25,7 +40,7 @@ static String sanitizeForPath(const String &s) {
 }
 
 bool wlogOpen(const char *name, const char *columns) {
-  wlogClose();                       // never leak a previously open handle
+  wlogClose();                       // The function closes any open handle first.
   sdBusBegin();
   if (!SD.begin(SD_CS, sdSPI)) return false;
 
@@ -43,7 +58,16 @@ bool wlogOpen(const char *name, const char *columns) {
   s_file = SD.open(path, FILE_WRITE);
   if (!s_file) return false;
 
-  s_aad = engagementHeaderLine();    // fixed AAD for every row in this file
+  mbedtls_sha256_init(&s_sha256_ctx);
+  mbedtls_sha256_starts(&s_sha256_ctx, 0);
+  s_rowCount = 0;
+  s_dir = dir;
+  String bareName = path;
+  int slash = bareName.lastIndexOf('/');
+  if (slash >= 0) bareName = bareName.substring(slash + 1);
+  s_bareName = bareName;
+
+  s_aad = engagementHeaderLine();    // The AAD value stays fixed for every row.
   s_encFails = 0;
   s_file.println(s_aad);
   s_file.println(cryptoHasKey() ? "encrypted=aes256gcm-hex" : "encrypted=none");
@@ -62,23 +86,65 @@ void wlogRow(const char *row) {
         cryptoEncryptRecord((const uint8_t *)row, len,
                             (const uint8_t *)s_aad.c_str(), s_aad.length(),
                             outBuf, sizeof(outBuf), &outLen)) {
-      for (size_t i = 0; i < outLen; i++) s_file.printf("%02X", outBuf[i]);
+      // The code builds the hex string in a buffer first.
+      // This ensures the manifest hash matches the exact bytes on disk.
+      // The buffer size accounts for the null terminator.
+      char hexBuf[sizeof(outBuf) * 2 + 1];
+      size_t hLen = 0;
+      for (size_t i = 0; i < outLen; i++) {
+        hLen += sprintf(hexBuf + hLen, "%02X", outBuf[i]);
+      }
+      mbedtls_sha256_update(&s_sha256_ctx, (const unsigned char *)hexBuf, hLen);
+      s_rowCount++;
+      s_file.write((const uint8_t *)hexBuf, hLen);
       s_file.println();
       return;
     }
-    // Armed but the encrypt failed -- NEVER write the row in the clear.
-    // Drop it, leave a non-sensitive marker, count it for the caller's UI.
+    // The encryption failed.
+    // The code drops the row.
+    // It writes a non-sensitive marker instead.
+    // It increments the fail counter for the UI.
     s_encFails++;
-    Serial.printf("[wlog] encrypt FAILED (#%lu), row len=%u -- dropped\n",
-                  (unsigned long)s_encFails, (unsigned)len);
-    s_file.println("ENC_FAIL");
+    DLOG("wlog", "encrypt FAILED (#%lu), row len=%u -- dropped",
+         (unsigned long)s_encFails, (unsigned)len);
+    static const char *failStr = "ENC_FAIL";
+    mbedtls_sha256_update(&s_sha256_ctx, (const unsigned char *)failStr, strlen(failStr));
+    s_rowCount++;
+    s_file.println(failStr);
     return;
   }
 
-  s_file.println(row);               // genuinely not armed -- plaintext is expected
+  // Encryption is disabled.
+  // The code hashes the exact row bytes.
+  // It writes the plaintext row.
+  mbedtls_sha256_update(&s_sha256_ctx, (const unsigned char *)row, strlen(row));
+  s_rowCount++;
+  s_file.println(row);
 }
 
 void wlogFlush()        { if (s_file) s_file.flush(); }
-void wlogClose()        { if (s_file) s_file.close(); }   // File::close() nulls the impl -> wlogIsOpen() false
+
+void wlogClose() {
+  if (s_file) {
+    unsigned char hash[32];
+    mbedtls_sha256_finish(&s_sha256_ctx, hash);
+    mbedtls_sha256_free(&s_sha256_ctx);
+
+    char hashHex[65];
+    for (int i = 0; i < 32; i++) sprintf(hashHex + i * 2, "%02x", hash[i]);
+    hashHex[64] = '\0';
+
+    String manifestPath = s_dir + "/manifest.txt";
+    File manifest = SD.open(manifestPath, FILE_APPEND);
+    if (!manifest) manifest = SD.open(manifestPath, FILE_WRITE);   // The append flag does not create missing files.
+    if (manifest) {
+      manifest.printf("%s,%s,%u\n", s_bareName.c_str(), hashHex, (unsigned)s_rowCount);
+      manifest.close();
+    }
+
+    s_file.close();   // The close method nulls the file handle.
+  }
+}
+
 bool wlogIsOpen()       { return (bool)s_file; }
 uint32_t wlogEncFails() { return s_encFails; }

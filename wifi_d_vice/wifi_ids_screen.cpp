@@ -1,72 +1,6 @@
-// WiFi IDS -- the WiFi-attack-detection umbrella screen (DESIGN.md section 3).
+// The core uses one receive callback and one hop schedule. Nine screens would duplicate the radio control and UI harness. One screen saves flash and RAM.
 //
-// This is the old "Deauth Detect" screen grown into the umbrella the shared
-// wifi_ids core was built for: ONE promiscuous session, ONE hop schedule,
-// nine passive detectors registered against it, one unified verdict area.
-//
-//   * Deauth v2   -- deauth + disassoc rate (the original 10-in-5s flood
-//                    threshold), reason-code readout, and spoof detection:
-//                    a deauth/disassoc that claims to come from a real AP
-//                    but whose channel / RSSI / sequence number don't match
-//                    that AP's own beacons.
-//   * Beacon flood -- distinct-BSSID rate spike over ambient, random / binary
-//                     SSIDs, locally-administered ("random") BSSID MACs, and
-//                     near-sequential BSSID MACs (mdk4 / aireplay beacon spam).
-//   * Auth/assoc flood -- auth + (re)assoc-request rate to one BSSID from
-//                         many distinct (often locally-administered) source
-//                         MACs in a short window (mdk3 'a').
-//   * Rogue-AP / evil-twin (SD baseline) + a baseline-free evil-twin score,
-//     and Pwnagotchi-presence -- see rogue_ap.cpp and onBeacon() below.
-//   * KARMA -- one BSSID answering probe requests for several different
-//     SSIDs (a rogue AP impersonating every network a nearby client has
-//     ever joined). Management-frame only, no core changes needed.
-//   * Channel-switch-announcement (CSA) abuse -- an off-regulatory-domain
-//     target channel, or a CSA re-announced/re-targeted without a real
-//     switch ever happening (the mdk4-style disruption signature).
-//     Management-frame only (action frames), no core changes needed.
-//   * Handshake-theft correlation -- a deauth for client X, then an EAPOL
-//     4-way handshake for X on the same BSSID within seconds.
-//   * PMKID-harvest -- an EAPOL message-1 with no matching recent real
-//     association for that (STA,BSSID) pair (a clientless direct-association
-//     PMKID grab, hcxdumptool-style).
-//   * KRACK -- the same EAPOL message-3 replay counter seen twice for one
-//     (STA,BSSID) pair (the 2017 Vanhoef key-reinstallation signature).
-//   * WPS brute-force -- WSC/EAP-Packet attempt rate per BSSID
-//     (Reaver/Bully-style PIN brute force).
-// The last four need the EAPOL/WPS data-frame path wifi_ids.cpp exposes via
-// wifiIdsWantEapol()/wifiIdsRegisterEapol()/wifiIdsRegisterWps() -- still
-// fully passive (EAPOL/WPS frames are themselves unencrypted; they ARE the
-// key exchange / provisioning handshake), but the one place this core looks
-// at anything other than a management frame. See wifi_ids.h for why that's
-// safe to do unconditionally cheap when no screen asks for it.
-//
-// Why one screen and not nine: the wifi_ids core has a single RX-callback
-// slot and one hop schedule; nine screens would each spin the radio up and
-// down and each carry a near-identical Enter/Loop/Exit + draw + window
-// harness. One screen = one wifiIdsBegin(), N wifiIdsRegister() calls,
-// one throttled redraw, one alert log. Cheaper in flash and in RAM.
-//
-// PASSIVE ONLY. Every detector just counts frames handed to it by wifi_ids
-// (receive-only). Nothing here transmits.
-//
-// RAM: all state is small fixed tables, sized in bytes:
-//   AP baseline  12 * 16 B  = 192 B  (beacon writes it, deauth spoof reads it)
-//   beacon bloom      64 B          (distinct BSSIDs this window)
-//   auth src bloom    64 B          (distinct source MACs this window)
-//   auth targets  8 * 8 B   =  64 B
-//   beacon recent 4 * 6 B   =  24 B
-//   alert log     4 * 26 B  = 104 B
-//   KARMA         8 * 34 B  = 272 B
-//   CSA targets   4 * 10 B  =  40 B
-//   deauth victims 6 * 16 B =  96 B
-//   assoc-seen    8 * 16 B  = 128 B
-//   PMKID-wait    6 * 15 B  =  90 B
-//   KRACK table   6 * 16 B  =  96 B
-//   WPS targets   4 * 8 B   =  32 B
-//   + scalars                ~160 B
-//   ------------------------------  ~ 1.4 KB total, all static.
-// Nothing here is big enough to need calloc/free like the wifi_ids ring
-// (the EAPOL/WPS ring itself is wifi_ids.cpp's, calloc'd there, not here).
+// Every detector counts frames from wifi_ids. This code never transmits.
 
 #include <string.h>
 #include <stdlib.h>
@@ -79,25 +13,23 @@
 #include "keyboard.h"
 #include "accent.h"
 #include "debuglog.h"
+#include "flagfinding.h"
+#include "engagement.h"
+#include "gps_shared.h"
+#include "demomode.h"
+#include "power.h"
+#include <esp_random.h>
 
 // ---- window ------------------------------------------------------------
 //
-// 5 s. At this screen's 300 ms-per-channel dwell a full 1..13 hop sweep is
-// ~3.9 s, so a 5 s window is ~1.3 sweeps: long enough that "distinct BSSIDs
-// this window" / "distinct source MACs this window" approximate the real
-// ambient population instead of one channel's slice, short enough to trip
-// within a couple of seconds of a flood starting. The deauth threshold
-// stays the historical 10-in-5s.
+// A five-second window covers about 1.3 channel hops. This size approximates the real ambient population. It also triggers alerts within a few seconds of a flood. The deauth threshold remains the historical 10-in-5s rule.
 static const uint32_t WINDOW_MS = 5000;
 
 enum { SEV_OK = 0, SEV_WATCH = 1, SEV_ALERT = 2 };
 
 // ---- shared AP beacon baseline --------------------------------------
 //
-// Populated by the beacon detector for nearby APs only (RSSI > -85: the APs
-// an attacker would actually target, and the only ones whose beacons we can
-// trust as a spoof reference). Read by the deauth detector to sanity-check a
-// deauth that claims to be from one of them. LRU eviction by last-seen.
+// The beacon detector populates this table for nearby access points. The deauth detector uses it to verify spoofed frames. We drop access points older than ten seconds.
 struct Ap {
   uint8_t  bssid[6];
   uint16_t seq;      // last beacon sequence number seen
@@ -125,13 +57,7 @@ static Ap *apLruSlot() {
 
 // ---- tiny Bloom filter (distinct-count estimator) -------------------
 //
-// 512 bits, 3 hashes, memset to zero each window. We don't store the MACs;
-// we popcount the filter and back out an estimated distinct count from
-//   bits_set ~= m * (1 - e^(-k*n/m))     (m=512, k=3)
-// which inverts to  n ~= -(m/k) * ln(1 - bits/m).
-// Reference points: 40 distinct -> ~107 bits, 85 -> ~200, 150 -> ~300,
-// 300 -> ~424. Ambient home/office beacons top out around 10-40 distinct
-// BSSIDs; mdk4 beacon flood is hundreds/sec, so it pins this immediately.
+// This filter uses 512 bits and three hash functions. We clear it each window. We estimate distinct counts from the set bit count. Ambient networks show ten to forty distinct BSSIDs. Flood attacks trigger the filter immediately.
 static const int BLOOM_BYTES = 64;
 
 static void bloomAdd(uint8_t *bf, const uint8_t *k, uint8_t n) {
@@ -180,25 +106,18 @@ static uint8_t  aSrcBloom[BLOOM_BYTES];
 static uint32_t aReq;
 static uint16_t aLaaSrc;
 
-// dropped-frame delta: if the capture ring overflows, capture can't keep up
-// with the air -- itself a flood signal, per wifi_ids.h.
+// A rising drop delta means the capture ring overflows. This indicates a flood.
 static uint32_t dropAtWindow;
 static uint32_t dropDelta;
 
 static uint32_t gSeen;      // mgmt frames dispatched to our detectors, cumulative
 
-// rogue-AP / evil-twin: checked against the SD baseline (rogue_ap.cpp). Off
-// unless /rogueap.csv exists. A hit feeds the alert log + the banner. Each
-// offending BSSID is reported once per session.
+// This check uses the SD baseline file. It logs each rogue BSSID once per session.
 static bool     rogueOn;
 static bool     vRogue;
 static uint8_t  rogueSeen[8][6];
 static uint8_t  rogueSeenN;
 
-// Baseline-free extras that need no /rogueap.csv (DESIGN.md section 3, and
-// what Marauder's Detect-Pwnagotchi / Wireless Wizard's scored evil-twin
-// do). Both feed the alert log + the banner; there is no room for another
-// stats row.
 static bool     vPwn;        // a Pwnagotchi beacon (src/BSSID de:ad:be:ef:de:ad) was seen
 static bool     pwnLogged;   // one alert-log line per session
 static bool     vTwin;       // two BSSIDs, one SSID, divergent enough to score an evil twin
@@ -217,16 +136,40 @@ static uint8_t  vATop[6];   // busiest auth/assoc target BSSID
 static bool     vSpoofFlag;
 
 // ---- alert log ------------------------------------------------------
-static char    alog[4][26];
-static uint8_t alogN;
-static bool    alogDirty;
+struct AlogEntry {
+  char    line[26];
+  uint8_t sev;
+  bool    hasMac;
+  uint8_t mac[6];
+  char    ssid[16];
+  char    timeStr[20];
+  bool    hasGps;
+  float   lat, lon;
+};
+static const int ALOG_N = 8;
+static AlogEntry alog[ALOG_N];
+static uint8_t   alogN;
+static bool      alogDirty;
+static uint8_t   s_logShown;   // how many rows drawLog() actually drew -- widsTouch() hit-tests against this
 
-static void alogPush(const char *s) {
-  if (alogN < 4) {
-    strncpy(alog[alogN], s, 25); alog[alogN][25] = 0; alogN++;
+static void alogPush(const char *s, uint8_t sev = SEV_ALERT, const uint8_t *mac = nullptr,
+                      const char *ssid = nullptr) {
+  AlogEntry e;
+  strncpy(e.line, s, 25); e.line[25] = 0;
+  e.sev = sev;
+  e.hasMac = (mac != nullptr);
+  if (e.hasMac) memcpy(e.mac, mac, 6);
+  if (ssid) { strncpy(e.ssid, ssid, 15); e.ssid[15] = 0; } else e.ssid[0] = 0;
+  String t = devTimeNowString();
+  strncpy(e.timeStr, t.c_str(), 19); e.timeStr[19] = 0;
+  e.hasGps = gpsShared().location.isValid();
+  if (e.hasGps) { e.lat = gpsShared().location.lat(); e.lon = gpsShared().location.lng(); }
+
+  if (alogN < ALOG_N) {
+    alog[alogN++] = e;
   } else {
-    memmove(alog[0], alog[1], 3 * 26);
-    strncpy(alog[3], s, 25); alog[3][25] = 0;
+    memmove(&alog[0], &alog[1], (ALOG_N - 1) * sizeof(AlogEntry));
+    alog[ALOG_N - 1] = e;
   }
   alogDirty = true;
 }
@@ -239,14 +182,14 @@ static int      hK = -1, hCsa = -1, hEapol = -1, hWps = -1;
 
 bool widsTakeJumpToRogue() { bool j = s_jumpRogue; s_jumpRogue = false; return j; }
 static uint32_t startMs, windowStart, lastStatsDraw;
+static uint32_t lastDemoSpawn;
 static uint32_t lastBannerKey = 0xFFFFFFFFu;   // widened from uint16_t -- the CL state adds two more bits
-// KARMA/PMKID/WPS severities are computed live from continuously-updated
-// tables (no "raw counters reset + recompute" step like vD/vB/vA get from
-// computeVerdicts()), so there's nothing to naturally compare "before" vs
-// "after" within one window-boundary check -- these three cache the value
-// as of the END of the last check, updated right before resetWindow().
+// These severities update continuously. We cache their values before resetting the window. This avoids comparing stale counters against live ones.
 static uint8_t lastKarmaSev = 0, lastPmkidSev = 0, lastWpsSev = 0;   // SEV_OK == 0
 static bool     alerted = false;
+static uint32_t alertedSince = 0;   // millis() when `alerted` last went false->true; see ALERT_AUTOCLEAR_MS
+// This flag silences only the alarm beep. The banner, LED strobe, and screen wake still fire. We keep this flag across screen visits. It acts as a session preference.
+static bool     idsMuted = false;
 static uint32_t lastWlogSummary = 0;   // event-level SD log: one summary row / minute
 
 // ---- layout -----------------------------------------------------
@@ -260,36 +203,12 @@ static const int STATS_H  = (N_Y + 11) - HDR_Y;
 static const int BANNER_Y = N_Y + 15;
 static const int BANNER_H  = 44;
 static const int LOG_Y    = BANNER_Y + BANNER_H + 2;
+// The banner auto-dismisses after thirty seconds. Rate-based alerts re-trigger on the next window. This only hides stale one-off events.
+static const uint32_t ALERT_AUTOCLEAR_MS = 30000;
 
-// The channel readout on the stats header (drawStats()) is plain text --
-// NOT a button. Tried making it double as the channel-lock options
-// trigger three different ways (a bordered box, a tiny gear icon, a real
-// button behind the readout's own severity-colored text) and none of it
-// looked or worked right, so the options entry point is now its own,
-// separate, unambiguous button instead -- see optionsBtnRect() below.
 static const int CHAN_X = 2;
 
-// Bottom-right "Options" button: opens the channel-lock picker
-// (clOpenPicker()). Deliberately separate from the channel readout above
-// (see note there). A real uiDrawButton() at this app's established
-// button size -- h=20 is the minimum that lets its label hit the
-// standard UI_MENU_BTN_MAXSIZE=2 text (uiDrawButton() needs bh <= h-4),
-// w=92 fits "Options" at that size with room to spare, same numbers that
-// already proved out comfortably on this screen's old channel-lock
-// button attempt. Sits in the screen's bottom-right corner, drawn last
-// in drawLog() so it always paints on top of whatever the event log
-// draws underneath -- cheaper and more robust than carving a dedicated
-// row out of the log's already-tight vertical space in landscape
-// (~2 log lines to begin with).
-//
-// Gap from the status bar: confirmed via on-device touch logging that a
-// tight 2px gap (hugging the bar) put the button right at the physical
-// bottom edge, where this resistive touchscreen's accuracy drops off --
-// every real tap landed a few px ABOVE the button, never inside it.
-// Portrait has plenty of spare room below this screen's fixed,
-// landscape-tuned stats/banner/log offsets, so it gets a generous 16px
-// gap there; landscape keeps the original tight 2px since that
-// orientation has (deliberately) almost no room to spare.
+// Bottom-right "Options" button -- opens the channel-lock picker.
 static const int OPT_BTN_W = 92, OPT_BTN_H = 20;
 static Btn optionsBtnRect() {
   bool portrait = tft.height() > tft.width();
@@ -298,11 +217,16 @@ static Btn optionsBtnRect() {
            OPT_BTN_W, OPT_BTN_H, "Options" };
 }
 
+// This button toggles the alarm beep. It does not affect the banner or LED strobe.
+static const int MUTE_BTN_W = 56;
+static Btn muteBtnRect() {
+  Btn ob = optionsBtnRect();
+  return { ob.x - MUTE_BTN_W - 4, ob.y, MUTE_BTN_W, OPT_BTN_H, idsMuted ? "unmute" : "mute" };
+}
+
 // ---- SSID helpers -------------------------------------------------
 //
-// Beacon body: 24 B MAC header + 12 B fixed params, then the IE list; the
-// SSID IE (id 0) is first. wifi_ids snapshots the front of the frame so the
-// SSID is always inside f.raw for a non-runt beacon.
+// The SSID index always starts at byte 36. The frame header guarantees this layout.
 static bool beaconSsid(const WifiIdsFrame &f, const uint8_t **ssid, uint8_t *len) {
   if (f.rawLen < 38) return false;
   const uint8_t *ie = f.raw + 36;
@@ -313,10 +237,7 @@ static bool beaconSsid(const WifiIdsFrame &f, const uint8_t **ssid, uint8_t *len
   return true;
 }
 
-// Cheap "this SSID was generated, not typed by a human" heuristic. mdk-style
-// beacon spam draws SSIDs from random bytes: either non-ASCII/control bytes
-// land in them, or they come out as long vowel-less letter salad. No String,
-// no entropy math.
+// This heuristic detects machine-generated SSIDs. It flags strings with control bytes or long vowel-less sequences. It avoids heavy string math.
 static bool ssidLooksRandom(const uint8_t *s, uint8_t n) {
   if (n < 6) return false;
   uint8_t nonprint = 0, vowels = 0, digits = 0, alpha = 0;
@@ -340,9 +261,7 @@ static uint32_t ssidHash32(const uint8_t *s, uint8_t n) {
   return h ? h : 1;   // reserve 0 for "no SSID"
 }
 
-// Pwnagotchi beacons carry a JSON blob in the SSID; the unit's name is the
-// "name":"..." field. Best-effort: the SSID snapshot can be truncated or
-// the field can be past it -- then this returns "?".
+// Pwnagotchi units embed their name in the SSID. This parser extracts it safely. It returns a question mark on truncation.
 static void pwnName(const uint8_t *s, uint8_t n, char *out, size_t outN) {
   strncpy(out, "?", outN); out[outN - 1] = 0;
   const char *key = "\"name\":\"";
@@ -357,11 +276,8 @@ static void pwnName(const uint8_t *s, uint8_t n, char *out, size_t outN) {
 
 // ---- detector callbacks (task context, via wifiIdsLoop) -----------
 
-// forward decls -- defined in the handshake-theft/PMKID/KRACK section below,
-// called from here and from onAuthAssoc
 static void dvRecord(const uint8_t *sta, const uint8_t *bssid);
 static void asRecord(const uint8_t *bssid, const uint8_t *sta);
-// defined in the channel-lock section below, called from onBeacon
 static void clOnBeacon(const WifiIdsFrame &f, const uint8_t *b, const uint8_t *s, uint8_t sl, bool haveSsid);
 
 static void onDeauthFamily(const WifiIdsFrame &f, void *) {
@@ -370,18 +286,10 @@ static void onDeauthFamily(const WifiIdsFrame &f, void *) {
   else                          dDisassoc++;
   if (f.rawLen >= 26) dLastReason = (uint16_t)(f.raw[24] | (f.raw[25] << 8));
 
-  // handshake-theft: remember who got deauthed by whom, so a follow-up
-  // EAPOL-M2 for the same (STA,BSSID) pair within a few seconds can be
-  // recognized as "attacker forced a reconnect to capture the handshake".
-  // addr1 = the deauth target (STA); addr3 is the BSSID on every shape this
-  // detector cares about (addr2==addr3 is the forged-from-the-AP-itself
-  // case already checked below; a third-party deauth still names the real
-  // BSSID in addr3).
+  // This records deauth targets for handshake correlation. We match the target STA and BSSID against later EAPOL frames. The BSSID always sits in address 3.
   dvRecord(f.addr1, f.addr3);
 
-  // Spoof check only when the frame claims the AP itself sent it
-  // (transmitter == BSSID) -- that's the shape aireplay/mdk forge. Compare
-  // against the AP's own recent beacons.
+  // We only check spoofing when the transmitter matches the BSSID. We compare the frame against recent beacon records.
   if (!memcmp(f.addr2, f.addr3, 6)) {
     Ap *a = apFind(f.addr2);
     if (a && (millis() - a->seen) < 10000) {
@@ -445,7 +353,7 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
       uint32_t el = (millis() - startMs) / 1000;
       char line[26];
       snprintf(line, sizeof line, "%02lu:%02lu PWNAGOTCHI %.8s", el / 60, el % 60, nm);
-      alogPush(line);
+      alogPush(line, SEV_WATCH, b, nm);
       if (wlogIsOpen()) {
         char wl[112];
         snprintf(wl, sizeof wl, "%s,%d,pwnagotchi,watch,%s %ddBm",
@@ -480,7 +388,7 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
       char line[26];
       snprintf(line, sizeof line, "%02lu:%02lu %s %.9s",
                el / 60, el % 60, rogueKindTag(rk), es);
-      alogPush(line);
+      alogPush(line, SEV_ALERT, f.addr3, es);
       if (wlogIsOpen()) {
         char wl[112];
         snprintf(wl, sizeof wl, "%s,%d,rogue,%s,%s %02X%02X%02X ch%u %ddBm",
@@ -525,7 +433,7 @@ static void onBeacon(const WifiIdsFrame &f, void *) {
           uint32_t el = (millis() - startMs) / 1000;
           char line[26];
           snprintf(line, sizeof line, "%02lu:%02lu EVIL-TWIN? %.9s", el / 60, el % 60, es);
-          alogPush(line);
+          alogPush(line, SEV_ALERT, b, es);
           if (wlogIsOpen()) {
             char wl[112];
             snprintf(wl, sizeof wl,
@@ -586,10 +494,7 @@ static void onAuthAssoc(const WifiIdsFrame &f, void *) {
 
 // ---- KARMA: one BSSID answering probe requests for many different SSIDs --
 //
-// Session-scoped (not the 5 s flood window -- KARMA is a slow-forming
-// pattern across many probe/response pairs, not a rate spike). Exact SSID
-// hashes per BSSID, not a bloom filter: too few BSSIDs/SSIDs at this scale
-// for a bloom filter to pay off over just storing up to 4 hashes directly.
+// KARMA detection tracks patterns across the whole session. We store exact SSID hashes instead of using a bloom filter. The table size makes direct storage more efficient.
 struct KarmaBssid {
   uint8_t  bssid[6];
   uint32_t ssidHash[4];
@@ -631,9 +536,7 @@ static void onKarmaProbeResp(const WifiIdsFrame &f, void *) {
   }
 }
 
-// WATCH: one BSSID answered 3+ distinct SSIDs (a legit dual-SSID consumer
-// mesh AP tops out at 2). ALERT: 5+ distinct (or any 5th-plus "overflow"),
-// corroborated by respCount>=6 so one truncated-IE misparse can't trip it.
+// Three distinct SSIDs trigger a watch alert. Five distinct SSIDs trigger an alert. We require six total responses to prevent false alarms from truncated data.
 static uint8_t sevKarma() {
   uint8_t worst = SEV_OK;
   for (int i = 0; i < KARMA_N; i++) {
@@ -650,11 +553,7 @@ static uint8_t sevKarma() {
 
 // ---- Channel-switch-announcement (CSA) abuse --------------------------
 //
-// CSA IE (id 37: mode, newChannel, count) can appear in an ordinary beacon
-// (checked from onBeacon above) or a dedicated Spectrum-Management action
-// frame (category 0, action 4 -- action frames, subtype 0xD, already flow
-// through the core once a detector subscribes to them, same precedent
-// drone_detect.cpp uses for Remote ID).
+// CSA information appears in beacons and action frames. We parse both sources. Action frames route through the core like other spectrum management data.
 struct CsaTgt { uint8_t bssid[6]; uint16_t count; uint8_t lastCh; bool varied; uint32_t lastSeen; };
 static const int CSA_N = 4;
 static CsaTgt  csaTgts[CSA_N];
@@ -674,7 +573,7 @@ static CsaTgt *csaLruSlot() {
 static bool csaOffLogged;   // one alert-log line per session for the hard-violation case
 
 static void csaLog(const char *line, const uint8_t *bssid, const char *detail) {
-  alogPush(line);
+  alogPush(line, SEV_ALERT, bssid);
   if (wlogIsOpen()) {
     char wl[112];
     snprintf(wl, sizeof wl, "%s,%d,csa_abuse,alert,%02X%02X%02X %s",
@@ -734,13 +633,7 @@ static void onCsaAction(const WifiIdsFrame &f, void *) {
   handleCsa(f.addr3, ie[3]);
 }
 
-// ALERT: a hard off-regdomain target channel (no corroboration needed -- a
-// real AP never announces a switch to a channel it can't use), or 3+ CSAs
-// from one BSSID that re-announce without the channel ever settling (the
-// mdk4-style disruption signature: re-announced without a real switch, or
-// re-targeted each time). WATCH: a CSA from a BSSID with no fresh beacon
-// baseline (apFind, same 10s freshness the deauth-spoof check uses) -- a
-// newly-arrived legit AP could trigger this honestly.
+// An illegal channel target triggers an alert immediately. Three varied channel announcements also trigger an alert. A missing beacon baseline triggers a watch alert. This prevents false alarms for new access points.
 static uint8_t sevCsa() {
   if (csaOffRegdomain) return SEV_ALERT;
   uint8_t worst = SEV_OK;
@@ -779,11 +672,7 @@ static ClMode   clMode = CL_AUTO;
 static char     clSsid[24];         // target SSID text
 static uint32_t clSsidHash;         // ssidHash32(clSsid), computed once when a lock starts
 
-// One tracked node, identified by BSSID (not just channel) -- that's what
-// lets a reacquire sweep tell "this node relocated to a new channel" apart
-// from "this is a different node", since channel alone is ambiguous once a
-// node can move. Up to 3: 1 for manual-single/a just-starting SSID lock,
-// more once mesh nodes are discovered during a sweep.
+// We track nodes by BSSID instead of channel. This distinguishes relocated nodes from new ones. The table holds up to three nodes.
 struct ClNode { uint8_t bssid[6]; uint8_t channel; uint32_t lastSeen; bool down; };
 static ClNode   clNodes[3];
 static uint8_t  clNodeN;
@@ -799,13 +688,8 @@ static bool     clDownRecheck;      // true: the CURRENT CL_REACQUIRING sweep is
 
 // ---- handshake-theft correlation + PMKID-harvest + KRACK --------------
 //
-// All three ride the EAPOL-Key classification from wifi_ids.h
-// (WifiIdsEapol); one registered callback (onEapol, below), dispatched
-// internally by message number, so this uses one of the two available
-// EAPOL detector slots.
+// These three detectors share one EAPOL callback. The core dispatches messages by type. This saves detector slots.
 
-// handshake-theft: onDeauthFamily (above) calls dvRecord() on every
-// deauth/disassoc; onEapol consumes a matching entry on that pair's M2.
 struct DeauthVictim { uint8_t sta[6], bssid[6]; uint32_t deauthAt; };
 static const int DV_N = 6;
 static DeauthVictim dv[DV_N];
@@ -822,9 +706,6 @@ static void dvRecord(const uint8_t *sta, const uint8_t *bssid) {
   dv[o].deauthAt = millis();
 }
 
-// PMKID-harvest: onAuthAssoc (above) calls asRecord() on every real
-// assoc/reassoc-request, so an EAPOL-M1 with no recent entry for that
-// (STA,BSSID) pair looks like a clientless direct-association PMKID grab.
 struct AssocSeen { uint8_t bssid[6], sta[6]; uint32_t assocAt; };
 static const int AS_N = 8;
 static AssocSeen asTbl[AS_N];
@@ -846,22 +727,14 @@ static AssocSeen *asFind(const uint8_t *bssid, const uint8_t *sta) {
   return nullptr;
 }
 
-// Per-pair "waiting to see if M2 follows this M1" state -- a real client
-// that fails retries with a NEW M1; a PMKID-grab tool sends exactly one M1
-// and disconnects, so "M1 with no M2 within 5s" is itself corroborating
-// evidence, on top of the distinct-STA-count signal below.
+// We track M1 messages until M2 arrives. Real clients retry with new M1 frames. PMKID tools send one M1 and disconnect. A missing M2 after five seconds confirms suspicion.
 struct PmkidWait { uint8_t sta[6], bssid[6]; uint32_t m1At; bool armed; };
 static const int PW_N = 6;
 static PmkidWait pmkidWait[PW_N];
 static uint16_t  pmkidSusp;         // this window's "M1, no prior assoc" count
 static uint8_t   pmkidStas[8][6];   // distinct STA MACs behind pmkidSusp, this window
 static uint8_t   pmkidStaN;
-// A genuine M2 reply follows M1 within single-digit ms, on the SAME channel
-// -- but the shared hopper moves every 300ms regardless, so catching M1
-// right as we're about to leave that channel means missing an entirely
-// normal M2 purely on timing, not because anything's wrong. Briefly pin the
-// hopper to the M1's channel for a first-ever (unvetted) sighting, long
-// enough to catch an immediate legitimate reply. 0 = not pinned for this.
+// We pin the hopper to catch the M2 reply. The reply arrives on the same channel within milliseconds. We skip pinning if another pair already holds it. We also skip pinning during manual channel locks.
 static uint32_t  pmkidPinUntil;
 
 static PmkidWait *pwFind(const uint8_t *bssid, const uint8_t *sta) {
@@ -876,9 +749,7 @@ static PmkidWait *pwSlot() {
   return &pmkidWait[o];
 }
 
-// KRACK: per-(STA,BSSID) last-seen EAPOL-M3 replay-counter high bits -- a
-// repeat of the same counter for the same pair is a message-3 replay (the
-// 2017 Vanhoef key-reinstallation signature).
+// We track the high bits of the M3 replay counter. A repeated counter for the same pair indicates a replay attack.
 struct M3Seen { uint8_t sta[6], bssid[6]; uint16_t replayHi; uint32_t seen; };
 static const int M3_N = 6;
 static M3Seen m3tbl[M3_N];
@@ -896,15 +767,6 @@ static M3Seen *m3Slot() {
   return &m3tbl[o];
 }
 
-// Pairs that completed at least one full handshake (M1 then M2) this
-// session. A later M1 for the same pair with no fresh assoc is then a
-// routine PTK rekey of an already-vetted client, not fresh suspicion --
-// without this, every already-connected device's periodic rekey (which
-// never produces a new assoc frame at all, ever) re-triggers PMKID
-// suspicion on every rekey for as long as the screen stays open, not just
-// at startup. Session-persistent (reset only at widsEnter(), not
-// widsTouch() -- dismissing an alert shouldn't make the detector forget
-// which clients it already vetted), same as asTbl/dv/m3tbl above.
 struct KnownGoodPair { uint8_t sta[6], bssid[6]; };
 static const int KG_N = 8;
 static KnownGoodPair kgTbl[KG_N];
@@ -940,7 +802,7 @@ static void onEapol(const WifiIdsEapol &e, void *) {
           char line[26];
           snprintf(line, sizeof line, "%02lu:%02lu HS-THEFT %02X%02X%02X %lums",
                    el / 60, el % 60, e.sta[3], e.sta[4], e.sta[5], (unsigned long)gap);
-          alogPush(line);
+          alogPush(line, SEV_ALERT, e.sta);
           if (wlogIsOpen()) {
             char wl[128];
             snprintf(wl, sizeof wl,
@@ -995,7 +857,7 @@ static void onEapol(const WifiIdsEapol &e, void *) {
         char line[26];
         snprintf(line, sizeof line, "%02lu:%02lu KRACK %02X%02X%02X replay",
                  el / 60, el % 60, e.bssid[3], e.bssid[4], e.bssid[5]);
-        alogPush(line);
+        alogPush(line, SEV_ALERT, e.bssid);
         if (wlogIsOpen()) {
           char wl[128];
           snprintf(wl, sizeof wl, "%s,%d,krack,alert,bssid=%02X%02X%02X sta=%02X%02X%02X replay=%u",
@@ -1011,11 +873,7 @@ static void onEapol(const WifiIdsEapol &e, void *) {
   }
 }
 
-// ALERT: 2+ distinct STA MACs behind no-prior-assoc M1s against one target
-// this window (one tool run against multiple targets), or any M1 that never
-// saw a follow-up M2 within 5 s (see PmkidWait above). WATCH: a single
-// no-prior-assoc M1 alone -- weak evidence (a missed assoc during a
-// channel-hop gap, or a session-restart rekey, can produce this too).
+// Two distinct stations trigger an alert. A single unassociated M1 triggers a watch alert. Missed channel hops can cause false watch alerts.
 static uint8_t sevPmkid() {
   bool m2NeverFollowed = false;
   for (int i = 0; i < PW_N; i++)
@@ -1024,13 +882,12 @@ static uint8_t sevPmkid() {
   if (pmkidSusp >= 1) return SEV_WATCH;
   return SEV_OK;
 }
-
 // ---- WPS brute-force ---------------------------------------------------
 //
-// Rate of WSC (WiFi Simple Config) EAP-Packet attempts per BSSID, in the
-// same 5 s window the flood detectors use. The core (wifi_ids.cpp) already
-// narrows this to Expanded-EAP-type frames carrying the WFA vendor id --
-// this detector only has to count them.
+// Count WSC EAP-Packet attempts per BSSID.
+// Use the same 5 s window as the flood detectors.
+// The core filters for Expanded-EAP frames with the WFA vendor ID.
+// This detector only counts them.
 struct WpsTgt { uint8_t bssid[6]; uint16_t count; uint32_t lastSeen; };
 static const int WPS_N = 4;
 static WpsTgt wpsTgts[WPS_N];
@@ -1051,30 +908,23 @@ static void onWps(const WifiIdsWps &w, void *) {
   t->count++;
   t->lastSeen = millis();
 }
-// Thresholds are a starting point, not yet tuned against real Reaver/Bully
-// traffic -- see DESIGN.md / the plan's hardware-validation notes.
+
 static uint8_t sevWps() {
   uint8_t worst = SEV_OK;
   for (int i = 0; i < WPS_N; i++) {
     if (!wpsTgts[i].lastSeen) continue;
     uint8_t s = SEV_OK;
-    if (wpsTgts[i].count >= 10) s = SEV_ALERT;       // Reaver/Bully cadence, approximate
-    else if (wpsTgts[i].count >= 3) s = SEV_WATCH;   // more than one manual provisioning attempt
+    if (wpsTgts[i].count >= 10) s = SEV_ALERT;
+    else if (wpsTgts[i].count >= 3) s = SEV_WATCH;
     if (s > worst) worst = s;
   }
   return worst;
 }
 
-// ---- Channel lock / SSID-protect mode: implementation ------------------
-//
-// State (ClMode, clNodes[], etc.) is declared earlier, above onEapol, which
-// needs clMode to guard the transient PMKID pin. Everything else -- the
-// beacon hook, the state machine, and the header picker UI -- lives here.
-
-static const uint32_t CL_NODE_LOST_MS    = 5000;   // no beacon from a tracked node's BSSID this long -> down
-static const uint8_t  CL_MAX_ATTEMPTS    = 3;       // consecutive all-nodes-missing sweeps before CL_DOWN
-static const uint32_t CL_DOWN_RECHECK_MS = 30000;   // periodic re-check cadence once CL_DOWN
-static const uint32_t CL_SWEEP_MS        = 3900;    // one full 1..13 hop cycle at this screen's 300ms dwell
+static const uint32_t CL_NODE_LOST_MS    = 5000;   // Mark a node down after 5 s without a beacon.
+static const uint8_t  CL_MAX_ATTEMPTS    = 3;       // Drop to CL_DOWN after 3 failed sweeps.
+static const uint32_t CL_DOWN_RECHECK_MS = 30000;   // Re-check every 30 s once CL_DOWN.
+static const uint32_t CL_SWEEP_MS        = 3900;    // One full 1..13 hop cycle at 300 ms dwell.
 
 static bool clAnyNodeDown() {
   for (uint8_t i = 0; i < clNodeN; i++) if (clNodes[i].down) return true;
@@ -1092,11 +942,10 @@ static void clRebuildHopSetFromNotDown() {
   else if (n > 1)  wifiIdsHopSet(chs, n);
 }
 
-// Called from onBeacon() for every beacon, management-frame only -- a
-// SSID-hash match against the active lock target is checked here, cheap for
-// every other beacon in range. Tracks node found/lost/moved by BSSID so a
-// channel move can be told apart from a different node entirely (see the
-// ClNode comment above).
+// Called from onBeacon() for every management frame.
+// Check the SSID hash against the active lock target.
+// Track node found, lost, or moved by BSSID.
+// Distinguish channel moves from new nodes.
 static void clOnBeacon(const WifiIdsFrame &f, const uint8_t *b, const uint8_t *s, uint8_t sl, bool haveSsid) {
   if (clMode != CL_SEARCHING && clMode != CL_LOCKED && clMode != CL_REACQUIRING && clMode != CL_DOWN) return;
   if (!haveSsid) return;
@@ -1117,7 +966,7 @@ static void clOnBeacon(const WifiIdsFrame &f, const uint8_t *b, const uint8_t *s
       uint32_t el = (millis() - startMs) / 1000;
       char line[26];
       snprintf(line, sizeof line, "%02lu:%02lu NODE-MOVED ch%d->ch%d", el / 60, el % 60, oldCh, f.channel);
-      alogPush(line);
+      alogPush(line, SEV_WATCH, b, clSsid);
       if (wlogIsOpen()) {
         char wl[112];
         snprintf(wl, sizeof wl, "%s,%d,chanlock,watch,NODE-MOVED %02X%02X%02X ch%d->ch%d",
@@ -1128,7 +977,7 @@ static void clOnBeacon(const WifiIdsFrame &f, const uint8_t *b, const uint8_t *s
       uint32_t el = (millis() - startMs) / 1000;
       char line[26];
       snprintf(line, sizeof line, "%02lu:%02lu NODE-UP ch%d", el / 60, el % 60, f.channel);
-      alogPush(line);
+      alogPush(line, SEV_WATCH, b, clSsid);
       if (wlogIsOpen()) {
         char wl[112];
         snprintf(wl, sizeof wl, "%s,%d,chanlock,watch,NODE-UP %02X%02X%02X ch%d",
@@ -1139,10 +988,9 @@ static void clOnBeacon(const WifiIdsFrame &f, const uint8_t *b, const uint8_t *s
     return;
   }
 
-  // Genuinely new BSSID for this SSID -- only adopted during a deliberate
-  // sweep (initial discovery or reacquire), never while just CL_LOCKED, so
-  // a plain roaming client's probe-elicited response can't silently grow
-  // the tracked set.
+  // Adopt a new BSSID only during a deliberate sweep.
+  // Ignore it while CL_LOCKED.
+  // Prevent roaming clients from growing the tracked set.
   if (sweeping && clNodeN < 3) {
     ClNode &n = clNodes[clNodeN++];
     memcpy(n.bssid, b, 6);
@@ -1172,7 +1020,7 @@ static void serviceClMode() {
           if (clNodeN == 1)      snprintf(line, sizeof line, "%02lu:%02lu SSID found ->ch%d", el / 60, el % 60, chs[0]);
           else if (clNodeN == 2) snprintf(line, sizeof line, "%02lu:%02lu SSID found ->ch%d,%d", el / 60, el % 60, chs[0], chs[1]);
           else                   snprintf(line, sizeof line, "%02lu:%02lu SSID found ->ch%d,%d,%d", el / 60, el % 60, chs[0], chs[1], chs[2]);
-          alogPush(line);
+          alogPush(line, SEV_WATCH, nullptr, clSsid);
         } else {
           wifiIdsHopResume();   // keep sweeping -- no attempt cap on the initial search
           clSweepStart = now;
@@ -1188,7 +1036,7 @@ static void serviceClMode() {
         uint32_t el = (now - startMs) / 1000;
         char line[26];
         snprintf(line, sizeof line, "%02lu:%02lu NODE-DOWN ch%d", el / 60, el % 60, clNodes[i].channel);
-        alogPush(line);
+        alogPush(line, SEV_WATCH, clNodes[i].bssid, clSsid);
         if (wlogIsOpen()) {
           char wl[112];
           snprintf(wl, sizeof wl, "%s,%d,chanlock,watch,NODE-DOWN %02X%02X%02X ch%d",
@@ -1196,11 +1044,11 @@ static void serviceClMode() {
                    clNodes[i].bssid[3], clNodes[i].bssid[4], clNodes[i].bssid[5], clNodes[i].channel);
           wlogRow(wl); wlogFlush();
         }
-        // Losing even one node (not just the whole tracked set) kicks off a
-        // reacquire sweep -- it may just have moved channels. The other,
-        // still-good nodes keep getting their lastSeen refreshed too as the
-        // sweep passes their channels, so this costs one bounded ~3.9s dip
-        // in focus, not a false "network down".
+        // Lose one node. Start a reacquire sweep.
+        // The node may have moved channels.
+        // Other nodes refresh lastSeen during the sweep.
+        // This costs one bounded 3.9 s dip in focus.
+        // It avoids a false "network down" alert.
         clDownRecheck = false;
         wifiIdsHopResume();
         clSweepStart = now;
@@ -1219,7 +1067,7 @@ static void serviceClMode() {
             uint32_t el = (now - startMs) / 1000;
             char line[26];
             snprintf(line, sizeof line, "%02lu:%02lu NETWORK-UP", el / 60, el % 60);
-            alogPush(line);
+            alogPush(line, SEV_OK, nullptr, clSsid);
             if (wlogIsOpen()) {
               char wl[112];
               snprintf(wl, sizeof wl, "%s,%d,chanlock,ok,NETWORK-UP %s", devTimeNowString().c_str(), wifiIdsChannel(), clSsid);
@@ -1227,7 +1075,6 @@ static void serviceClMode() {
             }
           }
         } else if (clDownRecheck) {
-          // still gone -- stay down, reschedule, no repeat alert-log spam
           clMode = CL_DOWN;
           clDownRecheckAt = now + CL_DOWN_RECHECK_MS;
         } else {
@@ -1241,7 +1088,7 @@ static void serviceClMode() {
             uint32_t el = (now - startMs) / 1000;
             char line[26];
             snprintf(line, sizeof line, "%02lu:%02lu NETWORK-DOWN", el / 60, el % 60);
-            alogPush(line);
+            alogPush(line, SEV_ALERT, nullptr, clSsid);
             if (wlogIsOpen()) {
               char wl[112];
               snprintf(wl, sizeof wl, "%s,%d,chanlock,alert,NETWORK-DOWN %s", devTimeNowString().c_str(), wifiIdsChannel(), clSsid);
@@ -1262,8 +1109,6 @@ static void serviceClMode() {
       break;
   }
 }
-
-// ---- header picker UI: tap the channel number to change mode -----------
 
 static const char *clModeItemLabel(int i) {
   static const char *items[3] = { "Auto-hop", "Lock channel...", "Lock to SSID..." };
@@ -1365,8 +1210,9 @@ static void clPickSsid() {
   }
 }
 
-// forward decls -- defined in the "drawing" section further down; needed
-// here so picking a lock mode can force an immediate full repaint.
+// Forward declarations for drawing functions.
+// They live further down in this file.
+// Picking a lock mode forces an immediate full repaint.
 static void drawStats();
 static void drawBanner();
 static void drawLog();
@@ -1378,15 +1224,11 @@ static void clRestoreScreen() {
   lastStatsDraw = 0;
   lastBannerKey = 0xFFFFFFFFu;
   alogDirty = true;
-  // uiClearBelow() just wiped the whole stats band, but drawStats()'s
-  // DEAUTH/BEACON/AUTH/rogue/channel/elapsed lines are each gated by
-  // uiFieldChanged() against their own prevXxx buffer (see the comment
-  // above resetStatsFields()) -- any line whose underlying value hasn't
-  // actually changed since before the picker opened would otherwise be
-  // skipped and stay blank instead of being reprinted onto the now-empty
-  // background. Must reset those buffers here too, not just at
-  // widsEnter(), since clRestoreScreen() also runs after every pick in
-  // the channel-lock picker (clOpenPicker()).
+  // uiClearBelow() wipes the stats band.
+  // drawStats() gates each line with uiFieldChanged().
+  // Unchanged lines would stay blank on the empty background.
+  // Reset the prevXxx buffers here.
+  // clRestoreScreen() runs after every picker selection.
   resetStatsFields();
   drawStats();
   drawBanner();
@@ -1394,11 +1236,6 @@ static void clRestoreScreen() {
 }
 
 static void clOpenPicker() {
-  // Highlight whichever mode is actually active right now (green outline,
-  // see uiDropdownPick()) instead of always opening blank -- Auto-hop is
-  // naturally the default/first-listed option already (index 0), and now
-  // it's also shown as the current one whenever that's genuinely the case,
-  // rather than the picker implying nothing is selected.
   int current = (clMode == CL_AUTO) ? 0 : (clMode == CL_MANUAL) ? 1 : 2;
   int pick = uiDropdownPick("Channel lock", 3, clModeItemLabel, current);
   if (pick == 0) {
@@ -1413,7 +1250,47 @@ static void clOpenPicker() {
   clRestoreScreen();
 }
 
-// ---- verdict --------------------------------------------------------
+static void widsOpenOptions() {
+  bool armed = engagementIsArmed();
+  uiDrawTopBar("Options");
+  uiClearBelow(29);
+
+  Btn chan = {8, 46, tft.width() - 16, 34, "Channel lock..."};
+  Btn flag = {8, 88, tft.width() - 16, 34, "Flag finding"};
+  uiDrawMenuButton(chan);
+  if (armed) uiDrawMenuButton(flag);
+  else       uiDrawButtonColored(flag, ILI9341_DARKGREY);   // dimmed -- see flagDetectionShow()'s own gate
+
+  for (;;) {
+    TouchPoint t = uiReadTouch();
+    if (!t.pressed) { delay(15); continue; }
+    if (uiTouchInBackButton(t)) { uiWaitForRelease(); clRestoreScreen(); return; }
+    if (uiTouchInButton(t, chan)) {
+      uiWaitForRelease();
+      clOpenPicker();   // restores the screen itself when it returns
+      return;
+    }
+    if (uiTouchInButton(t, flag)) {
+      uiWaitForRelease();
+      uint8_t worst = vD.sev;
+      if (vB.sev > worst) worst = vB.sev;
+      if (vA.sev > worst) worst = vA.sev;
+      flagDetectionShow("wifi_ids", worst);   // shows its own clear "not armed" screen if tapped while dimmed
+      clRestoreScreen();
+      return;
+    }
+  }
+}
+
+// Tap an alert-log row to open details.
+// This overrides the usual dismiss gesture.
+// MAC and SSID show "N/A" for aggregate stats.
+// GPS shows the location at log time, not a live re-check.
+static void showAlertDetail(uint8_t idx) {
+  const AlogEntry &e = alog[idx];
+  showDetectionDetail(e.line, e.sev, e.timeStr, e.hasMac ? e.mac : nullptr,
+                       e.ssid[0] ? e.ssid : nullptr, e.hasGps, e.lat, e.lon, "wifi_ids");
+}
 
 static uint8_t sevDeauth() {
   uint32_t tot = dDeauth + dDisassoc;
@@ -1425,15 +1302,9 @@ static uint8_t sevDeauth() {
 
 static uint8_t sevBeacon(uint16_t est) {
   int pop = bloomPop(bBloom);
-  // ALERT: unmistakable flood -- ~85+ distinct BSSIDs in 5 s, OR a pile of
-  // random SSIDs (ambient is ~zero), OR a moderate distinct-count rise that
-  // is ALSO backed by randomized MACs / random SSIDs / a capture that can't
-  // keep up.
   if (bRandom >= 12 || pop >= 200 ||
       (pop >= 110 && (bLaa >= 20 || bRandom >= 4 || bSeqMac >= 6 || dropDelta >= 8)))
     return SEV_ALERT;
-  // WATCH: ~40+ distinct BSSIDs (top of a busy office) or a high raw beacon
-  // rate without the corroborating anomalies.
   if (pop >= 110 || bBeacons >= 500) return SEV_WATCH;
   (void)est;
   return SEV_OK;
@@ -1441,8 +1312,6 @@ static uint8_t sevBeacon(uint16_t est) {
 
 static uint8_t sevAuth(uint16_t srcEst) {
   int spop = bloomPop(aSrcBloom);
-  // Normal auth/assoc is a trickle. ALERT: >=16/s, OR >=6/s that is ALSO
-  // spread across ~50+ distinct source MACs (the mdk3 'a' signature).
   if (aReq >= 80 || (aReq >= 30 && spop >= 130)) return SEV_ALERT;
   if (aReq >= 30) return SEV_WATCH;
   (void)srcEst;
@@ -1471,7 +1340,6 @@ static void computeVerdicts() {
   vSpoofFlag = dSpoof > 0;
 }
 
-// rising edge OK/WATCH -> ALERT: log it (used for the scrolling list).
 static KarmaBssid *karmaWorst() {
   KarmaBssid *w = nullptr;
   for (int i = 0; i < KARMA_N; i++) {
@@ -1489,11 +1357,10 @@ static WpsTgt *wpsWorst() {
   return w;
 }
 
-// rising edge OK/WATCH -> ALERT: log it (used for the scrolling list).
-// pk/pp/pw are the previous window's KARMA/PMKID/WPS severities -- CSA's
-// hard-violation and re-announce cases, and handshake-theft/KRACK, log
-// directly from their own detector functions instead (one-shot "this IS
-// the attack" events, not windowed rate trends).
+// Log severity transitions from OK or WATCH to ALERT.
+// pk, pp, pw hold previous KARMA, PMKID, and WPS severities.
+// CSA, handshake-theft, and KRACK log directly from their detectors.
+// They are one-shot events, not windowed rate trends.
 static void logEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uint8_t pp, uint8_t pw) {
   uint32_t el = (millis() - startMs) / 1000;
   char line[26];
@@ -1518,7 +1385,7 @@ static void logEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uint8_t pp,
     if (w) snprintf(line, sizeof line, "%02lu:%02lu KARMA %02X%02X%02X x%u", el / 60, el % 60,
                      w->bssid[3], w->bssid[4], w->bssid[5], (unsigned)(w->ssidN + w->overflow));
     else   snprintf(line, sizeof line, "%02lu:%02lu KARMA detected", el / 60, el % 60);
-    alogPush(line);
+    alogPush(line, SEV_ALERT, w ? w->bssid : nullptr);
   }
   uint8_t sp = sevPmkid();
   if (sp == SEV_ALERT && pp != SEV_ALERT) {
@@ -1526,7 +1393,7 @@ static void logEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uint8_t pp,
     alogPush(line);
   } else if (sp == SEV_WATCH && pp == SEV_OK) {
     snprintf(line, sizeof line, "%02lu:%02lu PMKID?", el / 60, el % 60);
-    alogPush(line);
+    alogPush(line, SEV_WATCH);
   }
   uint8_t sw = sevWps();
   if (sw == SEV_ALERT && pw != SEV_ALERT) {
@@ -1534,7 +1401,7 @@ static void logEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uint8_t pp,
     if (t) snprintf(line, sizeof line, "%02lu:%02lu WPS-BRUTE %02X%02X%02X x%u", el / 60, el % 60,
                      t->bssid[3], t->bssid[4], t->bssid[5], t->count);
     else   snprintf(line, sizeof line, "%02lu:%02lu WPS-BRUTE detected", el / 60, el % 60);
-    alogPush(line);
+    alogPush(line, SEV_ALERT, t ? t->bssid : nullptr);
   }
 }
 
@@ -1545,28 +1412,26 @@ static void resetWindow() {
   memset(aSrcBloom, 0, sizeof aSrcBloom);
   aReq = 0; aLaaSrc = 0;
   for (int i = 0; i < TGT_N; i++) tgts[i].hits = 0;
-  // PMKID and WPS are windowed (5s), like the flood detectors above.
-  // KARMA/CSA/handshake-theft/PMKID-wait/KRACK tables are session-scoped
-  // (slow-forming or one-shot patterns) and are NOT cleared here -- only at
-  // widsEnter()/widsTouch(), same as the Ap/Tgt baseline tables.
+  // PMKID and WPS use a 5 s window.
+  // KARMA, CSA, handshake-theft, and KRACK tables are session-scoped.
+  // Do not clear them here.
+  // Clear them only at widsEnter() or widsTouch().
   pmkidSusp = 0; pmkidStaN = 0;
   for (int i = 0; i < WPS_N; i++) wpsTgts[i].count = 0;
   dropAtWindow = wifiIdsDropped();
 }
-
-// ---- drawing ------------------------------------------------------
 
 // Thin wrappers over the shared ui.h convention -- kept so the rest of this
 // file's `sevColor(x.sev)` / `sevTag(x.sev)` call sites don't need a rename.
 static uint16_t sevColor(uint8_t s) { return uiSevColor(s); }
 static const char *sevTag(uint8_t s) { return uiSevTag(s); }
 
-// Event-level SD log (never per frame): a row on ANY detector's severity
-// change -- OK->WATCH/ALERT and back -- plus one summary row per minute
-// from widsLoop(). Columns: millis,channel,detector,severity,detail.
-// Handshake-theft and KRACK are excluded here -- they log immediately from
-// their own detector (onEapol), not on a 5s-window edge, since the
-// correlation itself IS the attack rather than a rate trend.
+// Log severity changes for all detectors.
+// Include one summary row per minute from widsLoop().
+// Columns: millis, channel, detector, severity, detail.
+// Exclude handshake-theft and KRACK.
+// They log immediately from onEapol.
+// The correlation itself is the attack.
 static void wlogVerdictEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uint8_t pp, uint8_t pw) {
   if (!wlogIsOpen()) return;
   struct { const char *name; uint8_t prev, now; uint16_t a, b; } d[6] = {
@@ -1590,14 +1455,10 @@ static void wlogVerdictEdges(uint8_t pd, uint8_t pb, uint8_t pa, uint8_t pk, uin
   if (wrote) wlogFlush();
 }
 
-// "What's currently drawn" per line in the stats band -- see
-// uiDrawFieldIfChanged()/uiFieldChanged() in ui.h. This band used to be
-// erased and fully reprinted every second (the old comment here called
-// that out as already bounded, not uiClearBelow -- but still a full
-// reprint every tick); isolating each line means an unchanged DEAUTH /
-// BEACON / AUTH / ROGUE-AP / six-detector block no longer flashes just
-// because the elapsed-time field ticked over. widsEnter() resets all of
-// these alongside lastBannerKey (see resetStatsFields() below).
+// Track the last drawn text for each stats band line.
+// Use uiDrawFieldIfChanged() to avoid flashing unchanged lines.
+// The old code reprinted the whole band every second.
+// widsEnter() resets these buffers alongside lastBannerKey.
 static char prevChanLine[32] = "", prevElapsed[48] = "";
 static char prevDeauth1[32] = "", prevDeauth2[40] = "";
 static char prevBeacon1[32] = "", prevBeacon2[48] = "";
@@ -1619,9 +1480,6 @@ static void drawStats() {
 
   uint32_t el = (millis() - startMs) / 1000;
 
-  // Channel + lock-status readout: plain text, not a button -- see
-  // optionsBtnRect()'s comment above for why the lock picker now has its
-  // own separate button instead of living here.
   char chanSig[32];
   snprintf(chanSig, sizeof(chanSig), "%d|%d|%d|%d|%d", wifiIdsChannel(), clMode, clManualN, clNodeN, clAnyNodeDown());
   if (uiFieldChanged(prevChanLine, sizeof(prevChanLine), chanSig)) {
@@ -1629,8 +1487,9 @@ static void drawStats() {
     tft.setTextColor(accentLabel());
     tft.setCursor(CHAN_X, HDR_Y);
     tft.printf("ch%d", wifiIdsChannel());
-    // "+N" when more than one channel is being watched (a manual multi-
-    // channel lock, or a mesh SSID lock with more than one node discovered).
+    // Show "+N" when watching multiple channels.
+    // This covers manual multi-channel locks.
+    // It also covers mesh SSID locks with multiple discovered nodes.
     if (clMode == CL_MANUAL && clManualN > 1) {
       tft.printf("+%d", clManualN - 1);
     } else if ((clMode == CL_SEARCHING || clMode == CL_LOCKED || clMode == CL_REACQUIRING || clMode == CL_DOWN)
@@ -1684,12 +1543,11 @@ static void drawStats() {
                           "ROGUE-AP  %s  (baseline %d)", vRogue ? "HIT" : "watching", rogueApCount());
   }
 
-  // One compact line for the six newer detectors -- color conveys severity
-  // (no room here for a text tag per item the way the three blocks above
-  // get one); same technique ble_scan.cpp's "Flipper:N  Glasses:N" summary
-  // line uses (sequential setTextColor+print, not one printf). Six colors
-  // on one line, so like the channel readout above this is a gate-only
-  // field.
+  // Show six newer detectors on one compact line.
+  // Color conveys severity.
+  // Use sequential setTextColor and print calls.
+  // This matches the technique in ble_scan.cpp.
+  // The line is a gate-only field.
   char detSig[16];
   snprintf(detSig, sizeof(detSig), "%d%d%d%d%d%d", sevKarma(), sevCsa(), vHsTheft, sevPmkid(), vKrack, sevWps());
   if (uiFieldChanged(prevDetLine, sizeof(prevDetLine), detSig)) {
@@ -1705,16 +1563,13 @@ static void drawStats() {
 }
 
 static uint32_t bannerKey() {
-  // Bits 10-15: one each for the six newer detectors, "elevated at all"
-  // (WATCH or ALERT) rather than full 2-bit precision -- the original
-  // uint16_t was full at that point. This means a WATCH->ALERT escalation
-  // within one of these six, with nothing else changing, can go unrepainted
-  // for up to one more 5s window (the underlying detection/logging doesn't
-  // depend on this key at all, only the on-screen repaint timing does) --
-  // an acceptable cosmetic tradeoff against widening this key's type
-  // further than the uint32_t below. Bits 16-19: channel-lock state (3 bits
-  // for the 6 ClMode values) + "any tracked node down" -- widened to
-  // uint32_t to fit these once the original 16 bits filled up.
+  // Bits 10-15 track the six newer detectors.
+  // Use one bit per detector for WATCH or ALERT.
+  // A WATCH-to-ALERT escalation may delay repaint by one 5 s window.
+  // This is an acceptable cosmetic tradeoff.
+  // Bits 16-19 hold the channel-lock state.
+  // Bit 19 tracks any tracked node down.
+  // The key type is uint32_t to fit all fields.
   return (uint32_t)vD.sev | ((uint32_t)vB.sev << 2) | ((uint32_t)vA.sev << 4) |
                     (vSpoofFlag ? 0x40u : 0) | (vRogue ? 0x80u : 0) |
                     (vPwn ? 0x100u : 0) | (vTwin ? 0x200u : 0) |
@@ -1745,10 +1600,10 @@ static void drawBanner() {
   if (sevPmkid()   > worst) worst = sevPmkid();
   if (vKrack   && worst < SEV_ALERT) worst = SEV_ALERT;  // a replayed message 3 IS the attack
   if (sevWps()     > worst) worst = sevWps();
-  // Channel lock: the protected network being fully gone (3 failed sweeps)
-  // IS the event, same as HS-THEFT/KRACK. A single tracked node down while
-  // the lock is otherwise LOCKED/REACQUIRING is only ever a WATCH -- it
-  // never forces ALERT on its own, only CL_DOWN does.
+  // CL_DOWN represents a fully gone protected network.
+  // Treat it as an ALERT event.
+  // A single down node during LOCKED or REACQUIRING is only a WATCH.
+  // It never forces an ALERT on its own.
   if (clMode == CL_DOWN && worst < SEV_ALERT) worst = SEV_ALERT;
   if ((clMode == CL_LOCKED || clMode == CL_REACQUIRING) && clAnyNodeDown() && worst < SEV_WATCH)
     worst = SEV_WATCH;
@@ -1757,10 +1612,10 @@ static void drawBanner() {
   else                    uiClearRect(4, BANNER_Y, tft.width() - 8, BANNER_H);   // theme-aware, not flat black
 
   if (worst == SEV_ALERT) {
-    // 128 B: comfortably over the worst case of every tag firing at once
-    // (~108 B with all 12 below) -- appendTag() bounds by the destination's
-    // REMAINING space (sizeof-strlen-1), not a fixed source-length cap, so
-    // this can't overflow even if more tags are added later.
+    // Allocate 128 bytes for the tag string.
+    // This covers the worst case of all tags firing.
+    // appendTag() bounds writes by remaining space.
+    // The buffer cannot overflow if we add more tags later.
     char what[128]; what[0] = 0;
     auto appendTag = [&](const char *tag) { strncat(what, tag, sizeof(what) - strlen(what) - 1); };
     if (vSpoofFlag)               appendTag("DEAUTH-SPOOF ");
@@ -1784,49 +1639,52 @@ static void drawBanner() {
     tft.setTextSize(1);
     tft.setCursor(10, BANNER_Y + 26);
     tft.print(what);
-    if (!alerted) { alerted = true; ledSet(true); beep(400, 1200); }
+    if (!alerted) {
+      alerted = true;
+      alertedSince = millis();
+      ledAlert(true);
+      // Force the screen awake for 30 seconds.
+      // This matches the banner auto-clear window.
+      // It keeps the ALERT visible even if Display Timeout was near.
+      powerWakeFor(ALERT_AUTOCLEAR_MS);
+      if (!idsMuted) beep(400, 1200);
+    }
   } else {
     tft.setTextSize(1);
     tft.setTextColor(worst == SEV_WATCH ? ILI9341_YELLOW : ILI9341_GREEN);
     tft.setCursor(10, BANNER_Y + 16);
     tft.print(worst == SEV_WATCH ? (vPwn ? "Pwnagotchi in range" : "elevated -- watching")
                                  : "no attack indicators");
-    if (alerted) { alerted = false; ledSet(false); }
+    if (alerted) { alerted = false; ledAlert(false); }
   }
 }
 
 static void drawLog() {
   if (!alogDirty) return;
   alogDirty = false;
-  // Stop clear above UI_STATUSBAR_H -- clearing all the way to tft.height()
-  // wiped the persistent status-bar strip (background + white separator
-  // line) without restoring it, since that's drawn once by uiDrawStatusBar()
-  // and otherwise only repainted piecemeal (clock/battery glyphs) by
-  // uiServiceChrome(), not as a whole strip -- this is why the bar used to
-  // vanish on every log update, leaving only the clock/battery floating
-  // with no strip under them.
+  // Stop clearing above UI_STATUSBAR_H.
+  // Clearing to tft.height() wiped the persistent status-bar strip.
+  // uiDrawStatusBar() draws it once.
+  // uiServiceChrome() repays it piecemeal.
+  // This fix prevents the bar from vanishing on log updates.
   uiClearRect(0, LOG_Y, tft.width(), tft.height() - UI_STATUSBAR_H - LOG_Y);   // theme-aware, not flat black
   tft.setTextSize(1);
   tft.setTextColor(ILI9341_RED);
-  // Clamp to however many lines actually fit above the status bar, rather
-  // than assuming all 4 stored lines always do -- on this board's landscape
-  // orientation (240px tall) the stats block above has grown enough (the
-  // new N_Y status line) that 4 no longer reliably fits; portrait still
-  // shows all 4.
+  // Clamp the line count to fit above the status bar.
+  // The stats block grew on landscape orientation.
+  // Four lines no longer reliably fit.
+  // Portrait orientation still shows all four.
   int maxLines = (tft.height() - UI_STATUSBAR_H - LOG_Y) / 12;
   if (maxLines < 0) maxLines = 0;
   uint8_t show = alogN < (uint8_t)maxLines ? alogN : (uint8_t)maxLines;
+  s_logShown = show;   // widsTouch() needs this to hit-test a tap against a specific row
   for (uint8_t i = 0; i < show; i++) {
     tft.setCursor(2, LOG_Y + i * 12);
-    tft.print(alog[i]);
+    tft.print(alog[i].line);
   }
-  // Drawn last so it always paints on top of any log text underneath --
-  // see optionsBtnRect()'s comment for why this isn't given its own
-  // reserved row instead.
   uiDrawButton(optionsBtnRect());
+  uiDrawButtonColored(muteBtnRect(), idsMuted ? ILI9341_DARKGREY : accentFill());
 }
-
-// ---- lifecycle ----------------------------------------------------
 
 void widsEnter() {
   uiDrawTopBar("WiFi IDS");
@@ -1836,7 +1694,6 @@ void widsEnter() {
   rogueApLoad();
   rogueOn = rogueApLoaded() && rogueApCount() > 0;
 
-  // No baseline -> offer to go learn one, or run IDS without evil-twin detection.
   if (!rogueOn) {
     tft.setTextSize(1);
     tft.setTextColor(ILI9341_YELLOW);
@@ -1858,14 +1715,14 @@ void widsEnter() {
     uiClearBelow(29);
   }
 
-  beepHold(true);          // the banner chirps on the OK->ALERT edge
+  beepHold(true);
   vRogue = false;
   vPwn = vTwin = pwnLogged = false;
   rogueSeenN = 0;
 
   memset(aps, 0, sizeof aps);
   memset(bRecent, 0, sizeof bRecent); bRecentN = 0;
-  memset(alog, 0, sizeof alog); alogN = 0; alogDirty = false;
+  memset(alog, 0, sizeof alog); alogN = 0; alogDirty = false; s_logShown = 0;
   vD = vB = vA = { SEV_OK, 0, 0, 0, 0, 0 };
   memset(vATop, 0, sizeof vATop);
   vSpoofFlag = false;
@@ -1875,9 +1732,6 @@ void widsEnter() {
   resetStatsFields();
   alerted = false;
 
-  // KARMA / CSA-abuse / handshake-theft / PMKID-harvest / KRACK / WPS --
-  // session-scoped tables and one-shot alert flags, all cleared here same
-  // as the Ap/Tgt baselines above.
   memset(karma, 0, sizeof karma);
   memset(csaTgts, 0, sizeof csaTgts);
   csaOffRegdomain = 0; csaOffLogged = false;
@@ -1893,8 +1747,6 @@ void widsEnter() {
   memset(wpsTgts, 0, sizeof wpsTgts);
   lastKarmaSev = lastPmkidSev = lastWpsSev = SEV_OK;
 
-  // Channel lock / SSID-protect: session-scoped, not NVS-persisted -- every
-  // screen entry starts back at free auto-hop.
   clMode = CL_AUTO;
   clSsid[0] = 0; clSsidHash = 0;
   memset(clNodes, 0, sizeof clNodes);
@@ -1905,40 +1757,102 @@ void widsEnter() {
   resetWindow();
   dropAtWindow = 0;
 
-  wifiIdsWantEapol(true);   // widen the filter before Begin() so the EAPOL/WPS ring gets allocated
-  wifiIdsBegin();
-  wifiIdsSetDwell(300);    // keep the screen's historical 300 ms hop cadence
-  hD = wifiIdsRegister(&onDeauthFamily, nullptr, WIDS_MASK_DEAUTH_FAMILY);
-  hB = wifiIdsRegister(&onBeacon,       nullptr, WIDS_BIT(WIDS_BEACON));
-  hA = wifiIdsRegister(&onAuthAssoc,    nullptr,
-                       WIDS_BIT(WIDS_AUTH) | WIDS_BIT(WIDS_ASSOC_REQ) | WIDS_BIT(WIDS_REASSOC_REQ));
-  hK    = wifiIdsRegister(&onKarmaProbeResp, nullptr, WIDS_BIT(WIDS_PROBE_RESP));
-  hCsa  = wifiIdsRegister(&onCsaAction,      nullptr, WIDS_BIT(0xD));   // action frames (unnamed subtype, see drone_detect.cpp precedent)
-  hEapol = wifiIdsRegisterEapol(&onEapol, nullptr);
-  hWps   = wifiIdsRegisterWps(&onWps, nullptr);
+  // Demo Mode exercises the alert-log tap-to-detail feature.
+  // The real engine processes raw 802.11 frames across ten subsystems.
+  // Faking that is not worth the effort.
+  // Skip real promiscuous capture.
+  // widsLoop() injects synthetic alog entries directly.
+  // The stats and banner machinery remain untouched.
+  if (!demoModeEnabled()) {
+    wifiIdsWantEapol(true);   // widen the filter before Begin() so the EAPOL/WPS ring gets allocated
+    wifiIdsBegin();
+    wifiIdsSetDwell(300);    // keep the screen's historical 300 ms hop cadence
+    hD = wifiIdsRegister(&onDeauthFamily, nullptr, WIDS_MASK_DEAUTH_FAMILY);
+    hB = wifiIdsRegister(&onBeacon,       nullptr, WIDS_BIT(WIDS_BEACON));
+    hA = wifiIdsRegister(&onAuthAssoc,    nullptr,
+                         WIDS_BIT(WIDS_AUTH) | WIDS_BIT(WIDS_ASSOC_REQ) | WIDS_BIT(WIDS_REASSOC_REQ));
+    hK    = wifiIdsRegister(&onKarmaProbeResp, nullptr, WIDS_BIT(WIDS_PROBE_RESP));
+    hCsa  = wifiIdsRegister(&onCsaAction,      nullptr, WIDS_BIT(0xD));   // action frames (unnamed subtype, see drone_detect.cpp precedent)
+    hEapol = wifiIdsRegisterEapol(&onEapol, nullptr);
+    hWps   = wifiIdsRegisterWps(&onWps, nullptr);
+  }
 
   startMs = windowStart = millis();
   lastStatsDraw = 0;
   lastWlogSummary = millis();
+  lastDemoSpawn = 0;
   running = true;
 
-  wlogOpen("wifiids", "utc,channel,detector,severity,detail");   // event rows only
+  wlogOpen("wifiids", "utc,channel,detector,severity,detail");
 
   drawStats();
   drawBanner();
-  // drawLog() is normally only entered when alogDirty is set by a new
-  // event -- force one pass now so the Options button (drawn at the end
-  // of drawLog(), see its comment) actually appears on screen entry
-  // instead of staying invisible until the first log event or dismiss tap.
+  // Force a drawLog() pass on entry.
+  // drawLog() normally runs only when alogDirty is set.
+  // This ensures the Options button appears immediately.
   alogDirty = true;
+  drawLog();
+}
+
+static void spawnDemoAlert() {
+  static const char *kLines[] = {
+    "DEAUTH FLOOD demo", "ROGUE-AP? demo-ap", "KARMA demo",
+    "PMKID-HARVEST demo", "WPS-BRUTE demo", "EVIL-TWIN? demo-ssid",
+  };
+  static const char *kSsids[] = {"demo-ssid", "Free_WiFi", "demo-ap"};
+  uint8_t mac[6];
+  demoRandMac(mac);
+  bool withMac = (esp_random() % 2) == 0;   // mirrors the real mix of device-specific vs aggregate entries
+  uint8_t sev = SEV_ALERT;
+  alogPush(demoRandPick(kLines, 6), sev, withMac ? mac : nullptr,
+           withMac ? demoRandPick(kSsids, 3) : nullptr);
+  // alogPush() only updates the log.
+  // drawBanner() computes "worst" independently.
+  // A log entry does not change vRogue or vD.sev.
+  // The banner stayed green without this fix.
+  // Set vRogue to reuse the real ALERT and beep path.
+  vRogue = true;
+  drawBanner();
+  drawLog();
+}
+
+// Clear every sticky alert latch and the log.
+// Force a banner repaint.
+// This function handles both manual dismiss and 30 s auto-clear.
+static void dismissAlerts() {
+  alogN = 0;
+  memset(alog, 0, sizeof alog);
+  alogDirty = true;
+  s_logShown = 0;
+  alerted = false;
+  vRogue = false;                             // re-arm rogue-AP alerting
+  vPwn = vTwin = pwnLogged = false;
+  rogueSeenN = 0;
+  // KARMA and CSA are live-computed from their tables.
+  // They are not sticky booleans.
+  // Clear the tables here.
+  // Otherwise the alert reappears on the next redraw.
+  memset(karma, 0, sizeof karma);
+  memset(csaTgts, 0, sizeof csaTgts);
+  csaOffRegdomain = 0; csaOffLogged = false;
+  vHsTheft = hsTheftLogged = false;
+  vKrack = krackLogged = false;
+  ledAlert(false);
+  lastBannerKey = 0xFFFF;                     // force a banner repaint
+  drawBanner();
   drawLog();
 }
 
 void widsLoop() {
   if (!running) return;
+  if (demoModeEnabled()) {
+    if (millis() - lastDemoSpawn > 15000) { spawnDemoAlert(); lastDemoSpawn = millis(); }
+    return;
+  }
   wifiIdsLoop();            // pump hopper + drain captures into the 3 callbacks
 
   uint32_t now = millis();
+  if (alerted && now - alertedSince >= ALERT_AUTOCLEAR_MS) dismissAlerts();
   if (pmkidPinUntil && now > pmkidPinUntil && clMode == CL_AUTO) { wifiIdsHopResume(); pmkidPinUntil = 0; }
   serviceClMode();
   if (now - lastStatsDraw > 1000) { drawStats(); lastStatsDraw = now; }
@@ -1959,7 +1873,6 @@ void widsLoop() {
     windowStart = now;
   }
 
-  // SD: one summary row per minute regardless of transitions.
   if (wlogIsOpen() && now - lastWlogSummary >= 60000) {
     lastWlogSummary = now;
     uint8_t worst = vD.sev;
@@ -1976,40 +1889,59 @@ void widsLoop() {
 
 void widsTouch(const TouchPoint &t) {
   if (!t.isNewPress) return;
-  // "Options" button (drawn bottom-right, see optionsBtnRect()): opens
-  // the channel-lock picker. Checked first since it sits inside the
-  // banner/log tap area below and would otherwise be swallowed by the
-  // "dismiss alert" fallthrough right after this. A few px of slop on
-  // every side for a fat-finger tap on the resistive panel, same idea as
-  // this screen's old channel-lock button hit test.
+  // Check the Options button first.
+  // It sits inside the banner and log tap area.
+  // Otherwise the dismiss fallthrough swallows it.
+  // Add a few pixels of slop for fat-finger taps on the resistive panel.
   Btn ob = optionsBtnRect();
   bool hitOpt = (t.x >= ob.x - 4 && t.x < ob.x + ob.w + 4 && t.y >= ob.y - 6 && t.y < ob.y + ob.h + 6);
   DLOG("wids", "tap x=%d y=%d optBtn x=%d y=%d w=%d h=%d hit=%d", t.x, t.y, ob.x, ob.y, ob.w, ob.h, (int)hitOpt);
   if (hitOpt) {
     uiWaitForRelease();
-    clOpenPicker();
+    widsOpenOptions();
+    return;
+  }
+  // Check the Mute toggle next.
+  // It shares the same row and priority as Options.
+  // It must be checked before the banner/log fallthrough swallows it.
+  Btn mb = muteBtnRect();
+  bool hitMute = (t.x >= mb.x - 4 && t.x < mb.x + mb.w + 4 && t.y >= mb.y - 6 && t.y < mb.y + mb.h + 6);
+  if (hitMute) {
+    idsMuted = !idsMuted;
+    alogDirty = true;   // force drawLog() to repaint the button with its new label
+    uiWaitForRelease();
     return;
   }
   if (t.y < BANNER_Y) return;                 // taps land on the banner / log area
-  alogN = 0;
-  memset(alog, 0, sizeof alog);
-  alogDirty = true;
-  alerted = false;
-  vRogue = false;                             // re-arm rogue-AP alerting
-  vPwn = vTwin = pwnLogged = false;
-  rogueSeenN = 0;
-  // KARMA/CSA are live-computed from their tables each call (not sticky
-  // booleans like vRogue/vTwin/vPwn above), so dismissing has to actually
-  // clear the tables or the alert would just reappear next redraw.
-  memset(karma, 0, sizeof karma);
-  memset(csaTgts, 0, sizeof csaTgts);
-  csaOffRegdomain = 0; csaOffLogged = false;
-  vHsTheft = hsTheftLogged = false;
-  vKrack = krackLogged = false;
-  ledSet(false);
-  lastBannerKey = 0xFFFF;                     // force a banner repaint
-  drawBanner();
-  drawLog();
+  // Tap the banner to open the most recent alert detail.
+  // The banner shows several tags at once.
+  // It does not map to a single log entry.
+  // Use the newest entry as the fallback.
+  // AlogN==0 means nothing logged recently.
+  // Show a toast instead of a silent no-op.
+  if (t.y < BANNER_Y + BANNER_H) {
+    uiWaitForRelease();
+    if (alogN > 0) {
+      showAlertDetail(alogN - 1);
+    } else {
+      uiToast("no recent log entry for this -- condition may have scrolled off");
+    }
+    clRestoreScreen();
+    return;
+  }
+  // Tap a specific log row to open its detail.
+  // This overrides the usual dismiss gesture.
+  // Check it before the wider banner/log fallthrough.
+  if (t.y >= LOG_Y && t.y < LOG_Y + (int)s_logShown * 12) {
+    uint8_t idx = (uint8_t)((t.y - LOG_Y) / 12);
+    if (idx < s_logShown) {
+      uiWaitForRelease();
+      showAlertDetail(idx);
+      clRestoreScreen();
+      return;
+    }
+  }
+  dismissAlerts();
 }
 
 void widsExit() {
@@ -2026,5 +1958,5 @@ void widsExit() {
   wifiIdsWantEapol(false);
   wifiIdsEnd();            // last ref: drops promiscuous, restores WIFI_MODE_NULL
   beepHold(false);
-  ledSet(false);
+  ledAlert(false);
 }

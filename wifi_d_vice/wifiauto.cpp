@@ -1,4 +1,5 @@
 #include "wifiauto.h"
+#include "debuglog.h"
 #include <WiFi.h>
 #include <Preferences.h>
 
@@ -53,6 +54,6 @@ bool wifiAutoConnectOnBoot() {
   WiFi.setSleep(false);
   if (pass.length()) WiFi.begin(ssid.c_str(), pass.c_str());
   else               WiFi.begin(ssid.c_str());
-  Serial.printf("[wifiauto] boot connect -> %s\n", ssid.c_str());
+  DLOG("wifiauto", "boot connect -> %s", ssid.c_str());
   return true;
 }

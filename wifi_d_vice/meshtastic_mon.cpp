@@ -1,16 +1,12 @@
-// Meshtastic mesh monitor -- BLE central link to a node's phone API.
+// Meshtastic mesh monitor. This code links to a node phone API via BLE.
 //
-// Flow: scan for advertisers of the mesh service (or name "Meshtastic*"),
-// pick one, enter its BLE PIN, bond, then write ToRadio{want_config_id}
-// and drain FromRadio. A tiny hand-rolled protobuf walker pulls out the
-// bits we show: my node num, NodeInfo (num/names/snr/hops/last-heard),
-// and MeshPacket payloads for TEXT_MESSAGE_APP (1) and TELEMETRY_APP (67).
-// Nothing is written onto the mesh -- receive/display only.
+// Scan for mesh service advertisers. Pick one device. Enter its BLE PIN. Bond the device. Write a config request. Drain the response stream. A custom protobuf parser extracts node numbers and packet payloads. The code only receives data. It never writes to the mesh.
 #include "meshtastic_mon.h"
 #include "accent.h"
 #include "keyboard.h"
 #include "devtime.h"
 #include "wifi_ids.h"
+#include "power.h"
 #include <WiFi.h>
 #include <BLEDevice.h>
 #include <BLEClient.h>
@@ -38,9 +34,7 @@ static Cand cand[8];
 static int  candN = 0;
 static int  candSel = 0;
 
-// Scan runs ASYNC now (continuous BLEScan + advertised-device callback,
-// stopped from meshLoop after SCAN_MS) so the UI / back button stay live
-// while it runs -- it used to block meshEnter() for the whole 6 s.
+// Scan runs asynchronously. The main task stops the scan after six seconds. This keeps the user interface responsive.
 static uint32_t scanStartMs = 0, lastScanDraw = 0;
 static const uint32_t SCAN_MS = 6000;
 static uint32_t s_pin = 123456;
@@ -54,9 +48,6 @@ static volatile bool dataWaiting = true;   // poll once on connect
 static uint32_t lastPoll = 0;
 
 // ------- mesh data model -------
-// snr/hops/batt/volt were dropped -- their only reader was the per-node
-// row list the Nodes tab used to show (replaced with a count + last-heard
-// summary; see drawBody()'s view == 0 branch).
 struct Node {
   uint32_t num = 0;
   char sName[6] = "";
@@ -68,12 +59,7 @@ static int  nodeN = 0;
 static uint32_t myNum = 0;
 static bool cfgDone = false;
 
-// Channel names for the Alerts-tab picker (FromRadio.channel, field 10 --
-// one Channel message per configured slot, sent during the config dump
-// same as NodeInfo). ChannelSettings.name is documented "Less than 12
-// bytes"; empty means the node treats that slot as the unnamed "Default"
-// channel (per channel.proto's own comment), so this stays blank and the
-// picker just shows the bare index for it, same as before this existed.
+// Store channel names for the alerts picker. The firmware reads one channel message per slot. Channel names stay under twelve bytes. An empty name means the node uses a default slot. The picker shows the slot index for empty names.
 static char channelName[8][13];
 
 static const int FEED_MAX = 36;
@@ -81,22 +67,13 @@ static char feed[FEED_MAX][46];
 static int  feedHead = 0, feedCount = 0;
 
 // ------- alert-channel commands (Guardian pre-work) -------
-// A dedicated Meshtastic channel this device listens to for a handful of
-// remote commands. Meshtastic channels are PSK-encrypted (except the
-// unencrypted default/primary channel), so picking a dedicated,
-// PSK-protected channel here is real access control on its own --
-// "status" relies on just that. "reboot"/"ids on|off"/"guardian on|off"
-// additionally require a configurable code as a second, explicit gate
-// (the user asked for this specifically) since those have real-world
-// effects (a remote reboot; disarming detection right before an attack).
+// Listen to a dedicated channel for remote commands. Meshtastic channels use PSK encryption. This encryption provides basic access control. The status command uses only channel encryption. Other commands require a separate code. This code prevents accidental triggers.
 static int8_t s_alertChan = -1;        // -1 = no alert channel configured
 static char   s_alertCode[24] = "";    // "" = no code set -- gated commands always refuse
 static bool   s_idsArmed = false;      // background WiFi IDS raw-capture ref held via a command
 static bool   s_guardianArmed = false; // placeholder flag only -- see meshSetGuardianArmed()
 
-// Declared in screens.h -- called once from setup() (see wifi_d_vice.ino),
-// same spot/reasoning as themeLoad()/accentLoad()/tzLoad()/modvisLoad():
-// must run before the boot-time meshIdsArmed() check right after it.
+// Load alert settings once during setup. This function must run before the boot-time armed check.
 void meshAlertLoad() {
   Preferences p;
   p.begin("meshalert", true);
@@ -108,12 +85,7 @@ void meshAlertLoad() {
   s_guardianArmed = p.getBool("gdnarm", false);
   p.end();
 }
-// Declared in screens.h -- wifi_d_vice.ino's setup()/loop() read this to
-// restore and service background WiFi IDS capture independent of whichever
-// screen is active; the mesh BLE link itself stays screen-bound (meshEnter()/
-// meshExit()), but an armed background capture outlives leaving this screen
-// (and a "<code> reboot") because this flag -- not the BLE link -- is what
-// loop() checks.
+// Check if background WiFi capture is armed. The mesh link stays bound to this screen. The background capture runs independently. The main loop checks this flag to control the capture.
 bool meshIdsArmed() { return s_idsArmed; }
 
 static int  meshAlertChannelGet() { return s_alertChan; }
@@ -127,25 +99,13 @@ static void meshAlertSetCode(const char *code) {
   s_alertCode[sizeof(s_alertCode) - 1] = 0;
   Preferences p; p.begin("meshalert", false); p.putString("code", s_alertCode); p.end();
 }
-// Holds/drops a background ref on wifi_ids.cpp's promiscuous sniffer via
-// its existing ref-counted wifiIdsBegin()/wifiIdsEnd() -- the same seam
-// wifi_ids.h documents as built for "a screen and (later) Guardian [to]
-// each hold a reference without stepping on each other". Raw capture only:
-// the actual deauth/beacon/karma/rogue-AP detectors and alerting live
-// entirely in wifi_ids_screen.cpp, tied to that screen's own lifecycle, so
-// they still only run while that screen is open -- this just keeps frames
-// flowing into the ring in the meantime. Closing that gap for real is
-// Guardian work, not this.
+// Manage the background WiFi sniffer reference. The main loop uses this flag to control capture. Detectors run only while their screen is open. This function keeps frames flowing into the ring buffer.
 static void meshSetIdsArmed(bool on) {
   if (on == s_idsArmed) return;
   s_idsArmed = on;
   Preferences p; p.begin("meshalert", false); p.putBool("idsarm", on); p.end();
   if (on) wifiIdsBegin(); else wifiIdsEnd();
 }
-// Pure placeholder -- no monitor is wired up to this yet. This flag (and
-// the "guardian on/off" command surface) is the hook point DESIGN.md's
-// Guardian mode (a unified multi-monitor alert framework) will replace
-// with real behavior later.
 static void meshSetGuardianArmed(bool on) {
   if (on == s_guardianArmed) return;
   s_guardianArmed = on;
@@ -256,10 +216,7 @@ static void parseTelemetry(const uint8_t *b, size_t len, uint32_t from) {
   }
 }
 
-// Channel{ index=1 (int32, varint); settings=2 (ChannelSettings, len-delim);
-// role=3 (enum, varint) } -- per channel.proto. Only settings.name (field 3
-// inside ChannelSettings) is wanted here; everything else (psk, role, ...)
-// is skipped.
+// Parse channel messages. The structure contains an index, settings, and a role. This code only extracts the channel name. It skips all other fields.
 static void parseChannel(const uint8_t *b, size_t len) {
   Pb r{b, b + len};
   uint32_t f, w;
@@ -284,17 +241,7 @@ static void parseChannel(const uint8_t *b, size_t len) {
 }
 
 // ---------------- outbound: alert-channel command replies ----------------
-// Hand-rolled protobuf ENCODER, mirroring the Pb decoder's style above --
-// until now this file only ever sent the fixed want_config_id handshake
-// (connectTo()), nothing else. Submessages are length-prefixed, so this
-// builds innermost-first: Data -> MeshPacket -> ToRadio, each written into
-// its own small stack buffer before being embedded (as bytes) in the next.
-// Data.portnum=1/payload=2 are the same field numbers the decoder above
-// already proves correct on real traffic; MeshPacket.to/channel/hop_limit
-// are standard mesh.proto fields the decoder never needed to read, so
-// they're NOT yet proven against this device -- verify a reply actually
-// lands in the Meshtastic app before trusting this on a node running a
-// materially different firmware version.
+// Build alert command replies. This encoder mirrors the decoder above. Submessages use length prefixes. The code builds innermost messages first. It writes each layer into a separate stack buffer. The field numbers match the decoder. Verify replies on your specific node firmware.
 struct PbW {
   uint8_t *p; size_t cap, n = 0;
   void varint(uint64_t v) {
@@ -337,10 +284,7 @@ static const char *alertChanLabel(int i) {
   return labels[i];
 }
 
-// "status" needs no code (see the access-control note on s_alertChan
-// above); reboot/ids/guardian do -- the user asked for this split
-// specifically, since those have real effects a stray/garbled message on
-// an otherwise-open channel shouldn't be able to trigger.
+// Handle alert channel commands. The status command needs no code. Other commands require a code. This split prevents stray messages from triggering dangerous actions.
 static void meshHandleCommand(const char *text) {
   int chan = meshAlertChannelGet();
   if (chan < 0) return;   // no alert channel configured -- nothing to do
@@ -478,9 +422,7 @@ class MeshSec : public BLESecurityCallbacks {
 };
 static MeshSec meshSec;
 
-// Drop every stored BLE bond. A wrong-PIN attempt can leave a half-bond
-// whose bad key gets reused on later tries, so the right PIN then still
-// fails -- and a reboot doesn't clear NVS bonds. Same call ble_2fa uses.
+// Clear all stored BLE bonds. A failed pairing attempt saves a bad key. The system reuses this key on future tries. A reboot does not clear the key. This function removes all bonds.
 static void meshForgetBonds() {
   int n = esp_ble_get_bond_device_num();
   if (n <= 0) return;
@@ -491,12 +433,7 @@ static void meshForgetBonds() {
   free(list);
 }
 
-// Whether this device already holds a BLE bond for `addr` -- a passkey is
-// only ever used during INITIAL pairing; reconnecting to an already-bonded
-// device resumes encryption from the stored key and never calls
-// onPassKeyRequest() at all, so prompting for one every single connect
-// attempt (which the MS_PICK tap handler used to do unconditionally) was
-// pure unnecessary UX, not something the stack needed.
+// Check if the device already holds a BLE bond. The system only uses a passkey during initial pairing. Reconnections use stored keys. The code skips the passkey prompt for bonded devices.
 static bool meshIsBonded(const String &addr) {
   int n = esp_ble_get_bond_device_num();
   if (n <= 0) return false;
@@ -521,41 +458,8 @@ static void fromNumCB(BLERemoteCharacteristic *, uint8_t *, size_t, bool) {
   dataWaiting = true;
 }
 
-// Each readValue() is a real synchronous over-the-air BLE GATT read/
-// response round trip -- a node typically floods its whole known NodeDB
-// right after want_config_id, and draining that in one unbounded loop (it
-// used to run up to 24 of these back to back) blocked the main task solid
-// for several seconds with no touch polling or redraw, which read as a
-// hang (and, confirmed on hardware, could even starve the BLE link's
-// supervision timeout into a "link lost"). A small batch per call instead,
-// with dataWaiting only cleared on a true empty read (actually drained,
-// not just batch-capped), keeps a big backlog draining just as completely
-// but across many quick loop() iterations instead of one long blocking one
-// -- meshLoop()'s own "if (dataWaiting || ...)" trigger calls back in on
-// the very next iteration when there's more to read.
-// readValue() has NO timeout parameter and can block forever if a GATT
-// read's response is ever lost -- confirmed in the vendored BLE library:
-// BLERemoteCharacteristic.cpp's m_semaphoreReadCharEvt.wait("readValue")
-// is FreeRTOS::Semaphore::wait(), an unconditional
-// xSemaphoreTake(m_semaphore, portMAX_DELAY). Same bug class as the
-// BLEClient::connect() hang fixed last pass (that one at least had a
-// timeoutMs parameter to pass); this one has none at all
-// (BLERemoteCharacteristic.h: `String readValue();`). Reducing the read
-// batch size (the previous attempt at this) does nothing if a single read
-// stalls -- the whole device still hangs on that one call, and a stuck
-// link's own supervision timeout firing while we're stuck is consistent
-// with the "link lost right after" the user also saw.
-//
-// There's no library API to cancel a stuck read, so the only way to bound
-// this is to run the real call on its own task and stop WAITING on it
-// after a timeout -- the task may still be genuinely stuck forever inside
-// the library's own wait, and is deliberately abandoned in that case (its
-// heap-allocated args block outlives this function on purpose); it
-// self-deletes whenever/if the real BLE call ever does resolve, most
-// likely when the stack itself tears the stuck operation down on
-// disconnect. A leaked ~4KB task+small buffer on the rare timeout path is
-// an acceptable trade against a device that otherwise freezes solid
-// forever with no recovery.
+// Drain the response stream in small batches. A single GATT read can block forever. The main task would hang during a long drain. This code processes four messages per loop iteration. It clears the wait flag only when the queue is truly empty. The main loop resumes draining on the next iteration.
+// Bound the read operation with a timeout. The library cannot cancel a stuck read. This code runs the read on a separate task. It waits for one and a half seconds. It abandons the task if the timeout expires. The task deletes itself when the read finishes. A small memory leak on timeout is acceptable.
 struct MeshReadArgs {
   BLERemoteCharacteristic *ch;
   String result;
@@ -569,8 +473,7 @@ static void meshReadTask(void *arg) {
   vTaskDelete(nullptr);
 }
 
-// false = timed out (nothing read this attempt); true = *out is valid
-// (possibly empty, meaning the characteristic's queue is actually drained).
+// Read a message with a timeout. Return false if the operation times out. Return true if the read succeeds. The output string may be empty when the queue drains completely.
 static bool readFromRadioWithTimeout(String &out) {
   MeshReadArgs *args = new MeshReadArgs{chFromRadio};
   xTaskCreatePinnedToCore(meshReadTask, "meshRd", 4096, args, 1, nullptr, 0);
@@ -595,7 +498,41 @@ static void drainFromRadio() {
   dataWaiting = true;   // hit the batch cap -- more may still be queued
 }
 
-static bool connectTo(const String &addr) {
+struct MeshConnectArgs {
+  BLEClient *cli;
+  BLEAddress addr;
+  volatile bool done = false;
+  volatile bool ok = false;
+};
+
+static void meshConnectTask(void *arg) {
+  MeshConnectArgs *a = (MeshConnectArgs *)arg;
+  a->ok = a->cli->connect(a->addr, 0xFF, 8000);
+  a->done = true;
+  vTaskDelete(nullptr);
+}
+
+// Connect to a BLE device with a timeout. The library blocks the main task for up to eight seconds. Touch input stops working during this wait. This code runs the connection on a separate task. It polls for touch input and cancels the wait if the user presses back. It abandons the task on timeout.
+static bool connectWithCancel(BLEClient *c, const BLEAddress &addr, bool *cancelled) {
+  *cancelled = false;
+  MeshConnectArgs *args = new MeshConnectArgs{c, addr};
+  xTaskCreatePinnedToCore(meshConnectTask, "meshConn", 4096, args, 1, nullptr, 0);
+  uint32_t t0 = millis();
+  while (!args->done && millis() - t0 < 8500) {   // a hair over the task's own 8000ms cap
+    TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
+    if (t.pressed && uiTouchInBackButton(t)) { *cancelled = true; uiWaitForRelease(); return false; }
+    delay(20);
+  }
+  if (!args->done) return false;   // task itself still stuck somehow -- abandon, same as above
+  bool ok = args->ok;
+  delete args;
+  return ok;
+}
+
+static bool connectTo(const String &addr, bool *cancelled) {
+  *cancelled = false;
   authResult = 0;
   linkUp = false;
   BLEDevice::setSecurityCallbacks(&meshSec);
@@ -608,27 +545,12 @@ static bool connectTo(const String &addr) {
 
   cli = BLEDevice::createClient();
   cli->setClientCallbacks(&meshCliCB);
-  // Explicit timeout -- BLEClient::connect()'s default (no 3rd arg) is
-  // portMAX_DELAY, i.e. block forever. This call runs synchronously inside
-  // the touch handler with no touch polling, so a BLE open event that
-  // never arrives (most commonly: the node's one BLE slot is already held
-  // by its phone app, same case the error message below already names)
-  // used to freeze the whole screen with no way out but a hard reset.
-  if (!cli->connect(BLEAddress(addr.c_str()), 0xFF, 8000)) { errMsg = "connect failed"; return false; }
+  if (!connectWithCancel(cli, BLEAddress(addr.c_str()), cancelled)) {
+    if (!*cancelled) errMsg = "connect failed";
+    return false;
+  }
 
-  // Meshtastic's own BLE client-API docs: "highly recommended that you
-  // call your phone's setMTU function to increase MTU to 512 bytes" right
-  // after connecting -- this codebase never did, leaving every connection
-  // at BLE's default 23-byte MTU (20 usable payload bytes). A NodeInfo
-  // message (num + User submessage's name fields + SNR/hops) routinely
-  // exceeds that, so readValue() -> esp_ble_gattc_read_char() has to fall
-  // back to multiple internal ATT "read blob" round trips per packet
-  // instead of one -- exactly the kind of multi-step exchange where one
-  // lost PDU mid-sequence stalls the whole read waiting on a continuation
-  // that never arrives. 517 is the usual max-MTU value other Meshtastic
-  // BLE clients request (517 - 5 byte ATT header = the documented 512
-  // usable bytes). Fire-and-forget (no blocking wait), so this can't
-  // introduce a new hang itself.
+  // Set the MTU to 517 bytes. The default MTU is too small for node info messages. Small MTUs force multiple ATT read blob exchanges. A lost packet stalls the read. This code requests the maximum MTU. The call does not block.
   cli->setMTU(517);
 
   BLERemoteService *svc = cli->getService(BLEUUID(MESH_SVC));
@@ -640,16 +562,23 @@ static bool connectTo(const String &addr) {
 
   if (chFromNum && chFromNum->canNotify()) chFromNum->registerForNotify(fromNumCB);
 
-  // ToRadio { want_config_id = 0x2a }  -- field 3, varint
+  // Send a config request. The payload contains the config ID.
   uint8_t hs[3] = { (3 << 3) | 0, 0x2a };
   chToRadio->writeValue(hs, 2, false);
 
-  // Wait for the encrypted link to come up AND real config data to land.
-  // A wrong PIN surfaces as authResult == -1; a silent timeout is almost
-  // always the phone app still holding the node's one BLE slot.
+  // Wait for the link to establish. Check for authentication failures. A silent timeout usually means the phone app holds the connection slot.
   dataWaiting = true;
   uint32_t t0 = millis();
   while (millis() - t0 < 5000) {
+    TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
+    if (t.pressed && uiTouchInBackButton(t)) {
+      *cancelled = true;
+      uiWaitForRelease();
+      cli->disconnect();
+      return false;
+    }
     if (authResult == -1) {
       errMsg = "PIN rejected -- read it from the node's boot log / screen";
       meshForgetBonds();          // the rejected bond is poison; clear it
@@ -681,20 +610,7 @@ static Btn tabNodes, tabFeed, tabAlerts;
 static int view = 0;   // 0 = nodes, 1 = feed, 2 = alerts (channel/code settings)
 static Btn alertChanBtn, alertCodeBtn;   // view == 2 only; set in drawBody()
 
-// Flicker-free gate: drawTabs() is a pure function of `view`, so skip the
-// clear+redraw entirely when it hasn't changed since the last draw. With
-// the node-list backlog drain now happening in quick back-to-back
-// meshLoop() ticks (see drainFromRadio()), meshLoop()'s periodic
-// "drainFromRadio(); drawTabs(); drawBody();" call was firing many times
-// per second during that burst -- drawTabs() had no diffing of its own
-// (unlike drawBody(), which already uses uiFieldChanged()/
-// uiDrawListIfChanged() throughout), so the tab bar was being wiped and
-// fully repainted every single time even though nothing about it was
-// actually changing, which read as flicker. A call site that needs a
-// guaranteed fresh redraw even though `view` itself isn't changing (a
-// full-screen modal just wiped the tab bar out from under it) resets
-// lastTabsView = -1 first -- same pattern forceMeshBodyReset() already
-// uses for lastBodyView below.
+// Skip tab redraws when the view does not change. The main loop calls the draw function many times during data bursts. This check prevents screen flicker. Reset the view tracker to minus one when a modal covers the tabs. This forces a fresh redraw.
 static int lastTabsView = -1;
 
 static void drawTabs() {
@@ -717,12 +633,7 @@ static void drawTabs() {
   tft.fillRect(cur.x + 2, TABS_Y + TABS_H - 4, cur.w - 4, 3, accentFill());
 }
 
-// "What's currently drawn" state for uiDrawListIfChanged()/uiFieldChanged().
-// The row baseline shifts when the "link lost" banner appears/disappears,
-// and the row content model is entirely different between the Nodes and
-// Feed tabs -- forceMeshBodyReset() wipes the body and forgets all of this
-// whenever either changes (or the screen goes live fresh), so the diffed
-// redraw below always starts clean at the current layout.
+// Track the last drawn screen state. The layout shifts when the link status changes. The content model differs between tabs. The reset function clears this state. The diffed redraw always starts from a clean layout.
 static char prevRow[40][UI_LIST_SIG_LEN];
 static char prevHeader[64] = "";
 static char prevEmpty[48] = "";
@@ -836,9 +747,7 @@ static void drawBody() {
 }
 
 // ---------------- scan / pick ----------------
-// Advertised-device callback (BLE task context): collect mesh advertisers as
-// they arrive. Only plain-int candN is read by the main task while the scan
-// runs; cand[] fields are read only after stopScan().
+// Collect mesh advertisers during the scan. The main task reads the count while scanning. It reads the candidate array only after stopping the scan.
 class MeshScanCB : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice d) override {
     if (candN >= 8) return;
@@ -990,7 +899,8 @@ void meshTouch(const TouchPoint &t) {
         uiDrawTopBar("Meshtastic");
         uiShowLoading(bonded ? "Reconnecting..." : "Pairing / connecting...");
         st = MS_CONNECT;
-        if (connectTo(cand[candSel].addr)) {
+        bool cancelled = false;
+        if (connectTo(cand[candSel].addr, &cancelled)) {
           st = MS_LIVE;
           view = 0;
           lastBodyView = -1;   // force drawBody() to treat this as a fresh body, not a stale re-entry
@@ -998,6 +908,14 @@ void meshTouch(const TouchPoint &t) {
           uiDrawTopBar("Meshtastic");
           drawTabs();
           drawBody();
+        } else if (cancelled) {
+          // Back-button tap during the connect/pairing wait -- straight
+          // back to the candidate list, not the MS_ERR screen (nothing
+          // actually failed, the user just backed out).
+          st = MS_PICK;
+          teardown();
+          uiDrawTopBar("Meshtastic");
+          drawPick();
         } else {
           st = MS_ERR;
           uiClearBelow(29);

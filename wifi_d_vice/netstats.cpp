@@ -1,62 +1,38 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <Preferences.h>   // LAN speed test: persisted server IP / port / direction
+#include <Preferences.h>   // Persist server IP, port, and direction for LAN tests.
 #include <esp_random.h>
-#include <esp_wifi.h>       // esp_wifi_set_ps
+#include <esp_wifi.h>       // Calls esp_wifi_set_ps
 #include <math.h>
 #include <string.h>
-#include <Adafruit_GFX.h>   // GFXcanvas16 -- off-screen graph buffer
+#include <Adafruit_GFX.h>   // Uses GFXcanvas16 for the off-screen buffer.
 #include "ui.h"
 #include "screens.h"
 #include "accent.h"
+#include "power.h"
 
-// "Net stats" -- reached from WiFi > Net stats. An internal three-item menu:
-//
-//   * Speed test        -- down/up throughput with a live mirrored bar
-//                          trace styled after the browser-netstats
-//                          "Bandwidth" card (newest sample at the right
-//                          edge scrolling left; download grows DOWN from
-//                          the centre line, upload mirrored UP; auto-scaled
-//                          Mbps grid).
-//   * LAN speed         -- the SAME live bar trace + sampling + summary,
-//                          but pointed at a plain raw-TCP listener on a PC
-//                          on the local network instead of an internet HTTP
-//                          host. No RTT/window ceiling, so it shows what the
-//                          WiFi link itself can actually do. The user runs a
-//                          one-line nc/socat listener on the PC (the exact
-//                          command is printed on the sub-page). This is a
-//                          hand-rolled raw-TCP blast, NOT the iperf wire
-//                          protocol -- see runLanTest().
-//   * Connection + NAT  -- the browser-netstats "Connection" card folded
-//                          together with its "NAT type" card: public IP,
-//                          ASN / network, geo, Cloudflare edge, HTTP+TLS,
-//                          then LAN addresses, then a STUN-based NAT probe
-//                          (outbound UDP reachability + endpoint-independent
-//                          "cone" vs endpoint-dependent "symmetric" mapping).
-//
-// Scope note: this is an active *client* feature -- it uses the network the
-// user deliberately joined (WiFi scan > Connect) to move bytes to public
-// endpoints, or (LAN speed) to a listener the user themselves started on
-// their own PC on that same network. It is not a transmit/attack feature
-// (deauth/jam/spoof), and it never touches other people's hosts -- so it
-// stays inside the project's "passive toward other people's networks" rule.
-//
-// Plain HTTP (no TLS), BLOCKING modal per phase, and N PARALLEL TCP
-// streams. A single ESP32 TCP stream is capped by the lwIP receive window
-// (~5.7 KB) divided by RTT -- a few Mbps regardless of how close the AP
-// is -- so like the browser bandwidth card we run several at once and sum
-// them. Note: an ESP32-WROOM-32 tops out around 20-40 Mbps on WiFi total;
-// it cannot approach what a PC on the same link sees. Swap the host/path
-// constants if unreachable.
+// The menu shows three options.
+// Speed test measures throughput with parallel TCP streams.
+// One ESP32 stream caps at ~5 Mbps due to the lwIP window.
+// Parallel streams sum the total throughput.
+// LAN speed uses raw TCP to a local PC listener.
+// This removes internet RTT limits.
+// It measures the raw WiFi link capacity.
+// Connection and NAT cards show public IP and network info.
+// They run a STUN probe to detect NAT mapping.
+// This feature acts as a client.
+// It uses the joined WiFi network.
+// It never attacks other hosts.
+// Plain HTTP runs blocking modal phases.
+// The chip tops out at 20-40 Mbps total.
+// Swap host constants if unreachable.
 
 // ----------------------------- config -----------------------------
-// Plain HTTP, no HTTP->HTTPS redirect (CDNs like CacheFly/Cloudflare now
-// 301 to https, which this bare WiFiClient can't follow -- the response is
-// just the redirect header, hence a ~0.5 Mbps blip then nothing). These
-// two are single distant datacentres, so per-stream throughput is
-// window/RTT-bound (~5.7KB / RTT); N_DL parallel streams aggregate it.
-// A real Cloudflare-grade test would need WiFiClientSecure (<=3 streams on
-// this chip's RAM) -- separate opt-in.
+// Plain HTTP avoids HTTPS redirects.
+// The chip cannot follow 301 redirects.
+// These hosts run single datacenters.
+// Per-stream throughput stays window-bound.
+// The chip lacks RAM for secure streams.
 static const char *DL_HOST = "ipv4.download.thinkbroadband.com";
 static const char *DL_PATH = "/50MB.zip";
 static const char *UL_HOST = "speedtest.tele2.net";               // accepts a POST body
@@ -65,9 +41,9 @@ static const char *UL_PATH = "/upload.php";
 static const int      N_DL         = 6;      // parallel download streams (was 5)
 static const int      N_UL         = 3;      // parallel upload streams -- N_DL+N_UL
                                              // must stay under LwIP's 10-socket cap
-// LAN speed test: N raw-TCP streams to a PC listener on the local net. 4 is
-// plenty on a LAN (no window/RTT ceiling like the internet test fights), and
-// 4 down + 4 up in "both" mode is 8 sockets -- under LwIP's 10-socket cap.
+// LAN tests use raw TCP streams.
+// Four streams suffice for local networks.
+// Eight total streams stay under the lwIP socket limit.
 static const int      N_LAN        = 4;
 
 static const uint16_t CONNECT_MS   = 6000;
@@ -86,15 +62,15 @@ static const uint16_t NS_LABEL = 0xB5DC;   // #b6bfe0
 enum Page { PAGE_MENU, PAGE_SPEED, PAGE_CONN, PAGE_NONET, PAGE_LAN };
 static Page page = PAGE_MENU;
 
-// LAN speed sub-page has two views under the one Page: the config form
-// (edit IP / port / direction, then Start) and the running/done graph. Back
-// from the graph returns to the form; back from the form returns to the
-// netstats menu (see netstatsHandleBack()).
+// The LAN page shows a config form or a running graph.
+// Back from the graph returns to the form.
+// Back from the form returns to the main menu.
 enum LanView { LV_CFG, LV_RUN };
 static LanView lanView = LV_CFG;
 
-// Persisted in NVS ("netstats" namespace). Default IP is the user's usual
-// desktop; they retarget it with the on-screen numpad.
+// The code saves LAN settings to NVS.
+// The default IP points to a common desktop.
+// Users change it with the on-screen numpad.
 static String   lanIP   = "192.168.1.157";
 static uint16_t lanPort = 5001;
 static uint8_t  lanDir  = 0;   // 0 = download, 1 = upload, 2 = both
@@ -117,8 +93,8 @@ static const char *errMsg = "";
 
 static uint8_t zbuf[1460];              // zero-filled upload payload
 static uint8_t rxbuf[2048];             // shared drain buffer (HTTP + LAN download)
-// No on-screen "menu" button on the sub-pages -- the permanent top-bar
-// back button handles going up a level (see netstatsHandleBack()).
+// The top bar back button handles navigation.
+// Sub-pages do not show a menu button.
 static Btn actBtn, refreshBtn, miSpeed, miLan, miConn;
 // LAN config-form hit targets (laid out in drawLanConfig()).
 static Btn lanIpBtn, lanPortBtn, lanDnBtn, lanUpBtn, lanBothBtn, lanStartBtn;
@@ -139,10 +115,11 @@ static inline float mbps(uint32_t bytes, uint32_t ms) {
   return ms ? (float)bytes * 0.008f / (float)ms : 0.0f;
 }
 
-// Log axis, 0.1 Mbps at the mid-line. The TOP is dynamic: it ratchets to
-// the loudest sample so far (next 1/2/5 x10^k), with hysteresis on the
-// way down. The whole graph body is redrawn every tick into an off-screen
-// canvas and blitted in one pass, so rescaling is flicker-free.
+// The log axis starts at 0.1 Mbps.
+// The top scale ratchets up on loud samples.
+// It shrinks only after a full decade drop.
+// The graph redraws into an off-screen canvas.
+// This prevents flicker during rescaling.
 static const float GBW_LO = 0.1f;
 static float gScaleTop = 1.0f;                  // reset in resetTraces()
 static GFXcanvas16 *gcanv = nullptr;            // tft.width() x gH graph-body buffer
@@ -185,17 +162,8 @@ static void drawChrome(const char *btnLabel) {
     tft.print(WiFi.localIP());
   }
   actBtn = {tft.width() - 90, UI_ACTIONROW_Y, 88, UI_ACTIONROW_H, btnLabel};
-  if (!strcmp(btnLabel, "Stop")) {                       // running -> magenta
-    tft.fillRoundRect(actBtn.x, actBtn.y, actBtn.w, actBtn.h, actBtn.h / 2, ILI9341_MAGENTA);
-    int16_t bx, by; uint16_t bw, bh;
-    tft.setTextSize(1);
-    tft.getTextBounds(btnLabel, 0, 0, &bx, &by, &bw, &bh);
-    tft.setTextColor(ILI9341_WHITE);
-    tft.setCursor(actBtn.x + (actBtn.w - bw) / 2, actBtn.y + (actBtn.h - bh) / 2);
-    tft.print(btnLabel);
-  } else {
-    uiDrawMenuButton(actBtn);
-  }
+  if (!strcmp(btnLabel, "Stop")) uiDrawButtonColored(actBtn, ILI9341_MAGENTA);   // running -> stands out regardless of theme accent
+  else                           uiDrawMenuButton(actBtn);
 }
 
 static void drawLegend() {
@@ -208,7 +176,8 @@ static void drawLegend() {
   tft.setCursor(lx + 49, UI_CONTENT_Y + 2); tft.print("up");
 }
 
-// Just the caption line (clears only its own strip, left of the legend).
+// This function clears only the caption strip.
+// It draws the caption text left of the legend.
 static void drawCaption(const char *cap) {
   uiClearRect(0, UI_CONTENT_Y, tft.width() - 84, gY - UI_CONTENT_Y);
   tft.setTextSize(1);
@@ -217,8 +186,9 @@ static void drawCaption(const char *cap) {
   tft.print(cap);
 }
 
-// Re-fit the dynamic top to the loudest sample so far, ratchet up now,
-// shrink only after it drops a full decade-step.
+// The function fits the dynamic top to the loudest sample.
+// It ratchets up immediately.
+// It shrinks only after a full decade drop.
 static void rescale() {
   float pk = 0;
   for (int i = 0; i < nSamp; i++) {
@@ -230,10 +200,10 @@ static void rescale() {
   if (gScaleTop < 1) gScaleTop = 1;
 }
 
-// Render the whole graph body (grid + every bar) into the off-screen
-// canvas at the current scale, then blit it in one pass -- the on-screen
-// pixels are overwritten with no intervening clear, so a scale change
-// doesn't flicker.
+// This function renders the grid and bars into the off-screen canvas.
+// It blits the canvas in one pass.
+// This overwrites pixels without clearing.
+// A scale change causes no flicker.
 static void renderGraph() {
   if (!gcanv || !gcanv->getBuffer()) return;
   GFXcanvas16 &c = *gcanv;
@@ -277,8 +247,8 @@ static void renderGraph() {
   tft.drawRGBBitmap(0, gY, c.getBuffer(), W, gH);
 }
 
-// Full repaint of the caption strip + legend + graph -- idle / done /
-// stopped / error. The live run uses drawCaption() + renderGraph() only.
+// This function repaints the caption, legend, and graph.
+// The live run uses faster partial updates.
 static void drawGraph(const char *cap) {
   uiClearRect(0, UI_CONTENT_Y, tft.width(), gY - UI_CONTENT_Y);
   drawCaption(cap);
@@ -288,10 +258,9 @@ static void drawGraph(const char *cap) {
   renderGraph();
 }
 
-// "What's currently drawn" per line -- see uiDrawFieldIfChanged() in ui.h.
-// enterSpeed() does a one-time clear + reset of these (see below) so a
-// fresh visit doesn't inherit stale text from whatever this screen showed
-// last time, or from the screen shown before it.
+// These variables track drawn text.
+// The enterSpeed function clears them on fresh visits.
+// This prevents stale text from previous screens.
 static char prevDown[48] = "", prevUp[48] = "";
 static bool summaryHintDrawn = false;
 
@@ -316,9 +285,11 @@ static void drawSummary() {
   }
 }
 
-// One tick: bytes since the last tick -> Mbps for each direction, stored
-// in this point's slot in the 30s window; then the graph is re-fitted and
-// re-rendered (flicker-free via the canvas blit).
+// This function calculates Mbps from bytes since the last tick.
+// It stores values in the bar grid.
+// It rescales and redraws the graph.
+// The canvas blit runs every other tick.
+// This saves SPI transfer bandwidth.
 static void takeSample(uint32_t elapsed) {
   uint32_t now = millis();
   uint32_t dt = now - lastSample;
@@ -346,17 +317,21 @@ static void takeSample(uint32_t elapsed) {
   if ((idx & 1) == 0) renderGraph();
 }
 
-// A tap on the Stop button or the top-bar back area during a phase.
+// This function checks for a stop tap or back tap.
+// It handles power management.
+// It returns true if the user aborts.
 static bool speedAborted() {
   TouchPoint t = uiReadTouch();
+  if (t.pressed) powerNoteActivity();
+  powerServiceAutoOff();
   if (!t.pressed) return false;
   if (uiTouchInButton(t, actBtn) || uiTouchInBackButton(t)) { uiWaitForRelease(); return true; }
   return false;
 }
 
-// Blocking: N_DL parallel GETs and N_UL parallel POSTs running at the
-// SAME time for TEST_MS. Each SAMPLE_MS tick logs both directions into
-// the fixed 30s bar grid and draws the one new bar-pair. Stop/back abort.
+// This function runs parallel downloads and uploads.
+// It logs both directions every sample tick.
+// It aborts on stop or back taps.
 static void runTest() {
   esp_wifi_set_ps(WIFI_PS_NONE);   // no modem sleep for the duration -- restored at the end
   WiFiClient dc[N_DL], uc[N_UL];
@@ -481,17 +456,13 @@ static void speedTouch(const TouchPoint &t) {
 }
 
 // ------------------------- LAN speed test ----------------------
-// The internet speed test above is bounded by the lwIP window / RTT to a
-// distant datacentre, so its number says little about the WiFi link. This
-// mode instead blasts raw TCP to/from a listener the user starts on a PC on
-// the same LAN -- no HTTP, no protocol at all, just "stream me zeros" /
-// "eat my zeros" -- so the result reflects what the radio + AP can really
-// move. Everything downstream (bar trace, sampling cadence, dynamic Mbps
-// scale, summary) is the SAME machinery as runTest(); only the byte source
-// changes. Deliberately NOT the iperf wire protocol: vendoring ESP-IDF's
-// iperf.c was the alternative but it's ~600 lines of IDF-isms for a
-// compat we don't need here -- a plain `socat`/`nc` one-liner on the PC is
-// all this asks of the user.
+// The internet test caps at the lwIP window.
+// The LAN test removes this limit.
+// It blasts raw TCP to a local PC listener.
+// The result shows true radio capacity.
+// The code uses the same sampling machinery.
+// It avoids the iperf protocol.
+// A simple socat command suffices on the PC.
 
 static void lanCfgLoad() {
   Preferences p;
@@ -511,10 +482,9 @@ static void lanCfgSave() {
   p.end();
 }
 
-// The exact PC-side listener for the current direction + port. `fork` is
-// what lets one command serve all N_LAN parallel streams (plain `nc -lk`
-// only really does one at a time). Drawn on the config form (2 lines) and,
-// abbreviated, as the summary's one-line hint.
+// This function draws the PC listener command.
+// The fork option handles parallel streams.
+// The summary shows a trimmed one-line hint.
 static void drawLanHint(int x, int y, bool oneLine) {
   tft.setTextWrap(false);
   tft.setTextSize(1);
@@ -539,9 +509,9 @@ static void drawLanHint(int x, int y, bool oneLine) {
   tft.setCursor(x, y + 22); tft.print(lb);
 }
 
-// The config form: server IP / port (tap -> numpad), a 3-way direction
-// toggle, Start. Shown on enter and after every edit; replaced wholesale by
-// the graph chrome once Start is tapped (LV_RUN).
+// This function draws the config form.
+// It shows IP, port, and direction toggles.
+// It replaces the form with graph chrome on start.
 static void drawLanConfig() {
   page = PAGE_LAN;
   lanView = LV_CFG;
@@ -589,11 +559,10 @@ static void drawLanSummary() {
   drawLanHint(4, y + 26, true);
 }
 
-// Blocking, TEST_MS. N_LAN raw-TCP streams per active direction to
-// lanIP:lanPort; download = drain whatever the listener sends, upload =
-// write zbuf as fast as it takes it. Same SAMPLE_MS -> takeSample() ->
-// renderGraph() cadence and the same WDT-safe delay(0) per iteration as
-// runTest(). Stop button / back tap aborts (s_cancel).
+// This function runs raw TCP streams for TEST_MS.
+// It drains downloads and writes uploads.
+// It uses the same sampling cadence as the internet test.
+// The stop button aborts the run.
 static void runLanTest() {
   esp_wifi_set_ps(WIFI_PS_NONE);   // no modem sleep for the run -- caller restores it
   IPAddress ip;
@@ -738,7 +707,7 @@ static bool httpGet(const char *host, const char *path, String &body, uint32_t t
   return body.length() > 0;
 }
 
-// "key=value" lines (cdn-cgi/trace)
+// This function extracts a value from a key=value string.
 static String traceVal(const String &s, const char *key) {
   String k = String(key) + "=";
   int i = s.indexOf(k);
@@ -750,7 +719,7 @@ static String traceVal(const String &s, const char *key) {
   return v;
 }
 
-// flat JSON string field (ip-api.com)
+// This function extracts a string field from flat JSON.
 static String jsonStr(const String &s, const char *key) {
   String k = String("\"") + key + "\"";
   int i = s.indexOf(k);
@@ -766,10 +735,10 @@ static String jsonStr(const String &s, const char *key) {
   return v;
 }
 
-// One STUN Binding Request on an already-open UDP socket; parses
-// (XOR-)MAPPED-ADDRESS out of the reply. Reusing one socket (one local
-// port) across two different servers is what makes the cone/symmetric
-// distinction meaningful.
+// This function sends one STUN request.
+// It parses the mapped address from the reply.
+// It reuses one socket across two servers.
+// This enables cone versus symmetric mapping.
 static bool stunOnce(WiFiUDP &udp, const char *host, uint16_t port,
                      IPAddress &mapped, uint16_t &mport) {
   IPAddress dst;
@@ -1001,8 +970,8 @@ void netstatsEnter() {
   drawMenu();
 }
 
-// Called right after netstatsEnter() by the WiFi post-connect shortcuts --
-// skip the internal menu and open a sub-page directly.
+// This function skips the menu.
+// It opens a sub-page directly after connection.
 void netstatsGoSpeedTest() {
   if (WiFi.status() == WL_CONNECTED) enterSpeed();
 }
@@ -1011,8 +980,8 @@ void netstatsGoConn() {
 }
 
 void netstatsLoop() {
-  // Speed test and the connection query both run as blocking modals from
-  // netstatsTouch(); nothing to service here.
+  // These functions run as blocking modals.
+  // The loop has nothing to service.
 }
 
 void netstatsTouch(const TouchPoint &t) {
@@ -1043,9 +1012,8 @@ void netstatsTouch(const TouchPoint &t) {
   }
 }
 
-// Consume the top-bar back button one level at a time: from a sub-page it
-// returns to this screen's own menu; from the menu it returns false so the
-// main loop's handler pops back out to the WiFi submenu.
+// This function handles back navigation.
+// It steps back one level at a time.
 bool netstatsHandleBack() {
   if (page == PAGE_MENU) return false;
   // LAN graph view steps back to its own config form first; everything else
@@ -1063,6 +1031,7 @@ void netstatsExit() {
   st = ST_IDLE;
   page = PAGE_MENU;
   graphFree();
-  // WiFi stays connected on purpose -- the user joined this network
-  // deliberately and may come straight back for another run.
+  // The code keeps WiFi connected.
+  // The user joined deliberately.
+  // They may run tests again.
 }

@@ -1,16 +1,3 @@
-// Passive BLE tracker detector: AirTag / Find My, Samsung SmartTag, Tile,
-// Chipolo and generic item-finders. Listen-only (passive scan -- no scan
-// requests). Two things it does that a plain BLE scan doesn't:
-//
-//   * follow-detection -- trackers rotate their MAC (AirTag every ~15min
-//     when separated) so you can't lock one address. Instead it tracks
-//     each tracker CLASS: how long some beacon of that class has been
-//     continuously in range, and how many distinct MACs of it have shown
-//     up. A class that's been present for minutes AND is rotating MACs
-//     near you gets a << FOLLOW flag.
-//   * direction-find -- tap a class to home in: RSSI bar + the shared
-//     range-finder chirp on the strongest live advertiser of that class.
-//
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
@@ -20,6 +7,10 @@
 #include "wlog.h"
 #include "devtime.h"
 #include "accent.h"
+#include "flagfinding.h"
+#include "demomode.h"
+#include "power.h"
+#include <esp_random.h>
 
 enum { TK_FINDMY = 0, TK_SMARTTAG, TK_TILE, TK_CHIPOLO, TK_FMDN, TK_UNKNOWN, TK_N };
 static const char *KIND_NAME[TK_N] = { "AirTag/FindMy", "SmartTag", "Tile", "Chipolo", "Google FMDN", "Tracker?" };
@@ -43,8 +34,9 @@ static BLEScan *pScan = nullptr;
 enum Sub { LIST, LOCATE };
 static Sub sub = LIST;
 static int locKind = -1;
-static Btn rows[TK_N], resetBtn, backRow;
+static Btn rows[TK_N], resetBtn, backRow, flagBtn;
 static uint32_t lastListDraw = 0, lastLoc = 0;
+static uint32_t lastDemoSpawn = 0;
 static int lastShownRssi = -999;
 
 static const uint32_t GAP_MS    = 90000;    // class is "gone" after this quiet
@@ -84,12 +76,10 @@ class Cb : public BLEAdvertisedDeviceCallbacks {
       if (u.indexOf("feed") >= 0 || u.indexOf("feec") >= 0) kind = TK_TILE;
       else if (u.indexOf("fd5a") >= 0) kind = TK_SMARTTAG;
     }
-    // Google Find My Device network (Android's cross-device tag network:
-    // Chipolo/Pebblebee "for Android", Moto Tag, eufy, and every modern
-    // Android phone acting as a finder node). Service data under UUID
-    // 0xFEAA -- the same 16-bit UUID Eddystone uses -- but the first byte is
-    // an FMDN frame type in the 0x40..0x4F range, outside Eddystone's
-    // 0x00/0x10/0x20/0x30 set, so it can't be a beacon we'd misread.
+    // The service uses UUID 0xFEAA. Eddystone also uses this UUID.
+    // The first data byte uses frame types 0x40 to 0x4F.
+    // Eddystone uses types 0x00, 0x10, 0x20, and 0x30.
+    // This prevents misreading the beacon.
     for (int i = 0; i < d.getServiceDataCount(); i++) {
       String su = d.getServiceDataUUID(i).toString(); su.toLowerCase();
       if (su.indexOf("feaa") < 0) continue;
@@ -137,12 +127,50 @@ static Cb cb;
 
 static bool classActive(int k) { return cs[k].hits > 0 && millis() - cs[k].lastSeen < GAP_MS; }
 
+// Demo mode updates the state arrays.
+// It mimics real advertisement processing.
+// This keeps all screens and logic identical.
+// The code skips the BLE radio.
+// It fabricates inputs instead.
+static void spawnDemoHit() {
+  int kind = esp_random() % TK_N;
+  int rssi = demoRandRssi();
+  uint8_t macBytes[6];
+  demoRandMac(macBytes);
+  String macS = demoRandMacStr(macBytes);
+  const char *mac = macS.c_str();
+  uint32_t now = millis();
+
+  ClassStat &c = cs[kind];
+  if (c.hits == 0 || now - c.lastSeen > GAP_MS) { c.firstSeen = now; c.macN = 0; c.separated = false; }
+  c.lastSeen = now;
+  c.rssiSmooth = c.hits ? (c.rssiSmooth * 3 + rssi) / 4 : rssi;
+  c.hits++;
+  if (kind == TK_FINDMY && (esp_random() % 4) == 0) c.separated = true;   // occasionally simulate a "lost" AirTag
+  noteMac(c, mac);
+
+  int slot = -1, oldest = 0;
+  for (int i = 0; i < LIVE_N; i++) {
+    if (live[i].seen && strcmp(live[i].mac, mac) == 0) { slot = i; break; }
+    if (!live[i].seen && slot < 0) slot = i;
+    if (live[i].seen < live[oldest].seen) oldest = i;
+  }
+  if (slot < 0) slot = oldest;
+  strncpy(live[slot].mac, mac, 17); live[slot].mac[17] = 0;
+  live[slot].kind = kind;
+  live[slot].rssi = rssi;
+  live[slot].seen = now;
+}
+
 // --- event-level SD logging -------------------------------------------
-// One row when a tracker class first comes into range, one when its FOLLOW
-// flag rises. NO per-advert rows. Edge state is checked from trackerLoop()
-// (main task) -- never the BLE callback -- so the SD write stays off the
-// radio task. Flags re-arm when the class drops so a genuine reappearance
-// logs again.
+// The logger writes one row per class appearance.
+// It writes one row when the FOLLOW flag rises.
+// It never logs per advertisement.
+// The main task checks edge state.
+// The BLE callback never writes to SD.
+// This keeps SD writes off the radio task.
+// The flags reset when the class drops.
+// A reappearance triggers a new log entry.
 static bool tkSeenLogged[TK_N];
 static bool tkFollowLogged[TK_N];
 
@@ -193,30 +221,28 @@ static int liveRssiFor(int kind) {
   return best;
 }
 
-// Active classes are packed into consecutive 32px slots from the top. The
-// content area (UI_CONTENT_Y..status bar) only fits MAX_SLOTS of them, and
-// with TK_N up to 6 (FMDN added) not all classes can have a fixed slot like
-// they used to. To keep a row repainting in place -- the anti-flicker point
-// of the old fixed-slot scheme -- the slot assignment is recomputed only
-// when the SET of active classes changes (tracked via activeSig), not on
-// every 1.2s refresh.
+// Active classes pack into consecutive 32-pixel slots.
+// The screen fits five slots.
+// The code recomputes slot assignment only when the active class set changes.
+// This prevents row flicker during the 1.2-second refresh cycle.
 static const int SLOT_H   = 32;
 static const int MAX_SLOTS = 5;   // 58 + 5*32 = 218, clear of the 222px status bar
 static int slotY(int slot) { return UI_CONTENT_Y + 2 + slot * SLOT_H; }
 static uint8_t slotForClass[TK_N];   // TK_N sentinel = not shown
 static uint8_t activeSig = 0xFF;     // bitmask of classes shown last full layout
 
-// Per-slot "what's currently drawn" signature for uiDrawListIfChanged() --
-// see ui.h. A class's row now only erases + reprints when its own content
-// (RSSI / dwell / mac count / follow flag) actually changes, instead of
-// every active row unconditionally redrawing on every ~1.2s refresh.
+// The code tracks a draw signature per slot.
+// A row erases and reprints only when its content changes.
+// This avoids unconditional redraws on every 1.2-second refresh.
 static char prevRow[MAX_SLOTS][UI_LIST_SIG_LEN];
 static char prevEmpty[48] = "";
 
-// Static chrome: action row. Drawn once on enter / on return from locate,
-// NOT in the 1.2s refresh -- redrawing it there was the flicker.
+// The action row draws once on entry.
+// It draws again after returning from locate mode.
+// The code skips this row during the 1.2-second refresh.
+// Redrawing it caused screen flicker.
 static void drawListChrome() {
-  uiClearBelow(UI_ACTIONROW_Y);   // wipes the row area too -- reset what drawListRows() thinks is on screen so it doesn't skip redrawing into the now-blank area
+  uiClearBelow(UI_ACTIONROW_Y);   // This clears the row area. It resets the draw state. The list function now redraws the blank area.
   memset(prevRow, 0, sizeof(prevRow));
   prevEmpty[0] = '\0';
   Btn r[1] = {{0, 0, 0, 0, "reset dwell timers"}};
@@ -225,13 +251,12 @@ static void drawListChrome() {
 }
 
 static void drawListRows() {
-  // Recompute the packed slot assignment only when the set of active
-  // classes changes. uiDrawListIfChanged() below is still per-slot content
-  // diffed afterwards -- its signature includes the class id (idx[i]), so
-  // a slot whose occupant changed (or emptied out) redraws/clears on its
-  // own without needing a forced full reset here; a slot that keeps the
-  // same class in place just keeps diffing its RSSI/dwell/mac-count as
-  // usual -- the anti-flicker point of the original fixed-slot layout.
+    // The code recomputes slot assignment only when active classes change.
+    // The draw function diffs content per slot.
+    // The signature includes the class ID.
+    // A changed slot redraws automatically.
+    // A stable slot only diffs its metrics.
+    // This prevents unnecessary redraws.
   uint8_t sig = 0;
   for (int k = 0; k < TK_N; k++) if (classActive(k)) sig |= (1u << k);
   if (sig != activeSig) {
@@ -241,9 +266,10 @@ static void drawListRows() {
       slotForClass[k] = (classActive(k) && slot < MAX_SLOTS) ? (uint8_t)slot++ : (uint8_t)TK_N;
   }
 
-  // rows[k] (touch hit-boxes, indexed by CLASS not slot) is kept up to date
-  // every call regardless of whether anything redraws -- cheap, and
-  // trackerDetectTouch() needs it live even for an unchanged row.
+    // The code updates touch hit-boxes every frame.
+    // This costs little CPU time.
+    // The touch handler requires live coordinates.
+    // It needs them even for unchanged rows.
   int idx[TK_N], shown = 0;
   for (int k = 0; k < TK_N; k++) {
     if (!classActive(k) || slotForClass[k] >= (uint8_t)TK_N) { rows[k] = {0, 0, 0, 0, ""}; continue; }
@@ -294,9 +320,10 @@ static void drawList() { drawListChrome(); drawListRows(); }
 
 static void drawLocateChrome() {
   uiClearBelow(UI_ACTIONROW_Y);
-  Btn r[1] = {{0, 0, 0, 0, "< list"}};
-  uiDrawActionRow(r, 1);
+  Btn r[2] = {{0, 0, 0, 0, "< list"}, {0, 0, 0, 0, "Flag"}};
+  uiDrawActionRow(r, 2);
   backRow = r[0];
+  flagBtn = r[1];
   tft.setTextSize(2);
   tft.setTextColor(accentLabel());
   tft.setCursor(6, UI_CONTENT_Y + 6);
@@ -326,27 +353,36 @@ void trackerEnter() {
   memset(tkFollowLogged, 0, sizeof(tkFollowLogged));
   wlogOpen("tracker", "utc,event,class,rssi,macs");   // event rows only; ok if SD absent
   uiShowLoading("Listening...");
-  if (!pScan) {
-    WiFi.disconnect(true, false);   // radio coexistence -- see README
-    WiFi.mode(WIFI_OFF);
-    delay(50);
-    BLEDevice::init("");
-    pScan = BLEDevice::getScan();
+  if (!demoModeEnabled()) {
+    if (!pScan) {
+      WiFi.disconnect(true, false);   // radio coexistence -- see README
+      WiFi.mode(WIFI_OFF);
+      delay(50);
+      BLEDevice::init("");
+      pScan = BLEDevice::getScan();
+    }
+    pScan->setActiveScan(false);          // truly listen-only -- no scan requests
+    pScan->setInterval(200);
+    pScan->setWindow(180);
+    pScan->setAdvertisedDeviceCallbacks(&cb, true /* want duplicates */);
+    pScan->start(0, nullptr, false);      // continuous until trackerExit()
   }
-  pScan->setActiveScan(false);          // truly listen-only -- no scan requests
-  pScan->setInterval(200);
-  pScan->setWindow(180);
-  pScan->setAdvertisedDeviceCallbacks(&cb, true /* want duplicates */);
-  pScan->start(0, nullptr, false);      // continuous until trackerExit()
   drawList();
   lastListDraw = millis();
+  lastDemoSpawn = 0;
 }
 
 void trackerLoop() {
+  if (demoModeEnabled() && millis() - lastDemoSpawn > 4000) { spawnDemoHit(); lastDemoSpawn = millis(); }
   trackerLogEdges();   // detection runs in both sub-modes -- check edges regardless
   if (sub == LIST) {
     if (millis() - lastListDraw > 1200) { drawListRows(); lastListDraw = millis(); }
   } else {
+    // The RSSI meter runs continuously.
+    // It calls the power activity function every tick.
+    // This keeps the display timeout clock fresh.
+    // The screen stays awake during tracking.
+    powerNoteActivity();
     updateLocate();
   }
 }
@@ -376,6 +412,19 @@ void trackerTouch(const TouchPoint &t) {
     sub = LIST;
     drawList(); lastListDraw = millis();
     uiWaitForRelease();
+    return;
+  }
+  if (uiTouchInButton(t, flagBtn)) {
+    uiWaitForRelease();
+    // A separated advertisement signals a lost device.
+    // This poses a higher risk than a passing tracker.
+    // The code assigns an alert severity level.
+    // It uses watch severity for nearby trackers.
+    uint8_t sev = cs[locKind].separated ? UI_SEV_ALERT : UI_SEV_WATCH;
+    flagDetectionShow("tracker", sev);   // LOCATE chrome (big class name + RSSI) already IS this screen's detail view
+    uiDrawTopBar("Tracker Detect");
+    drawLocateChrome();
+    return;
   }
 }
 
@@ -395,5 +444,8 @@ void trackerExit() {
     pScan->setAdvertisedDeviceCallbacks(nullptr);
     pScan = nullptr;
   }
-  BLEDevice::deinit(false);   // radio coexistence -- see README; re-inits via the !pScan guard
+  // The code checks initialization state before deinitializing.
+  // Demo mode skips radio setup.
+  // An unconditional deinit would crash the system.
+  if (BLEDevice::getInitialized()) BLEDevice::deinit(false);   // radio coexistence -- see README; re-inits via the !pScan guard
 }

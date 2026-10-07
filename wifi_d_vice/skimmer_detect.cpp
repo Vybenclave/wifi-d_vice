@@ -1,39 +1,35 @@
-// Bluetooth skimmer detection: cheap HC-05/HC-06/HC-08 serial modules are
-// the commodity part found in pump/ATM overlay skimmers -- name substring
-// match (see known_signatures.h for sourcing).
-//
-// (An earlier version also drove a PN532 for an NFC/RFID card-UID audit,
-// but that was dropped -- it didn't actually detect a hidden reader's field
-// (not something a simple PN532 setup can do) and the "audit your own
-// card's UID" use case was judged low-value. If NFC/RFID detection is
-// wanted again later, note it needs its own real capability, not just
-// re-adding this.)
+// This module detects Bluetooth skimmers. Cheap HC-05, HC-06, and HC-08
+// modules power most skimmers. The code matches module names. See
+// known_signatures.h for source data.
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <WiFi.h>
 #include "ui.h"
 #include "known_signatures.h"
+#include "devtime.h"
+#include "flagfinding.h"
+#include "demomode.h"
+#include <esp_random.h>
 
 static BLEScan *pBLEScan = nullptr;
 static uint32_t lastBleScan = 0;
 static const int MAX_HITS = 6;
-struct Hit { String name; int rssi; };
+struct Hit { String name; int rssi; uint8_t mac[6]; };
 static Hit hits[MAX_HITS];
 static int hitCount = 0;
 
-// ASYNC scan -- a blocking pBLEScan->start() froze the UI (no back button)
-// for ~1s every cycle. Now uses the start(dur, callback) overload; the
-// callback runs on the BLE host task and skimmerLoop() polls `bleDone`.
+// A blocking scan freezes the user interface. The code now uses an
+// asynchronous scan. The callback runs on the BLE host task. The main
+// loop polls the done flag.
 static volatile bool bleDone = false;
 static bool scanning = false;
 static int  prevHits = 0;   // for the detection edge
 
 static void draw();
 
-// The UART-bridge service UUID is a weaker signal than the module name (a
-// renamed module still advertises it, but so do some legit serial gadgets),
-// so it only counts when the device is ALSO nameless or generically named --
-// a real HM-10 in a product usually carries the product's name.
+// The UART service UUID is a weak signal. Renamed modules still advertise
+// it. Legitimate gadgets also use it. The code only flags it when the
+// device lacks a name. Real products usually carry a specific name.
 static bool hasSkimmerServiceUuid(BLEAdvertisedDevice &d) {
   for (int i = 0; i < d.getServiceUUIDCount(); i++) {
     String u = d.getServiceUUID(i).toString(); u.toLowerCase();
@@ -52,15 +48,35 @@ static void bleScanDone(BLEScanResults r) {
     bool byUuid = hasSkimmerServiceUuid(d) &&
                   (!d.haveName() || lower.indexOf("bl") >= 0 || lower.indexOf("uart") >= 0 ||
                    lower.indexOf("serial") >= 0 || lower.indexOf("spp") >= 0);
-    if (byName || byUuid)
-      hits[hitCount++] = {byUuid && !byName ? name + " [UART]" : name, d.getRSSI()};
+    if (byName || byUuid) {
+      Hit &h = hits[hitCount++];
+      h.name = byUuid && !byName ? name + " [UART]" : name;
+      h.rssi = d.getRSSI();
+      memcpy(h.mac, d.getAddress().getNative(), 6);
+    }
+  }
+  bleDone = true;
+}
+
+// Demo mode fabricates a hit list. It skips the BLE radio. The fake data
+// uses the same structure. The draw and tap handlers remain unchanged.
+static void spawnDemoHits() {
+  static const char *kNames[] = {"HC-05", "HC-06 [UART]", "BT-Module"};
+  hitCount = 1 + (int)(esp_random() % 2);   // 1..2 fake hits
+  if (hitCount > MAX_HITS) hitCount = MAX_HITS;
+  for (int i = 0; i < hitCount; i++) {
+    Hit &h = hits[i];
+    h.name = demoRandPick(kNames, 3);
+    h.rssi = demoRandRssi();
+    demoRandMac(h.mac);
   }
   bleDone = true;
 }
 
 static void startScan() {
+  if (demoModeEnabled()) { scanning = true; spawnDemoHits(); return; }
   if (!pBLEScan) {
-    WiFi.disconnect(true, false);   // radio coexistence -- see README
+    WiFi.disconnect(true, false);   // The radio requires coexistence handling. See the README.
     WiFi.mode(WIFI_OFF);
     delay(50);
     BLEDevice::init("");
@@ -72,29 +88,40 @@ static void startScan() {
   pBLEScan->start(2, bleScanDone, false);
 }
 
+// These variables track the last drawn signatures. The UI functions check
+// them to avoid redraws. The enter function clears the screen once. It
+// resets these variables.
+static char prevHitRow[MAX_HITS][UI_LIST_SIG_LEN];
+static char prevMsg[48] = "";
+static const int LIST_Y = 50, ROW_H = 14;
+
 static void draw() {
-  uiClearBelow(29);
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setCursor(4, 34);
-  tft.print("BLE (HC-05/06/08 style modules):");
-  if (scanning && hitCount == 0) {
-    tft.setTextColor(ILI9341_YELLOW);
-    tft.setCursor(4, 50);
-    tft.print("  scanning...");
-  } else if (hitCount == 0) {
-    tft.setTextColor(ILI9341_GREEN);
-    tft.setCursor(4, 50);
-    tft.print("  none seen");
-  } else {
-    int y = 50;
-    for (int i = 0; i < hitCount; i++) {
-      tft.setTextColor(ILI9341_RED);
-      tft.setCursor(4, y);
-      tft.printf("  %-16.16s %ddBm", hits[i].name.c_str(), hits[i].rssi);
-      y += 14;
+  const char *msg = nullptr;
+  uint16_t msgCol = ILI9341_YELLOW;
+  if (scanning && hitCount == 0) msg = "  scanning...";
+  else if (hitCount == 0)      { msg = "  none seen"; msgCol = ILI9341_GREEN; }
+
+  if (msg) {
+    uiDrawListIfChanged(4, LIST_Y, tft.width() - 4, ROW_H, 0, MAX_HITS, prevHitRow,
+      [](int, char *, size_t) {}, [](int) {});   // just clears any rows left from a previous hit list
+    if (uiFieldChanged(prevMsg, sizeof(prevMsg), msg)) {
+      uiClearRect(4, LIST_Y, tft.width() - 4, ROW_H);
+      tft.setTextColor(msgCol);
+      tft.setCursor(4, LIST_Y);
+      tft.print(msg);
     }
+    return;
   }
+  prevMsg[0] = '\0';   // forget it so the message reprints if the list empties out again later
+
+  uiDrawListIfChanged(4, LIST_Y, tft.width() - 4, ROW_H, hitCount, MAX_HITS, prevHitRow,
+    [&](int i, char *sig, size_t cap) { snprintf(sig, cap, "%s|%d", hits[i].name.c_str(), hits[i].rssi); },
+    [&](int i) {
+      tft.setTextColor(ILI9341_RED);
+      tft.setCursor(4, LIST_Y + i * ROW_H);
+      tft.printf("  %-16.16s %ddBm", hits[i].name.c_str(), hits[i].rssi);
+    });
 }
 
 static int bestHitRssi() {
@@ -106,6 +133,13 @@ static int bestHitRssi() {
 void skimmerEnter() {
   uiDrawTopBar("Skimmer Detect");
   beepHold(true);          // hits chirp repeatedly -- keep the amp warm
+  uiClearBelow(29);
+  memset(prevHitRow, 0, sizeof(prevHitRow));
+  prevMsg[0] = '\0';
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(4, 34);
+  tft.print("BLE (HC-05/06/08 style modules):");
   hitCount = 0;
   prevHits = 0;
   startScan();
@@ -125,20 +159,44 @@ void skimmerLoop() {
     return;
   }
   if (hitCount == 0) {
-    ledSet(false);
+    ledAlert(false);
   } else {
-    ledSet(true);
+    ledAlert(true);
     rangeBeep(bestHitRssi());   // beep faster/higher the closer the nearest skimmer is
   }
   if (millis() - lastBleScan > 5000) startScan();
 }
 
-void skimmerTouch(const TouchPoint &t) { (void)t; }
+void skimmerTouch(const TouchPoint &t) {
+  if (!t.isNewPress || hitCount == 0) return;
+  for (int i = 0; i < hitCount; i++) {
+    int rowY = LIST_Y + i * ROW_H;
+    if (t.y >= rowY && t.y < rowY + ROW_H) {
+      showDetectionDetail(hits[i].name.c_str(), UI_SEV_ALERT, devTimeNowString().c_str(),
+                           hits[i].mac, nullptr, false, 0, 0, "skimmer");
+      // The detail view repaints the entire screen. This code redraws the local
+      // header. It clears the list redraw cache. The draw function now repaints
+      // every row.
+      uiDrawTopBar("Skimmer Detect");
+      uiClearBelow(29);
+      tft.setTextSize(1);
+      tft.setTextColor(ILI9341_WHITE);
+      tft.setCursor(4, 34);
+      tft.print("BLE (HC-05/06/08 style modules):");
+      memset(prevHitRow, 0, sizeof(prevHitRow));
+      prevMsg[0] = '\0';
+      draw();
+      return;
+    }
+  }
+}
 void skimmerExit() {
   beepHold(false);
-  ledSet(false);
+  ledAlert(false);
   ledGreen(false);
   if (pBLEScan) { pBLEScan->stop(); pBLEScan = nullptr; }
   scanning = false;
-  BLEDevice::deinit(false);   // radio coexistence -- see README; re-inits via the !pBLEScan guard
+  // The radio requires coexistence handling. See the README. The code
+  // reinitializes the radio through a guard check.
+  if (BLEDevice::getInitialized()) BLEDevice::deinit(false);
 }

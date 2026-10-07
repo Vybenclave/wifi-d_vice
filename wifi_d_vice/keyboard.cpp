@@ -1,25 +1,24 @@
 #include "keyboard.h"
 #include "ui.h"
 #include "accent.h"
+#include "power.h"
 
 struct KeyRect { int x, y, w, h; char c; };
 static KeyRect keys[80];
 static int keyCount = 0;
 
-// Special key codes -- values that never appear in a typed passphrase, so
-// they can share the `char c` slot with printable keys.
+// These codes never appear in typed passphrases.
+// They share the char slot with printable keys.
 static const char K_SPACE  = ' ';
 static const char K_BKSP   = '\b';
 static const char K_CANCEL = 27;
 static const char K_DONE   = '\n';
-static const char K_SHIFT  = 1;    // toggle letter case (letters layer only)
-static const char K_LAYER  = 2;    // toggle letters <-> symbols
+static const char K_SHIFT  = 1;
+static const char K_LAYER  = 2;
 
-// Two layers + a case toggle -- Wi-Fi passphrases need lowercase and
-// punctuation, which the original A-Z/0-9-only grid couldn't produce.
-// `shift` is sticky (caps-lock style, with the key highlighted while on)
-// rather than one-shot: fewer taps on a laggy resistive panel, and the
-// highlight makes the state obvious.
+// The shift toggle uses a sticky mode.
+// The system highlights the key while active.
+// This reduces taps on the resistive panel.
 static bool symbols = false;
 static bool shift = false;
 
@@ -86,8 +85,6 @@ String uiTextInput(const char *prompt, const String &initial, bool mask) {
   bool done = false, cancelled = false;
   bool revealed = false;   // masked fields start hidden; SHOW toggles this
 
-  // "show password" checkbox (masked fields only) -- box + label, tapping
-  // anywhere on it toggles `revealed`.
   Btn showBtn = {tft.width() - 76, 16, 74, 22, "show"};
 
   uiClearBelow(0);
@@ -125,6 +122,8 @@ String uiTextInput(const char *prompt, const String &initial, bool mask) {
 
   while (!done && !cancelled) {
     TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (!t.pressed) { delay(15); continue; }
     if (mask && uiTouchInButton(t, showBtn)) {
       revealed = !revealed;
@@ -137,9 +136,8 @@ String uiTextInput(const char *prompt, const String &initial, bool mask) {
           t.y >= keys[i].y && t.y < keys[i].y + keys[i].h) {
         char c = keys[i].c;
         if (c == K_BKSP) {
-          // The one deliberate exception to single-fire-per-touch (see
-          // TouchPoint's comment in ui.h): backspace repeats while held,
-          // rate-limited so it doesn't delete faster than ~1 char/150ms.
+          // Backspace repeats while held.
+          // The system rate-limits the action to one character per 150 milliseconds.
           static uint32_t lastRepeat = 0;
           if (t.isNewPress || millis() - lastRepeat > 150) {
             lastRepeat = millis();

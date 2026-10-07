@@ -1,16 +1,12 @@
-// "Rogue AP" screen (WiFi menu) -- learn a known-good AP baseline and watch
-// live WiFi.scanNetworks() passes against it for evil-twin / downgrade /
-// channel-move / RSSI-jump anomalies. The baseline (rogue_ap.cpp, SD
-// /rogueap.csv) is shared with the WiFi IDS screen, which runs the same
-// rogueApCheck() against received beacons.
-//
-// PASSIVE: standard station scans + a table compare. Nothing transmits.
-
 #include <WiFi.h>
 #include "ui.h"
 #include "screens.h"
 #include "rogue_ap.h"
 #include "accent.h"
+#include "devtime.h"
+#include "flagfinding.h"
+#include "demomode.h"
+#include <esp_random.h>
 
 enum RView { RV_VIEW, RV_LEARN, RV_DONE };
 static RView    view = RV_VIEW;
@@ -24,13 +20,34 @@ static const int LEARN_PASSES = 4;
 static Btn learnBtn, clearBtn;
 
 static const int VMAX = 12;
-struct VRow { char essid[19]; uint8_t ch; int8_t rssi; RogueKind k; };
+struct VRow { char essid[19]; uint8_t ch; int8_t rssi; RogueKind k; uint8_t bssid[6]; };
 static VRow vrows[VMAX];
 static int  vrowN = 0;
 static bool anyAlert = false;
 
+static void drawView();
+static void addVRow(const String &ss, uint8_t ch, int rssi, RogueKind k, const uint8_t *bssid);
+
+// Demo mode fabricates view rows. It uses the same addVRow function as real scans. It skips WiFi entirely. It only runs in the view state. The learn state still uses real scans. A fake baseline would not match future scans.
+static void spawnDemoRows() {
+  static const char *kSsids[] = {"Starbucks WiFi", "xfinitywifi", "HomeNetwork_5G"};
+  vrowN = 0;
+  anyAlert = false;
+  int n = 2 + (int)(esp_random() % 3);   // 2..4 fake rows
+  for (int i = 0; i < n && vrowN < VMAX; i++) {
+    uint8_t mac[6];
+    demoRandMac(mac);
+    RogueKind k = (i == 0) ? ROGUE_EVIL_TWIN : ROGUE_NONE;   // first row flagged, so there's always a non-OK one to tap
+    addVRow(demoRandPick(kSsids, 3), (uint8_t)(1 + esp_random() % 11), demoRandRssi(), k, mac);
+    if (k == ROGUE_EVIL_TWIN || k == ROGUE_DOWNGRADE) anyAlert = true;
+  }
+  drawView();
+  if (anyAlert) { ledAlert(true); beep(400, 1200); } else ledAlert(false);
+}
+
 // ---- scanning ----
 static void startScan() {
+  if (demoModeEnabled() && view == RV_VIEW) { lastScan = millis(); spawnDemoRows(); return; }
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.scanNetworks(true, true, false, 180);   // async, incl. hidden, 180ms/ch
@@ -115,19 +132,19 @@ static void drawDone() {
 }
 
 // ---- scan-complete handlers ----
-static void addVRow(const String &ss, uint8_t ch, int rssi, RogueKind k) {
+static void addVRow(const String &ss, uint8_t ch, int rssi, RogueKind k, const uint8_t *bssid) {
   if (vrowN >= VMAX) return;
   VRow &r = vrows[vrowN++];
   snprintf(r.essid, sizeof(r.essid), "%s", ss.length() ? ss.c_str() : "(hidden)");
   r.ch = ch;
   r.rssi = (int8_t)rssi;
   r.k = k;
+  memcpy(r.bssid, bssid, 6);
 }
 
 static void harvestView(int n) {
   vrowN = 0;
   anyAlert = false;
-  // pass 1: anomalies first
   for (int i = 0; i < n; i++) {
     uint8_t b[6]; memcpy(b, WiFi.BSSID(i), 6);
     String ss = WiFi.SSID(i);
@@ -135,21 +152,20 @@ static void harvestView(int n) {
     RogueKind k = rogueApCheck(ss.c_str(), b, (uint8_t)WiFi.encryptionType(i),
                                (uint8_t)WiFi.channel(i), WiFi.RSSI(i), &h);
     if (k == ROGUE_NONE) continue;
-    addVRow(ss, WiFi.channel(i), WiFi.RSSI(i), k);
+    addVRow(ss, WiFi.channel(i), WiFi.RSSI(i), k, b);
     if (k == ROGUE_EVIL_TWIN || k == ROGUE_DOWNGRADE) anyAlert = true;
   }
-  // pass 2: fill the rest with clean rows
   for (int i = 0; i < n && vrowN < VMAX; i++) {
     uint8_t b[6]; memcpy(b, WiFi.BSSID(i), 6);
     String ss = WiFi.SSID(i);
     if (rogueApCheck(ss.c_str(), b, (uint8_t)WiFi.encryptionType(i),
                      (uint8_t)WiFi.channel(i), WiFi.RSSI(i), nullptr) != ROGUE_NONE) continue;
-    addVRow(ss, WiFi.channel(i), WiFi.RSSI(i), ROGUE_NONE);
+    addVRow(ss, WiFi.channel(i), WiFi.RSSI(i), ROGUE_NONE, b);
   }
   WiFi.scanDelete();
   drawView();
-  if (anyAlert) { ledSet(true); beep(400, 1200); }
-  else            ledSet(false);
+  if (anyAlert) { ledAlert(true); beep(400, 1200); }
+  else            ledAlert(false);
 }
 
 static void harvestLearn(int n) {
@@ -180,7 +196,8 @@ void rogueEnter() {
   rogueApLoad();
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false, false);
-  delay(200);              // let a possibly-cold PHY settle before the first scan
+  // Let the cold PHY settle before the first scan.
+  delay(200);
   drawChrome();
   drawView();
   startScan();
@@ -195,7 +212,7 @@ void rogueLoop() {
   if (n == WIFI_SCAN_RUNNING) return;
   scanPending = false;
   ledBusy(false);
-  if (n < 0) n = 0;   // WIFI_SCAN_FAILED -> treat as empty, retry on the interval
+  if (n < 0) n = 0;
   if (view == RV_LEARN) harvestLearn(n);
   else                  harvestView(n);
 }
@@ -210,7 +227,7 @@ void rogueTouch(const TouchPoint &t) {
     startScan();
     return;
   }
-  if (view == RV_LEARN) return;   // back button cancels (rogueHandleBack)
+  if (view == RV_LEARN) return;
 
   if (uiTouchInButton(t, learnBtn)) {
     view = RV_LEARN;
@@ -233,11 +250,25 @@ void rogueTouch(const TouchPoint &t) {
     }
     return;
   }
+  // Rows have a fixed height. Direct index arithmetic matches the drawView layout. You do not need to record per-row geometry.
+  int rowY0 = UI_CONTENT_Y + 26;
+  if (t.y >= rowY0 && t.y < rowY0 + vrowN * 13) {
+    int idx = (t.y - rowY0) / 13;
+    if (idx < vrowN) {
+      const VRow &r = vrows[idx];
+      uint8_t sev = (r.k == ROGUE_EVIL_TWIN || r.k == ROGUE_DOWNGRADE) ? UI_SEV_ALERT
+                  : r.k == ROGUE_NONE ? UI_SEV_OK : UI_SEV_WATCH;
+      showDetectionDetail(r.essid, sev, devTimeNowString().c_str(), r.bssid, r.essid, false, 0, 0, "rogue_ap");
+      uiDrawTopBar("Rogue AP");
+      drawChrome();
+      drawView();
+    }
+  }
 }
 
 bool rogueHandleBack() {
-  if (view == RV_VIEW) return false;   // leave the screen
-  view = RV_VIEW;                      // LEARN / DONE -> back to the watch view
+  if (view == RV_VIEW) return false;
+  view = RV_VIEW;
   drawChrome();
   drawView();
   startScan();
@@ -248,6 +279,6 @@ void rogueExit() {
   scanPending = false;
   WiFi.scanDelete();
   ledBusy(false);
-  ledSet(false);
-  // leave the radio in WIFI_STA (cold-radio rule) for the next screen
+  ledAlert(false);
+  // Leave the radio in station mode for the next screen.
 }

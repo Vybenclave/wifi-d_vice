@@ -9,9 +9,9 @@
 #include "wlog.h"
 #include "wifiauto.h"
 #include "accent.h"
+#include "power.h"
 
-// Set when the user taps a shortcut on the post-connect screen; the main
-// loop drains it via wifiScanTakePendingJump() and switches screens.
+// The main loop drains this value. It switches screens after a tap.
 static int s_pendingJump = WSJUMP_NONE;
 int wifiScanTakePendingJump() { int j = s_pendingJump; s_pendingJump = WSJUMP_NONE; return j; }
 
@@ -25,19 +25,14 @@ static bool muted = false;
 static const int MAX_ROWS = 10;
 static int rowCount = 0;
 static ApInfo rows[MAX_ROWS];
-static Btn trackBtn, connectBtn, muteBtn;   // positioned once tft is sized/rotated
-// LIST-mode SD logging: an action-row toggle (default off). While on, every
-// completed scan writes one row per AP via the shared wlog. Opened on
-// toggle-on, closed on toggle-off and on wifiScanExit().
+static Btn trackBtn, connectBtn, muteBtn;   // The code positions these buttons after the screen size changes.
+// The action row toggles SD logging. The code writes one row per access point after each scan.
+// The system opens the file on toggle. It closes the file on toggle off or screen exit.
 static Btn logBtn;
 static bool logging = false;
-// WiFi.scanNetworks(false, ...) blocks the calling task until every channel
-// is hopped (1-4s for a full scan) -- that's the whole ESP32 task, so
-// loop()'s touch-polling stalls right along with it (confirmed as the cause
-// of "unresponsive UI" reports here, not something needing a separate
-// FreeRTOS task). async=true kicks the scan off on the WiFi driver's own
-// task and returns immediately; WiFi.scanComplete() is polled from loop()
-// each iteration instead, so touch keeps getting serviced while a scan runs.
+// The synchronous scan blocks the main task. It stalls touch polling.
+// The asynchronous scan runs on the WiFi driver task. The main loop polls for completion.
+// Touch input stays responsive during the scan.
 static bool listScanPending = false;
 static bool locateScanPending = false;
 
@@ -58,15 +53,13 @@ static const char *encName(wifi_auth_mode_t enc) {
 }
 
 static void startListScan() {
-  WiFi.mode(WIFI_STA);             // may have been powered off by another screen
-  WiFi.setSleep(false);            // power save makes scan yield vary wildly
-  // Explicit 200ms/channel active dwell (default is a fast pass). On a
-  // radio that was just cold-re-inited the default caught almost nothing
-  // for ~5 scans; 200ms/ch is ~2.8s for a full sweep but lands APs on
-  // scan 1.
+  WiFi.mode(WIFI_STA);             // Another screen may power off the WiFi module.
+  WiFi.setSleep(false);            // Power save mode causes unpredictable scan timing.
+  // The default dwell time misses access points after a cold start.
+  // A 200 millisecond dwell per channel finds them quickly.
   WiFi.scanNetworks(true, true, false, 200);
   listScanPending = true;
-  ledBusy(true);                   // green heartbeat until the scan lands
+  ledBusy(true);
 }
 
 static void harvestListScan(int n) {
@@ -78,8 +71,6 @@ static void harvestListScan(int n) {
     rows[i].channel = WiFi.channel(i);
     rows[i].enc = WiFi.encryptionType(i);
   }
-  // Log every AP the scan saw (not just the MAX_ROWS shown), one row each,
-  // then a single flush for the batch.
   if (logging) {
     for (int i = 0; i < n; i++) {
       char line[220];
@@ -95,15 +86,12 @@ static void harvestListScan(int n) {
   ledBusy(false);
 }
 
-// Bigger list: SSID at text size 2, channel/RSSI in a size-1 tail. Content
-// starts at UI_CONTENT_Y (not the plain 29) to leave room for the log
-// toggle in the action row -- see the UI rule in ui.h.
+// The list uses larger text for SSIDs. The content starts below the top bar.
+// This leaves space for the log toggle button.
 static const int LIST_Y0 = UI_CONTENT_Y + 2, LIST_STEP = 20;
 
-// Per-row "what's currently drawn" signature for uiDrawListIfChanged() --
-// uiDrawActionRow() already self-clears its own band, so drawList() no
-// longer needs a uiClearBelow() up front; only rows whose signature changed
-// get erased and reprinted.
+// The system tracks the last drawn signature for each row.
+// The action row clears itself. The code only redraws rows with changed signatures.
 static char prevRow[MAX_ROWS][UI_LIST_SIG_LEN];
 
 static void drawList() {
@@ -137,13 +125,8 @@ static void drawList() {
 }
 
 static void drawDetail() {
-  // Action row, not a bottom-pinned footer -- matches drawList() and
-  // drawLocateChrome() in this same file (and the UI rule in ui.h: a
-  // per-screen button belongs in the action row, not floating wherever).
-  // This used to sit at tft.height()-44, which put it right under a short
-  // 5-line info block on a short (landscape) screen but stranded it far
-  // below a big empty gap in portrait -- looked like the button had
-  // "fallen" to the bottom of the screen.
+  // The action row matches other screens in this file.
+  // Per-screen buttons belong in the action row. They do not float freely.
   uiClearBelow(UI_ACTIONROW_Y);
   Btn row[2] = {{0, 0, 0, 0, "Connect"}, {0, 0, 0, 0, "Track"}};
   uiDrawActionRow(row, 2);
@@ -170,10 +153,8 @@ static void drawDetail() {
   }
 }
 
-// Blocking join flow (modal, like the on-screen keyboard it calls): prompt
-// for a passphrase if the AP isn't open, kick off WiFi.begin(), and sit on
-// a status/back-to-cancel wait until it connects, fails, or times out. Used
-// so the Speed test screen has a network to run against.
+// The function prompts for a passphrase on closed networks. It starts the connection process.
+// It waits for success, failure, or timeout. The speed test screen requires an active network.
 static void doConnectFlow() {
   const ApInfo &r = rows[selected];
   bool open = (r.enc == WIFI_AUTH_OPEN);
@@ -183,7 +164,7 @@ static void doConnectFlow() {
     engStoreFindWifi(r.ssid, saved);   // pre-fill from a saved profile if we have one
     String prompt = "Wi-Fi passphrase for " + r.ssid;
     pass = uiTextInput(prompt.c_str(), saved, true);
-    // The keyboard did a full fillScreen -- the top bar is gone, restore it.
+    // The keyboard clears the entire screen. The code restores the top bar.
     uiDrawTopBar("WiFi Scan");
     if (pass.length() == 0) { drawDetail(); return; }   // cancelled / empty
   }
@@ -208,6 +189,8 @@ static void doConnectFlow() {
     wl_status_t s = WiFi.status();
     if (s == WL_CONNECTED || s == WL_CONNECT_FAILED || s == WL_NO_SSID_AVAIL) break;
     TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed && uiTouchInBackButton(t)) { cancelled = true; uiWaitForRelease(); break; }
     delay(80);
   }
@@ -246,7 +229,7 @@ static void doConnectFlow() {
   };
 
   if (ok) {
-    devTimeBeginNet();   // start SNTP (DHCP / gateway / NIST) now that we're online
+    devTimeBeginNet();   // The system starts SNTP synchronization now that the network is active.
     tft.setTextColor(ILI9341_GREEN);
     tft.setCursor(4, 40);  tft.printf("Connected to %s", r.ssid.c_str());
     tft.setTextColor(ILI9341_WHITE);
@@ -270,6 +253,8 @@ static void doConnectFlow() {
   }
   for (;;) {
     TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
     if (t.pressed) {
       if (uiTouchInBackButton(t)) { applyPersist(); uiWaitForRelease(); break; }
       if (ok && uiTouchInButton(t, stBtn)) { applyPersist(); s_pendingJump = WSJUMP_NETSTATS_SPEED; uiWaitForRelease(); return; }
@@ -293,12 +278,8 @@ static void doConnectFlow() {
   drawDetail();
 }
 
-// Locate/track mode redraws only the parts that actually change (RSSI
-// number + bar), on a throttled interval -- confirmed on hardware that
-// redrawing the whole area every loop iteration (which also re-ran a
-// ~300ms blocking WiFi scan every single time, unthrottled) caused visible
-// flicker and left touch getting checked far too rarely, which also broke
-// the back button in this mode.
+// The code redraws only changed elements. It updates at a fixed interval.
+// Redrawing every loop causes flicker. It also blocks touch input and breaks the back button.
 static const uint32_t LOCATE_UPDATE_MS = 400;
 static int lastRssiShown = -999;
 
@@ -319,8 +300,8 @@ static void applyLocateReading(int rssi) {
   uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8,
                        accentLabel(), -90, -30, &lastRssiShown, rssi);
 
-  beepHold(!muted);              // keep the amp warm so short chirps aren't swallowed
-  if (!muted) rangeBeep(rssi);   // rate + pitch scale with signal as a range proxy
+  beepHold(!muted);              // The amplifier stays warm to prevent short chirps from dropping.
+  if (!muted) rangeBeep(rssi);
 }
 
 static void updateLocate() {
@@ -346,8 +327,8 @@ static void updateLocate() {
 
 void wifiScanEnter() {
   subMode = LIST;
-  logging = false;   // fresh each entry; the file is closed in wifiScanExit()
-  memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawList() thinks is on screen
+  logging = false;   // The system closes the log file on screen exit.
+  memset(prevRow, 0, sizeof(prevRow));   // The loading screen clears the content area. The code resets the row signatures.
   uiDrawTopBar("WiFi Scan");
   uiShowLoading("Scanning...");
   WiFi.mode(WIFI_STA);
@@ -369,13 +350,16 @@ void wifiScanLoop() {
     }
     if (millis() - lastScan > 4000) startListScan();
   } else if (subMode == LOCATE) {
+    // The operator walks around while tracking signal strength.
+    // The code updates the idle timer every loop. The display stays awake during the track.
+    powerNoteActivity();
     updateLocate();
   }
 }
 
 void wifiScanTouch(const TouchPoint &t) {
   if (subMode == LIST) {
-    if (!t.isNewPress) return;   // manual bounds check below, not uiTouchInButton() -- needs its own edge guard
+    if (!t.isNewPress) return;   // The code uses manual bounds checking. It requires a custom edge guard.
     if (uiTouchInButton(t, logBtn)) {
       if (!logging) {
         logging = wlogOpen("wifiscan", "utc,ssid,bssid,rssi,channel,security");
@@ -432,16 +416,14 @@ void wifiScanTouch(const TouchPoint &t) {
   }
 }
 
-// Top-bar back button steps up one level inside this screen: DETAIL or
-// LOCATE -> the AP list; only from the list does it fall through to the
-// main loop and leave the screen. One back button, same as every other
-// screen -- no in-content "list" button needed.
+// The back button steps up one screen level. It returns to the AP list from detail or locate modes.
+// It exits the screen only from the list. The system uses one back button per screen.
 bool wifiScanHandleBack() {
   if (subMode == LIST) return false;
   beepHold(false);
-  locateScanPending = false;   // abandon any in-flight locate scan
+  locateScanPending = false;
   subMode = LIST;
-  memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawList() thinks is on screen
+  memset(prevRow, 0, sizeof(prevRow));   // The loading screen clears the content area. The code resets the row signatures.
   uiDrawTopBar("WiFi Scan");
   uiShowLoading("Scanning...");
   startListScan();

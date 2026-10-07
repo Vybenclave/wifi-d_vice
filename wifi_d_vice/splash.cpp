@@ -4,9 +4,10 @@
 #include <Preferences.h>
 #include "driver/dac_continuous.h"
 #include "modmix.h"
-#include "demo_mod.h"            // DEMO_MOD / DEMO_MOD_LEN (the chase track)
-#include "splash_landscape.h"   // SPLASH_LANDSCAPE[76800]  (320x240)
-#include "splash_portrait.h"    // SPLASH_PORTRAIT[76800]   (240x320)
+#include "demo_mod.h"            // DEMO_MOD and DEMO_MOD_LEN define the chase track.
+#include "splash_landscape.h"   // SPLASH_LANDSCAPE holds 19200 pixels. The renderer upscales it 2x.
+#include "splash_portrait.h"    // SPLASH_PORTRAIT holds 19200 pixels. The renderer upscales it 2x.
+#include "power.h"
 
 bool splashEnabled() {
   Preferences p;
@@ -24,34 +25,39 @@ void splashSetEnabled(bool on) {
 }
 
 void showSplash(uint32_t holdMs) {
-  if (!splashEnabled()) return;   // image disabled in System > Display
+  if (!splashEnabled()) return;   // The user disabled the splash image in the display settings.
   bool landscape = tft.width() >= tft.height();
   const uint16_t *img = landscape ? SPLASH_LANDSCAPE : SPLASH_PORTRAIT;
+  int srcW = landscape ? 160 : 120, srcH = landscape ? 120 : 160;
   int iw = landscape ? 320 : 240;
   int ih = landscape ? 240 : 320;
   int w = iw < tft.width()  ? iw : tft.width();
   int h = ih < tft.height() ? ih : tft.height();
 
+  static uint16_t line[320];
   tft.startWrite();
   tft.setAddrWindow(0, 0, w, h);
-  // Row by row so a panel smaller than 320x240 still lands the top-left.
-  for (int y = 0; y < h; y++)
-    tft.writePixels((uint16_t *)(img + y * iw), w, true, false);
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) line[x] = uiBgSample(img, srcW, srcH, x, y);
+    tft.writePixels(line, w, true, false);
+  }
   tft.endWrite();
 
-  // Fade out via a couple of dim overlays would need alpha we don't have;
-  // just hold then let the caller draw the menu over it.
   uint32_t start = millis();
   while (millis() - start < holdMs) {
-    if (uiReadTouch().pressed) break;   // tap to skip
+    TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
+    if (t.pressed) break;   // The tap skips the splash.
     delay(15);
   }
 }
 
-// Real 4-channel MOD, software-mixed (modmix.cpp) out through the SHARED
-// GPIO26 DAC channel from ui.cpp -- own core-0 task, full ~22kHz waveform
-// centred at mid-rail so nothing allocates/frees the DAC and beeps keep
-// working afterwards. Lifted from the retired Outrun demo.
+// The software mixer sends four channels to the shared GPIO26 DAC.
+// The task runs on core 0.
+// The waveform centers at mid-rail.
+// This prevents allocation conflicts.
+// Beep sounds continue to work.
 static volatile bool aRun = false, aDone = false;
 
 static void splashAudioTask(void *) {
@@ -70,8 +76,7 @@ static void splashAudioTask(void *) {
     dac_continuous_write(h, buf, sizeof(buf), &wrote, 200);
   }
 
-  // Short timeout on the settle write so a starved DMA ring can't wedge
-  // this task -- a hung shutdown here is what left the DAC dead on exit.
+  // The short timeout prevents a starved DMA ring from hanging the task.
   memset(buf, 128, sizeof(buf));
   dac_continuous_write(h, buf, sizeof(buf), &wrote, 20);
   digitalWrite(AUDIO_EN, HIGH);
@@ -88,21 +93,30 @@ void showSplashArt() {
     xTaskCreatePinnedToCore(splashAudioTask, "splashaud", 6144, nullptr, 3, nullptr, 0);
   }
 
-  // Full-screen, orientation-matched: the landscape art (320x240) on a
-  // landscape panel, the portrait art (240x320) on a portrait one -- both
-  // are a straight 1:1 blit, no rotation / letterbox.
+  // The renderer scales the art to match the panel orientation.
+  // It upscales the half-resolution source 2x.
+  // The code skips rotation and letterboxing.
   bool landscape = tft.width() >= tft.height();
   const uint16_t *img = landscape ? SPLASH_LANDSCAPE : SPLASH_PORTRAIT;
-  int iw = landscape ? 320 : 240;
+  int srcW = landscape ? 160 : 120, srcH = landscape ? 120 : 160;
   int sw = tft.width(), sh = tft.height();
 
+  static uint16_t line[320];
   tft.startWrite();
   tft.setAddrWindow(0, 0, sw, sh);
-  for (int y = 0; y < sh; y++)
-    tft.writePixels((uint16_t *)(img + y * iw), sw, true, false);
+  for (int y = 0; y < sh; y++) {
+    for (int x = 0; x < sw; x++) line[x] = uiBgSample(img, srcW, srcH, x, y);
+    tft.writePixels(line, sw, true, false);
+  }
   tft.endWrite();
 
-  while (!uiReadTouch().pressed) delay(15);
+  for (;;) {
+    TouchPoint t = uiReadTouch();
+    if (t.pressed) powerNoteActivity();
+    powerServiceAutoOff();
+    if (t.pressed) break;
+    delay(15);
+  }
   uiWaitForRelease();
 
   if (haveAudio) {
@@ -110,9 +124,10 @@ void showSplashArt() {
     uint32_t g = millis();
     while (!aDone && millis() - g < 1500) delay(5);
     modmixFree();
-    // Rebuild the DAC channel from scratch: the render loop competing with
-    // the splash blit for SPI/DMA can latch the channel into a state where
-    // plain enable/disable no longer produces sound. del + recreate does.
+    // The render loop competes with the splash blit for SPI and DMA.
+    // This can latch the DAC channel.
+    // Plain enable and disable commands then fail.
+    // The code destroys and recreates the channel.
     uiAudioReset();
   }
 }

@@ -7,6 +7,10 @@
 #include "known_signatures.h"
 #include "devtime.h"
 #include "accent.h"
+#include "flagfinding.h"
+#include "demomode.h"
+#include "power.h"
+#include <esp_random.h>
 
 enum SubMode { LIST, DETAIL, LOCATE };
 static SubMode subMode = LIST;
@@ -14,14 +18,9 @@ static BLEScan *pBLEScan = nullptr;
 static uint32_t lastScan = 0;
 static const int MAX_ROWS = 10;
 
-// Notable-device classification layered onto the plain scan list. Two
-// classes worth calling out on sight (Marauder's Flipper Sniff / Meta
-// Detect, Wireless Wizard's Flipper Detect / Meta Glasses Detect):
-//   FLIPPER  -- a Flipper Zero: BLE name begins "Flipper ".
-//   GLASSES  -- Ray-Ban / Meta smart glasses: name match, or a Meta /
-//               Luxottica company id in the manufacturer data.
-// Signatures live in known_signatures.h. Passive: this only reads the
-// advertisement fields the scan already collected.
+// Classify notable devices on the scan list. Two classes appear on sight.
+// FLIPPER devices start with "Flipper ". GLASSES devices match a name or a Meta company ID.
+// Signatures live in known_signatures.h. This scan only reads existing advertisement fields.
 enum BleClass { BC_NONE = 0, BC_FLIPPER, BC_GLASSES };
 static const char *bleClassLabel(BleClass c) {
   return c == BC_FLIPPER ? "FLIPPER" : c == BC_GLASSES ? "GLASSES" : "";
@@ -49,79 +48,143 @@ static BleClass bleClassify(BLEAdvertisedDevice &d) {
 struct BleRow { String name; uint8_t mac[6]; String macStr; int rssi; BleClass cls; };
 static BleRow rows[MAX_ROWS];
 static int rowCount = 0;
-// Counts across the WHOLE last scan (not just the MAX_ROWS shown), for the
-// summary line under the list.
+// Count all devices in the last scan. The summary line uses these totals.
 static int nFlipper = 0, nGlasses = 0;
 static int selected = -1;
-static Btn trackBtn, muteBtn;
+static Btn trackBtn, muteBtn, flagBtn;
 static bool muted = false;
 static int lastRssiShown = -999;
-// LIST-mode SD logging: an action-row toggle (default off). While on, every
-// completed scan writes one row per device via the shared wlog. Opened on
-// toggle-on, closed on toggle-off and on bleScanExit().
+// Toggle SD logging for the list mode. The default state is off.
+// The code writes one row per device per scan.
+// The code opens the file on toggle.
+// The code closes the file on toggle off or screen exit.
 static Btn logBtn;
 static bool logging = false;
 
-// BLE scans block for their whole duration with no channel-restricted fast
-// mode like WiFi has -- kept short (1s, was 2s) so back-button taps and
-// screen transitions aren't starved as long between checks.
 static const uint32_t SCAN_SECONDS = 1;
+static volatile bool bleDone = false;
+static bool scanInFlight = false;
+// Request a fresh list scan immediately. A previous scan may still run.
+// The code cannot start a new scan until the old one finishes.
+// This flag skips the normal three second wait.
+// The code starts the new scan right after the old one ends.
+static bool forceListScan = false;
+static bool locateModeScan = false;   // which half of finishScan() applies to the in-flight scan
 
-static void doScan() {
-  BLEScanResults *results = pBLEScan->start(SCAN_SECONDS, false);
-  int total = (int)results->getCount();
-  rowCount = min(total, MAX_ROWS);
+static void onScanComplete(BLEScanResults) { bleDone = true; }
+static void drawRows();
+
+// Demo mode generates fake data. The code skips the BLE radio.
+// It bypasses the async scan pipeline.
+// List mode fills rows and redraws immediately.
+// Locate mode uses its own timing gate.
+// The real scan takes one second.
+// Demo mode skips it.
+static void spawnDemoList() {
+  static const char *kNames[] = {"iPhone", "Galaxy Buds", "Flipper 1A2B", "Pixel Watch", "AirPods Pro"};
+  rowCount = 3 + (int)(esp_random() % 3);   // 3..5 fake rows
   nFlipper = nGlasses = 0;
   for (int i = 0; i < rowCount; i++) {
-    BLEAdvertisedDevice d = results->getDevice(i);
-    rows[i].name = d.haveName() ? String(d.getName().c_str()) : "(no name)";
-    memcpy(rows[i].mac, d.getAddress().getNative(), 6);
-    rows[i].macStr = String(d.getAddress().toString().c_str());
-    rows[i].rssi = d.getRSSI();
-    rows[i].cls = bleClassify(d);
+    demoRandMac(rows[i].mac);
+    rows[i].macStr = demoRandMacStr(rows[i].mac);
+    rows[i].name = demoRandPick(kNames, 5);
+    rows[i].rssi = demoRandRssi();
+    rows[i].cls = (rows[i].name == "Flipper 1A2B") ? BC_FLIPPER : BC_NONE;
+    if (rows[i].cls == BC_FLIPPER) nFlipper++;
   }
-  for (int i = 0; i < total; i++) {
-    BLEAdvertisedDevice d = results->getDevice(i);
-    BleClass c = bleClassify(d);
-    if (c == BC_FLIPPER) nFlipper++;
-    else if (c == BC_GLASSES) nGlasses++;
+}
+
+static void startScan(bool locate) {
+  if (demoModeEnabled()) {
+    locateModeScan = locate;
+    if (locate) {
+      if (millis() - lastScan < SCAN_SECONDS * 1000) return;   // self-pace, same cadence a real scan would
+      lastScan = millis();
+      int rssi = demoRandRssi();
+      uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8, accentLabel(), -95, -40, &lastRssiShown, rssi);
+      beepHold(!muted);
+      if (!muted) rangeBeep(rssi);
+    } else {
+      lastScan = millis();
+      spawnDemoList();
+      drawRows();
+    }
+    return;
   }
-  // Log every device the scan saw (not just the MAX_ROWS shown), one row
-  // each, then a single flush for the batch.
-  if (logging) {
-    for (int i = 0; i < total; i++) {
+  locateModeScan = locate;
+  bleDone = false;
+  scanInFlight = true;
+  pBLEScan->start(SCAN_SECONDS, onScanComplete, false);
+}
+
+static int finishScan() {
+  scanInFlight = false;
+  lastScan = millis();
+  BLEScanResults *results = pBLEScan->getResults();
+  int rssi = -100;
+
+  if (locateModeScan) {
+    for (int i = 0; i < (int)results->getCount(); i++) {
       BLEAdvertisedDevice d = results->getDevice(i);
       uint8_t mac[6];
       memcpy(mac, d.getAddress().getNative(), 6);
-      char line[192];
-      snprintf(line, sizeof(line), "%s,%s,%s,%s,%d",
-               devTimeNowString().c_str(),
-               d.haveName() ? d.getName().c_str() : "(no name)",
-               d.getAddress().toString().c_str(),
-               macVendorTag(mac).c_str(), d.getRSSI());
-      wlogRow(line);
+      if (memcmp(mac, rows[selected].mac, 6) == 0) { rssi = d.getRSSI(); break; }
     }
-    wlogFlush();
+  } else {
+    int total = (int)results->getCount();
+    rowCount = min(total, MAX_ROWS);
+    nFlipper = nGlasses = 0;
+    for (int i = 0; i < rowCount; i++) {
+      BLEAdvertisedDevice d = results->getDevice(i);
+      rows[i].name = d.haveName() ? String(d.getName().c_str()) : "(no name)";
+      memcpy(rows[i].mac, d.getAddress().getNative(), 6);
+      rows[i].macStr = String(d.getAddress().toString().c_str());
+      rows[i].rssi = d.getRSSI();
+      rows[i].cls = bleClassify(d);
+    }
+    for (int i = 0; i < total; i++) {
+      BLEAdvertisedDevice d = results->getDevice(i);
+      BleClass c = bleClassify(d);
+      if (c == BC_FLIPPER) nFlipper++;
+      else if (c == BC_GLASSES) nGlasses++;
+    }
+    // Log every device the scan detects. The code writes one row per device.
+    // The code flushes the batch once.
+    if (logging) {
+      for (int i = 0; i < total; i++) {
+        BLEAdvertisedDevice d = results->getDevice(i);
+        uint8_t mac[6];
+        memcpy(mac, d.getAddress().getNative(), 6);
+        char line[192];
+        snprintf(line, sizeof(line), "%s,%s,%s,%s,%d",
+                 devTimeNowString().c_str(),
+                 d.haveName() ? d.getName().c_str() : "(no name)",
+                 d.getAddress().toString().c_str(),
+                 macVendorTag(mac).c_str(), d.getRSSI());
+        wlogRow(line);
+      }
+      wlogFlush();
+    }
   }
   pBLEScan->clearResults();
+  return rssi;
 }
 
-// Bigger list: name at text size 2, vendor/RSSI in a size-1 line below it --
-// the vendor tag (up to 23 chars, see macVendorTag()) plus RSSI ran off the
-// right edge of the screen when squeezed onto the same line as the name, so
-// it gets its own line and the full row width instead. Content starts at
-// UI_CONTENT_Y (not the plain 29) to leave room for the log toggle in the
-// action row -- see the UI rule in ui.h. The last visible row is held back
-// to LIST_BOTTOM so the notable-device summary line has a fixed home just
-// above the status bar.
+// Display the list with two lines per row.
+// The vendor tag and RSSI exceed the screen width on one line.
+// The code places them on separate lines.
+// Content starts at UI_CONTENT_Y.
+// This leaves space for the log toggle.
+// The code stops drawing rows at LIST_BOTTOM.
+// The summary line sits just above the status bar.
 static const int LIST_Y0 = UI_CONTENT_Y + 2, LIST_STEP = 30;
 static const int LIST_BOTTOM = 204;   // rows stop here; 206..220 is the summary line
 
-// Per-row / summary "what's currently drawn" signatures for
-// uiDrawListIfChanged() / uiFieldChanged() -- uiDrawActionRow() already
-// self-clears its own band, so drawRows() no longer needs a uiClearBelow()
-// up front; only rows (and the summary line) whose content changed get
-// erased and reprinted.
+// Track drawn content for each row and the summary.
+// The action row clears itself.
+// The code skips a full screen clear.
+// The code only erases changed rows.
+// The code only erases the changed summary line.
 static char prevRow[MAX_ROWS][UI_LIST_SIG_LEN];
 static char prevSummary[48] = "";
 
@@ -159,8 +222,10 @@ static void drawRows() {
     });
   tft.setTextSize(1);
 
-  // Notable-device summary -- always shown (green "none" when clear) so a
-  // Flipper/glasses appearing is unmistakable without hunting the list.
+  // Show the notable device summary always.
+  // The code displays green text when no devices appear.
+  // This makes new devices obvious.
+  // The user does not need to search the list.
   char sum[48];
   if (nFlipper == 0 && nGlasses == 0) snprintf(sum, sizeof(sum), "none");
   else                                snprintf(sum, sizeof(sum), "Flipper:%d Glasses:%d", nFlipper, nGlasses);
@@ -180,14 +245,11 @@ static void drawRows() {
 }
 
 static void drawDetail() {
-  // Action row, not a bottom-pinned footer -- matches drawLocateChrome()
-  // below (and the UI rule in ui.h). This used to sit at tft.height()-44,
-  // stranded far below this short 4-line info block on a tall screen --
-  // looked like the button had "fallen" to the bottom of the screen.
   uiClearBelow(UI_ACTIONROW_Y);
-  Btn row[1] = {{0, 0, 0, 0, "Track"}};
-  uiDrawActionRow(row, 1);
+  Btn row[2] = {{0, 0, 0, 0, "Track"}, {0, 0, 0, 0, "Flag"}};
+  uiDrawActionRow(row, 2);
   trackBtn = row[0];
+  flagBtn  = row[1];
 
   const BleRow &r = rows[selected];
   tft.setTextSize(1);
@@ -212,33 +274,17 @@ static void drawLocateChrome() {
   lastRssiShown = -999;
 }
 
-static void updateLocate() {
-  if (millis() - lastScan < 250) return;   // BLEScanResults blocks for SCAN_SECONDS itself; this just avoids a tight spin
-  lastScan = millis();
-
-  BLEScanResults *results = pBLEScan->start(SCAN_SECONDS, false);
-  int rssi = -100;
-  for (int i = 0; i < (int)results->getCount(); i++) {
-    BLEAdvertisedDevice d = results->getDevice(i);
-    uint8_t mac[6];
-    memcpy(mac, d.getAddress().getNative(), 6);
-    if (memcmp(mac, rows[selected].mac, 6) == 0) { rssi = d.getRSSI(); break; }
-  }
-  pBLEScan->clearResults();
-
-  uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8,
-                       accentLabel(), -95, -40, &lastRssiShown, rssi);
-
-  beepHold(!muted);              // keep the amp warm so short chirps aren't swallowed
-  if (!muted) rangeBeep(rssi);   // rate + pitch scale with signal as a range proxy
-}
-
 void bleScanEnter() {
   subMode = LIST;
   logging = false;   // fresh each entry; the file is closed in bleScanExit()
   memset(prevRow, 0, sizeof(prevRow));   // uiShowLoading() below wipes the content area -- forget what drawRows() thinks is on screen
   prevSummary[0] = '\0';
   uiDrawTopBar("BLE Scan");
+  if (demoModeEnabled()) {
+    uiShowLoading("Scanning...");
+    startScan(false);
+    return;
+  }
   uiShowLoading("Initializing radio...");
   if (!pBLEScan) {
     WiFi.disconnect(true, false);   // radio coexistence -- see README
@@ -251,26 +297,45 @@ void bleScanEnter() {
     pBLEScan->setWindow(99);
   }
   uiShowLoading("Scanning...");
-  doScan();
-  drawRows();
-  lastScan = millis();
+  startScan(false);
 }
 
 void bleScanLoop() {
-  if (subMode == LIST) {
-    if (millis() - lastScan > 3000) {
-      doScan();
+  // Keep the display timeout clock fresh.
+  // The code calls powerNoteActivity every tick.
+  // The code runs this unconditionally.
+  // The scan early return skips the locate branch.
+  // This keeps the screen awake during tracking.
+  if (subMode == LOCATE) powerNoteActivity();
+  if (scanInFlight) {
+    if (!bleDone) return;         // still scanning -- touch keeps being read/handled every frame regardless
+    bool wasLocate = locateModeScan;
+    int rssi = finishScan();
+    // Guard against a scan that was started in one mode completing after
+    // the user has already navigated elsewhere (possible now that this
+    // doesn't block -- a back-button tap mid-scan can switch subMode
+    // before the callback resolves). Only draw/beep for the mode this
+    // scan was actually for, and only if still there.
+    if (wasLocate && subMode == LOCATE) {
+      uiDrawLocateReading(4, UI_CONTENT_Y + 36, tft.width() - 8,
+                           accentLabel(), -95, -40, &lastRssiShown, rssi);
+      beepHold(!muted);              // keep the amp warm so short chirps aren't swallowed
+      if (!muted) rangeBeep(rssi);   // rate + pitch scale with signal as a range proxy
+    } else if (!wasLocate && subMode == LIST) {
       drawRows();
-      lastScan = millis();
     }
+    return;
+  }
+  if (subMode == LIST) {
+    if (forceListScan || millis() - lastScan > 3000) { forceListScan = false; startScan(false); }
   } else if (subMode == LOCATE) {
-    updateLocate();
+    startScan(true);   // self-paces at ~SCAN_SECONDS per cycle; no extra gating needed
   }
 }
 
 void bleScanTouch(const TouchPoint &t) {
   if (subMode == LIST) {
-    if (!t.isNewPress) return;   // manual bounds check below, not uiTouchInButton() -- needs its own edge guard
+    if (!t.isNewPress) return;   // Use manual bounds checking for touch. The code skips the standard button helper. This method requires its own edge guard
     if (uiTouchInButton(t, logBtn)) {
       if (!logging) {
         logging = wlogOpen("blescan", "utc,name,mac,vendor,rssi");
@@ -300,8 +365,17 @@ void bleScanTouch(const TouchPoint &t) {
     if (uiTouchInButton(t, trackBtn)) {
       subMode = LOCATE;
       drawLocateChrome();
-      lastScan = 0;
       uiWaitForRelease();
+      return;
+    }
+    if (uiTouchInButton(t, flagBtn)) {
+      uiWaitForRelease();
+      const BleRow &r = rows[selected];
+      uint8_t sev = (r.cls != BC_NONE) ? UI_SEV_WATCH : UI_SEV_OK;
+      flagDetectionShow("ble_scan", sev);   // this screen already has its own detail view (above) -- no need for showDetectionDetail()
+      uiDrawTopBar("BLE Scan");
+      drawDetail();
+      return;
     }
     return;
   }
@@ -314,10 +388,11 @@ void bleScanTouch(const TouchPoint &t) {
   }
 }
 
-// Top-bar back button steps up one level inside this screen: DETAIL or
-// LOCATE -> the device list; only from the list does it fall through to the
-// main loop and leave the screen. Keeps the one back button consistent
-// with every other screen instead of needing an in-content "list" button.
+// The back button steps up one level.
+// Detail and locate modes return to the list.
+// The list mode exits to the main loop.
+// This keeps the back button consistent.
+// The code avoids extra list buttons.
 bool bleScanHandleBack() {
   if (subMode == LIST) return false;
   beepHold(false);
@@ -326,8 +401,13 @@ bool bleScanHandleBack() {
   prevSummary[0] = '\0';
   uiDrawTopBar("BLE Scan");
   uiShowLoading("Scanning...");
-  doScan();
-  drawRows();
+  // Can't call start() again if a scan (quite possibly a LOCATE one) is
+  // still in flight from before this back-tap -- bleScanLoop()'s subMode
+  // guard will just drop that scan's result since subMode is LIST now,
+  // and forceListScan makes sure a fresh one starts the moment it's
+  // free, rather than waiting out the normal 3s refresh interval.
+  if (!scanInFlight) startScan(false);
+  else                forceListScan = true;
   return true;
 }
 
@@ -336,5 +416,7 @@ void bleScanExit() {
   logging = false;
   wlogClose();
   if (pBLEScan) { pBLEScan->stop(); pBLEScan = nullptr; }
-  BLEDevice::deinit(false);   // radio coexistence -- see README; re-inits via the !pBLEScan guard
+  if (BLEDevice::getInitialized()) BLEDevice::deinit(false);   // radio coexistence -- see README; re-inits via the !pBLEScan guard
+  scanInFlight = false;
+  forceListScan = false;
 }
