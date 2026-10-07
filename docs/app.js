@@ -9,8 +9,8 @@
 // ---------------------------------------------------------------- geometry
 const LANDSCAPE = { w: 320, h: 240 };
 const PORTRAIT  = { w: 240, h: 320 };
-let SCR = { ...LANDSCAPE };
-let isLandscape = true;
+let SCR = { ...PORTRAIT };
+let isLandscape = false;
 
 const canvas = document.getElementById('tft');
 const ctx = canvas.getContext('2d');
@@ -71,13 +71,14 @@ const store = {
 };
 let THEME = store.get('theme', 1);       // 0 = Basic, 1 = Vice
 let ACCENT_ID = store.get('accent', 0);
-let LIST_BG = store.get('listbg', false);
-let ROTATION = store.get('rotation', 0); // 0/1/2/3 like the real uiSetRotation
+let LIST_BG = store.get('listbg', true);
+let ROTATION = store.get('rotation', 1); // 0/1/2/3 like the real uiSetRotation -- 1 = 90 deg, portrait
 let TZ_24H = store.get('tz24h', false);
 let TZ_AUTODST = store.get('tzdst', true);
 let TZ_IDX = store.get('tzidx', 4); // index into TZLIST below
 let SPLASH_ON = store.get('splash', true);
 let BEEP_VOL = store.get('beepvol', 70);
+let DISPLAY_TIMEOUT_MS = store.get('dispTimeoutMs', 0); // 0 = Never, like the real firmware's default
 
 function themeIsVice() { return THEME === 1; }
 function accent() { return ACCENT[ACCENT_ID]; }
@@ -424,7 +425,111 @@ canvas.addEventListener('touchstart', onPointerDown, { passive: false });
 window.addEventListener('mouseup', onPointerUp);
 window.addEventListener('touchend', onPointerUp);
 
-function ledSet(on) { ledEl.classList.toggle('on', !!on); }
+// Mirrors ledBusyTask()'s priority chain in ui.cpp: a brief green blink
+// (alertDetected(), for a detector hit) preempts everything briefly;
+// then a sustained alert (ledAlert, red/yellow alternating); then a
+// accent-colored pulse for any continuously-scanning screen (ledBusy);
+// then the idle heartbeat (a red blip every ~3s) as the default.
+let greenBlinkUntil = 0;
+let ledAlertOn = false;
+const LED_BUSY_SCREENS = new Set([
+  'WIFI_SCAN', 'BLE_SCAN', 'TRACKER', 'FLOCK', 'SKIMMER', 'SUBGHZ',
+  'GPS_WARDRIVE', 'PROBE_WATCH', 'CLIENT_MAP', 'CAMERA_DET', 'DRONE_DET',
+  'BLE_SPAM', 'WIFI_IDS',
+]);
+function ledBlinkGreen(ms) { greenBlinkUntil = performance.now() + ms; }
+function ledAlert(on) { ledAlertOn = !!on; }
+function ledPaint(color, opacity = 1) {
+  if (!color) { ledEl.style.background = '#000'; ledEl.style.boxShadow = '0 0 0 1px #000'; ledEl.style.opacity = 1; return; }
+  ledEl.style.background = color;
+  ledEl.style.boxShadow = `0 0 6px 2px ${color}, 0 0 0 1px #000`;
+  ledEl.style.opacity = opacity;
+}
+function serviceLed(now) {
+  if (now < greenBlinkUntil) { ledPaint('#3cff6b'); return; }
+  if (ledAlertOn) {
+    // Red/yellow, each smoothly fading 0->full->0 over 250ms (125 up +
+    // 125 down), alternating color every 250ms -- matches ledBusyTask().
+    const cyclePos = now % 500, isRed = cyclePos < 250, t = cyclePos % 250;
+    const k = t < 125 ? t / 125 : (250 - t) / 125;
+    ledPaint(isRed ? '#ff3b3b' : '#ffd23b', k);
+    return;
+  }
+  if (LED_BUSY_SCREENS.has(currentScreen)) {
+    // Accent color, 500ms fade-in, then instantly off for the remaining
+    // 250ms of a 750ms cycle -- matches ledBusyTask()'s "busy" pattern.
+    const t = now % 750;
+    ledPaint(accentFill(), t < 500 ? t / 500 : 0);
+    return;
+  }
+  ledPaint(now % 3050 < 50 ? '#ff3b3b' : null);
+}
+
+// ------------------------------------------------------------------- beep
+// Real Web Audio tone instead of a silent toast, for the handful of spots
+// that already reference "beep" in the sim. One AudioContext, created
+// lazily on first use so it's always inside a user-gesture handler (every
+// call site here originates from a click/tap) and browsers don't block it.
+let audioCtx = null;
+function beep(durationMs, freqHz) {
+  if (BEEP_VOL <= 0) return;
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  const t0 = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'square';
+  osc.frequency.value = freqHz;
+  const peak = (BEEP_VOL / 100) * 0.2;
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(peak, t0 + 0.005);
+  gain.gain.linearRampToValueAtTime(0, t0 + durationMs / 1000);
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + durationMs / 1000 + 0.01);
+}
+// Range-finder chirp: rate + pitch scale with signal, same idea as the
+// real firmware's rangeBeep(). Called on a timer from each LOCATE screen.
+function rangeBeep(rssi) {
+  const f = Math.max(0, Math.min(1, (rssi + 95) / 65));
+  beep(40, 900 + f * 1400);
+}
+
+// -------------------------------------------------------- BOOT / RESET
+// The device's two real physical buttons (GPIO0 / the EN pin) -- mirrors
+// their actual firmware behavior as closely as a single mouse pointer
+// allows (no real multi-touch "hold BOOT, tap RESET" on desktop).
+const bootBtnEl = document.getElementById('bootBtn');
+const resetBtnEl = document.getElementById('resetBtn');
+let bootHeldSince = 0, bootHoldFired = false, bootPinResetArmed = false;
+function bootPressStart(e) { e.preventDefault(); bootHeldSince = performance.now(); bootHoldFired = false; }
+function bootPressEnd() {
+  if (!bootHeldSince) return;
+  const held = performance.now() - bootHeldSince;
+  bootHeldSince = 0;
+  if (held > 1500) {
+    bootHoldFired = true;
+    uiToast('touch recalibrated');
+  } else {
+    bootPinResetArmed = !bootPinResetArmed;
+    bootBtnEl.classList.toggle('active', bootPinResetArmed);
+  }
+}
+bootBtnEl.addEventListener('mousedown', bootPressStart);
+bootBtnEl.addEventListener('touchstart', bootPressStart, { passive: false });
+bootBtnEl.addEventListener('mouseup', bootPressEnd);
+bootBtnEl.addEventListener('touchend', bootPressEnd);
+resetBtnEl.addEventListener('click', () => {
+  if (bootPinResetArmed) {
+    bootPinResetArmed = false;
+    bootBtnEl.classList.remove('active');
+    uiToast('BOOT held: SPI pin overrides reset to defaults');
+  }
+  booted = false;
+  currentScreen = 'MENU';
+  displayBlanked = false;
+  bootSequence();
+});
 
 // ------------------------------------------------------------- navigation
 const Screens = {}; // id -> {enter, exit, frame(now,t), handleBack()}
@@ -578,6 +683,18 @@ function stepChrome() {
   batteryPct += (Math.random() < 0.5 ? -1 : 1) * 0.02;
   batteryPct = Math.max(14, Math.min(96, batteryPct));
 }
+
+// Mirrors power.cpp's powerNoteActivity()/powerServiceAutoOff(): a global
+// idle clock, checked once per frame regardless of which screen is up, so
+// Display Timeout behaves the same here as on real hardware.
+let lastActivityAt = performance.now();
+let displayBlanked = false;
+function noteActivity() { lastActivityAt = performance.now(); }
+function serviceAutoOff(now) {
+  if (DISPLAY_TIMEOUT_MS === 0 || displayBlanked) return;
+  if (now - lastActivityAt >= DISPLAY_TIMEOUT_MS) displayBlanked = true;
+}
+
 function mainLoop(now) {
   requestAnimationFrame(mainLoop);
   if (now - lastFrame < 66) return;
@@ -588,7 +705,17 @@ function mainLoop(now) {
     const img = isLandscape ? ASSETS.splashLandscape : ASSETS.splashPortrait;
     if (img) { ctx.drawImage(img, 0, 0, SCR.w, SCR.h); }
     else { tft.fillScreen('#150a24'); }
-    if (touch.isNewPress || now > splashUntil) { booted = true; drawMenu(); }
+    if (touch.isNewPress || now > splashUntil) { booted = true; drawMenu(); noteActivity(); }
+    touch.isNewPress = false;
+    return;
+  }
+  serviceLed(now);
+
+  if (touch.isNewPress) noteActivity();
+  serviceAutoOff(now);
+  if (displayBlanked) {
+    tft.fillScreen(C.BLACK);
+    if (touch.pressed) { displayBlanked = false; noteActivity(); }
     touch.isNewPress = false;
     return;
   }
@@ -647,7 +774,7 @@ function askText(promptText, initial, cb, opts = {}) {
 
 // ---------------------------------------------------------------- WiFi Scan
 (() => {
-  let mode = 'LIST', sel = null, logging = false, locateAngle = 0, connectMsg = '';
+  let mode = 'LIST', sel = null, logging = false, locateAngle = 0, connectMsg = '', muted = false, lastChirp = 0;
   function draw() {
     uiDrawTopBar('WiFi Scan');
     bgMode = LIST_BG ? 1 : 0;
@@ -679,7 +806,7 @@ function askText(promptText, initial, cb, opts = {}) {
       lines.forEach(([s, col]) => { tft.setTextColor(col); tft.setCursor(6, y); tft.print(s); y += 16; });
       if (connectMsg) { tft.setTextColor(connectMsg.startsWith('Connected') ? C.GREEN : C.RED); tft.setCursor(6, y + 6); tft.print(connectMsg); }
     } else if (mode === 'LOCATE') {
-      uiDrawActionRow([{ label: 'mute', key: 'mute' }]);
+      uiDrawActionRow([{ label: muted ? 'unmute' : 'mute', key: 'mute' }]);
       uiClearBelow(UI_CONTENT_Y);
       const ap = sel;
       tft.setTextSize(3); tft.setTextColor(accentLabel());
@@ -693,7 +820,7 @@ function askText(promptText, initial, cb, opts = {}) {
     }
   }
   Screens.WIFI_SCAN = {
-    enter() { mode = 'LIST'; connectMsg = ''; draw(); },
+    enter() { mode = 'LIST'; connectMsg = ''; muted = false; draw(); },
     frame(now) {
       if (now % 900 < 66) tickAps();
       draw();
@@ -713,7 +840,8 @@ function askText(promptText, initial, cb, opts = {}) {
           }
         }
       } else if (mode === 'LOCATE') {
-        if (tapped({ x: 4, y: UI_ACTIONROW_Y, w: SCR.w - 8, h: UI_ACTIONROW_H })) {}
+        if (!muted && now - lastChirp > 700) { lastChirp = now; rangeBeep(sel.rssi); }
+        if (tapped({ x: 4, y: UI_ACTIONROW_Y, w: SCR.w - 8, h: UI_ACTIONROW_H })) { muted = !muted; }
       }
     },
     handleBack() {
@@ -854,11 +982,14 @@ function askText(promptText, initial, cb, opts = {}) {
       log.slice(0, maxLines).forEach((l) => { tft.setTextColor(C.RED); tft.setCursor(4, ly); tft.print(l); ly += 11; });
     },
     frame(now) {
-      if (now - lastEvent > 5000) { lastEvent = now; fireEvent(now); ledSet(banner === 'ALERT'); if (banner === 'ALERT') uiToast('WiFi IDS: ' + bannerText); }
+      if (now - lastEvent > 5000) {
+        lastEvent = now; fireEvent(now); ledAlert(banner === 'ALERT');
+        if (banner === 'ALERT') { uiToast('WiFi IDS: ' + bannerText); beep(400, 1200); }
+      }
       this.draw();
-      if (touch.isNewPress && touch.y > 140) { banner = 'ok'; bannerText = 'no attack indicators'; log = []; ledSet(false); }
+      if (touch.isNewPress && touch.y > 140) { banner = 'ok'; bannerText = 'no attack indicators'; log = []; ledAlert(false); }
     },
-    exit() { ledSet(false); },
+    exit() { ledAlert(false); },
   };
 })();
 
@@ -947,7 +1078,7 @@ function askText(promptText, initial, cb, opts = {}) {
         this._t = now;
         if ((wifiOn || bleOn) && Math.random() < 0.4 && hits.length < 8) {
           const [kind, name] = pick(POOL);
-          if ((kind === 'WiFi' && wifiOn) || (kind === 'BLE' && bleOn)) { hits.unshift([kind, name, rndi(-85, -45)]); uiToast('Flock detect: possible hit'); ledSet(true); setTimeout(() => ledSet(false), 200); }
+          if ((kind === 'WiFi' && wifiOn) || (kind === 'BLE' && bleOn)) { hits.unshift([kind, name, rndi(-85, -45)]); uiToast('Flock detect: possible hit'); ledBlinkGreen(200); }
         }
       }
       this.draw();
@@ -958,7 +1089,7 @@ function askText(promptText, initial, cb, opts = {}) {
 
 // -------------------------------------------------------------- Tracker Detect
 (() => {
-  let mode = 'LIST', sel = null;
+  let mode = 'LIST', sel = null, lastChirp = 0;
   const CLASSES = [
     { name: 'AirTag/FindMy', rssi: -52, dwell: '4m12s', mac: 2, follow: true },
     { name: 'SmartTag', rssi: -67, dwell: '0m38s', mac: 1, follow: false },
@@ -1001,6 +1132,7 @@ function askText(promptText, initial, cb, opts = {}) {
       if (now % 1400 < 66) CLASSES.forEach((c) => { c.rssi = jitterRssi(c.rssi, 4); });
       this.draw();
       if (mode === 'LIST' && touch.isNewPress) for (const c of CLASSES) if (hit(touch, c._row)) { sel = c; mode = 'LOCATE'; }
+      else if (mode === 'LOCATE' && now - lastChirp > 700) { lastChirp = now; rangeBeep(sel.rssi); }
     },
     handleBack() { if (mode === 'LOCATE') { mode = 'LIST'; return true; } return false; },
   };
@@ -1022,7 +1154,7 @@ function askText(promptText, initial, cb, opts = {}) {
       hits.forEach((n) => { tft.setTextColor(C.RED); tft.setCursor(4, y); tft.print(sprintf('  %-16.16s %ddBm', n, rndi(-80, -45))); y += 14; });
     },
     frame(now) {
-      if (now - (this._t || 0) > 3500) { this._t = now; if (Math.random() < 0.3 && hits.length < 6) { hits.unshift(pick(POOL)); uiToast('Skimmer detect: possible hit'); ledSet(true); setTimeout(() => ledSet(false), 400); } }
+      if (now - (this._t || 0) > 3500) { this._t = now; if (Math.random() < 0.3 && hits.length < 6) { hits.unshift(pick(POOL)); uiToast('Skimmer detect: possible hit'); ledBlinkGreen(400); } }
       this.draw();
     },
   };
@@ -1030,11 +1162,11 @@ function askText(promptText, initial, cb, opts = {}) {
 
 // ------------------------------------------------------------------ BLE Scan
 (() => {
-  let mode = 'LIST', sel = null, logging = false;
+  let mode = 'LIST', sel = null, logging = false, muted = false, lastChirp = 0;
   function classify(name) { if (name.includes('Flipper')) return { cls: 'FLIPPER', col: C.MAGENTA }; if (name.includes('Ray-Ban')) return { cls: 'GLASSES', col: C.ORANGE }; return null; }
   const DEVS = BLE_NAME_POOL.map((n) => ({ name: n, mac: randMac(), rssi: rndi(-88, -42), vendor: pick(VENDOR_POOL) }));
   Screens.BLE_SCAN = {
-    enter() { mode = 'LIST'; this.draw(); },
+    enter() { mode = 'LIST'; muted = false; this.draw(); },
     draw() {
       uiDrawTopBar('BLE Scan');
       if (mode === 'LIST') {
@@ -1065,7 +1197,7 @@ function askText(promptText, initial, cb, opts = {}) {
         tft.setTextSize(1); tft.setTextWrap(false); tft.setTextColor(accentLabel());
         [`Name: ${sel.name}`, `MAC:  ${sel.mac}`, `Vendor: ${sel.vendor}`, `RSSI: ${sel.rssi} dBm`].forEach((l, i) => { tft.setCursor(6, UI_CONTENT_Y + 6 + i * 16); tft.print(l); });
       } else if (mode === 'LOCATE') {
-        uiDrawActionRow([{ label: 'mute' }]);
+        uiDrawActionRow([{ label: muted ? 'unmute' : 'mute' }]);
         uiClearBelow(UI_CONTENT_Y);
         tft.setTextSize(2); tft.setTextColor(accentLabel()); tft.setCursor(6, UI_CONTENT_Y + 4); tft.print(sel.name);
         tft.setTextSize(3);
@@ -1086,6 +1218,10 @@ function askText(promptText, initial, cb, opts = {}) {
           else for (const d of DEVS) if (hit(touch, d._row)) { sel = d; mode = 'DETAIL'; }
         }
       } else if (mode === 'DETAIL' && tapped({ x: 4, y: UI_ACTIONROW_Y, w: SCR.w - 8, h: UI_ACTIONROW_H })) mode = 'LOCATE';
+      else if (mode === 'LOCATE') {
+        if (!muted && now - lastChirp > 700) { lastChirp = now; rangeBeep(sel.rssi); }
+        if (tapped({ x: 4, y: UI_ACTIONROW_Y, w: SCR.w - 8, h: UI_ACTIONROW_H })) muted = !muted;
+      }
     },
     handleBack() { if (mode === 'LOCATE') { mode = 'DETAIL'; return true; } if (mode === 'DETAIL') { mode = 'LIST'; return true; } return false; },
   };
@@ -1230,7 +1366,7 @@ function askText(promptText, initial, cb, opts = {}) {
 
 // ------------------------------------------------------------- Camera Detect
 (() => {
-  let mode = 'LIST', sel = null;
+  let mode = 'LIST', sel = null, lastChirp = 0;
   const ROWS = [
     { vendor: 'Hikvision', bssid: 'A1:22:9F', ch: 6, rssi: -58, ssid: 'IPCAM_Front_Door' },
     { vendor: 'Dahua', bssid: '3F:B0:77', ch: 11, rssi: -66, ssid: '(hidden)' },
@@ -1271,6 +1407,7 @@ function askText(promptText, initial, cb, opts = {}) {
       if (now % 2000 < 66) ROWS.forEach((r) => { r.rssi = jitterRssi(r.rssi, 3); });
       this.draw();
       if (mode === 'LIST' && touch.isNewPress) for (const r of ROWS) if (hit(touch, r._row)) { sel = r; mode = 'LOCATE'; }
+      else if (mode === 'LOCATE' && now - lastChirp > 700) { lastChirp = now; rangeBeep(sel.rssi); }
     },
     handleBack() { if (mode === 'LOCATE') { mode = 'LIST'; return true; } return false; },
   };
@@ -1341,10 +1478,10 @@ function askText(promptText, initial, cb, opts = {}) {
     frame(now) {
       if (now < spikeUntil) { rate = rndi(260, 380); continuity = rndi(40, 65); }
       else { rate = rndi(20, 60); continuity = rndi(0, 4); swiftpair = rndi(0, 2); fastpair = rndi(0, 2); addr = rndi(6, 14); }
-      if (now - (this._t || 0) > 9000) { this._t = now; if (Math.random() < 0.35) { spikeUntil = now + 3500; ledSet(true); uiToast('BLE spam watch: alert'); setTimeout(() => ledSet(false), 350); } }
+      if (now - (this._t || 0) > 9000) { this._t = now; if (Math.random() < 0.35) { spikeUntil = now + 3500; ledBlinkGreen(350); uiToast('BLE spam watch: alert'); } }
       sev = rate >= 250 || continuity >= 40 || (continuity >= 15 && addr >= 20) ? 'ALERT' : (rate >= 110 || continuity >= 12) ? 'watch' : 'ok';
       this.draw();
-      if (touch.isNewPress) { spikeUntil = 0; ledSet(false); }
+      if (touch.isNewPress) { spikeUntil = 0; greenBlinkUntil = 0; }
     },
   };
 })();
@@ -1493,14 +1630,77 @@ function askText(promptText, initial, cb, opts = {}) {
   const TZLIST = ['UTC-12', 'UTC-10 (Hawaii)', 'UTC-8 (US Pacific)', 'UTC-5 (US Eastern)', 'UTC+0 (UTC/London)', 'UTC+1 (Central EU)', 'UTC+5:30 (India)', 'UTC+9 (Japan/Korea)', 'UTC+9:30 (C. Aust.)', 'UTC+12 (NZ)'];
   const MODULES = ['WiFi scan', 'Net stats', 'WiFi IDS', 'Wardrive', 'BLE scan', 'Tracker detect', 'Flock detect', 'Skimmer detect', 'SubGHz sweep', 'Meshtastic', 'Engagement', 'Rogue AP', 'Probe watch', 'Client map', 'Camera detect', 'Drone detect', 'BLE spam watch'];
   let modHidden = MODULES.map(() => false);
+  let modPage = 0, modPages = 1;
   let view = 'ROOT';
   let pins = { cc1101: true, radio24: 0, cs1101: 5, cs24: 27, irq24: 26, gdo0: 4 };
   let battMv = 3850, battFactor = 1.015;
   let tzSel = TZ_IDX;
   let stack = [];
+  let rootPage = 0, rootPages = 1;
+  let powerMenuOpen = false, powerConfirmOpen = false, poweredOff = false;
+  let powerPopupBtns = null, powerConfirmBtns = null;
+
+  const TIMEOUT_OPTIONS_MS = [30000, 60000, 180000, 300000, 600000, 900000];
+  const TIMEOUT_LABELS = ['30 seconds', '1 minute', '3 minutes', '5 minutes', '10 minutes', '15 minutes'];
+  function timeoutIdxFromMs(ms) { const i = TIMEOUT_OPTIONS_MS.indexOf(ms); return i < 0 ? 0 : i; }
+  let timeoutNever = DISPLAY_TIMEOUT_MS === 0;
+  let timeoutIdx = timeoutIdxFromMs(DISPLAY_TIMEOUT_MS);
 
   function push(v) { stack.push(view); view = v; }
   function popView() { view = stack.pop() || 'ROOT'; }
+
+  // Same bottom-left corner and puck/ring/stem style as the main menu's
+  // gear icon (drawGear()/touchInGear() above) and the real firmware's
+  // drawPowerIcon() in system_screen.cpp.
+  function powerIconCenter() { return { cx: 18, cy: SCR.h - 18 }; }
+  function drawPowerIcon() {
+    const { cx, cy } = powerIconCenter();
+    const R = 10, PUCK_R = R + 6, RING_R = PUCK_R - 2;
+    tft.fillCircle(cx, cy, PUCK_R, C.BLACK);
+    for (let rr = RING_R - 2; rr <= RING_R; rr++) tft.drawCircle(cx, cy, rr, C.DARKGREY);
+    tft.fillRect(cx - 4, cy - RING_R - 1, 8, 6, C.BLACK);
+    tft.fillRect(cx - 1, cy - RING_R - 1, 3, RING_R - 1, C.DARKGREY);
+  }
+  function touchInPowerIcon(t) {
+    const { cx, cy } = powerIconCenter();
+    const dx = t.x - cx, dy = t.y - cy, rr = 10 + 8;
+    return dx * dx + dy * dy <= rr * rr;
+  }
+  function drawPowerPopup() {
+    const boxW = Math.min(220, SCR.w - 60), boxH = 110;
+    const bx = (SCR.w - boxW) / 2, by = (SCR.h - boxH) / 2;
+    tft.fillRect(bx, by, boxW, boxH, C.BLACK);
+    tft.drawRect(bx, by, boxW, boxH, C.WHITE);
+    const sleepBtn = { x: bx + 10, y: by + 12, w: boxW - 20, h: 34, label: 'Sleep' };
+    const offBtn = { x: bx + 10, y: by + 56, w: boxW - 20, h: 34, label: 'Power off' };
+    uiDrawMenuButton(sleepBtn);
+    uiDrawMenuButton(offBtn);
+    tft.setTextSize(1); tft.setTextColor(C.DARKGREY); tft.setTextWrap(false);
+    const msg = 'tap outside to cancel';
+    tft.setCursor(bx + (boxW - tft.textWidthOf(msg)) / 2, by + boxH - 14);
+    tft.print(msg);
+    powerPopupBtns = { box: { x: bx, y: by, w: boxW, h: boxH }, sleepBtn, offBtn };
+  }
+  function drawPowerOffConfirm() {
+    uiClearBelow(0);
+    tft.setTextColor(C.YELLOW); tft.setTextSize(2); tft.setTextWrap(false);
+    tft.setCursor(8, 40); tft.print('Power off');
+    tft.setTextColor(C.WHITE); tft.setTextSize(1);
+    tft.setCursor(8, 76); tft.print('Lowest power mode.');
+    tft.setCursor(8, 92); tft.print('Press RESET to power on.');
+    const goBtn = { x: 8, y: 140, w: SCR.w - 16, h: 34, label: 'Power off now' };
+    const noBtn = { x: 8, y: 184, w: SCR.w - 16, h: 34, label: 'cancel' };
+    uiDrawMenuButton(goBtn);
+    uiDrawMenuButton(noBtn);
+    powerConfirmBtns = { goBtn, noBtn };
+  }
+  function drawPoweredOff() {
+    tft.fillScreen(C.BLACK);
+    tft.setTextColor(C.DARKGREY); tft.setTextSize(1); tft.setTextWrap(false);
+    const msg = 'Powered off -- tap to restart the demo';
+    tft.setCursor((SCR.w - tft.textWidthOf(msg)) / 2, SCR.h / 2 - 4);
+    tft.print(msg);
+  }
 
   function rowList(title, items, onTap, footer) {
     uiDrawTopBar(title);
@@ -1512,9 +1712,33 @@ function askText(promptText, initial, cb, opts = {}) {
     return btns;
   }
 
+  const ROOT_ITEMS = ['Display', 'Hardware', 'Modules', 'Beep volume', 'Run setup wizard', 'About'];
   const draws = {
     ROOT() {
-      this._btns = rowList('System', ['Display', 'Hardware', 'Modules', 'Beep volume', 'Run setup wizard', 'About'], null, sprintf('SD: ok   theme: %s', themeIsVice() ? 'Vice' : 'Basic'));
+      if (poweredOff) { drawPoweredOff(); return; }
+      if (powerConfirmOpen) { drawPowerOffConfirm(); return; }
+      // Standard button size (36/6), paginated like the real firmware --
+      // 6 standard-size rows don't fit above the status bar in landscape.
+      uiDrawTopBar('System'); bgMode = 1; uiClearBelow(29);
+      const y0 = 34, rowH = 36, gap = 6, bottomMargin = 36, pagerGap = 6;
+      let rowsPerPage = Math.max(1, Math.floor((SCR.h - bottomMargin - UI_PAGER_H - pagerGap - y0 + gap) / (rowH + gap)));
+      rowsPerPage = Math.min(rowsPerPage, ROOT_ITEMS.length);
+      rootPages = Math.ceil(ROOT_ITEMS.length / rowsPerPage);
+      if (rootPage >= rootPages) rootPage = rootPages - 1;
+      if (rootPage < 0) rootPage = 0;
+      const base = rootPage * rowsPerPage;
+      let y = y0;
+      this._btns = ROOT_ITEMS.slice(base, base + rowsPerPage).map((label) => {
+        const b = { x: 8, y, w: SCR.w - 16, h: rowH, label };
+        uiDrawMenuButton(b);
+        y += rowH + gap;
+        return b;
+      });
+      const pagerY = y0 + rowsPerPage * (rowH + gap) - gap + pagerGap;
+      this._prevBtn = {}; this._nextBtn = {};
+      uiDrawPager(pagerY, rootPage, rootPages, this._prevBtn, this._nextBtn);
+      drawPowerIcon();
+      if (powerMenuOpen) drawPowerPopup();
     },
     ABOUT() {
       uiDrawTopBar('About');
@@ -1533,15 +1757,30 @@ function askText(promptText, initial, cb, opts = {}) {
       lines.forEach(([s, col]) => { tft.setTextColor(col); tft.setCursor((SCR.w - tft.textWidthOf(s)) / 2, y); tft.print(s); y += 13; });
     },
     MODULES() {
+      // Paginated like the real systemShowModules() -- at MOD_N=17 and a
+      // 25px row pitch, more than fit on a 240px-tall screen used to just
+      // draw off the bottom, unreachable by touch.
       uiDrawTopBar('Modules'); bgMode = 1; uiClearBelow(29);
-      let y = 38;
-      this._rows = MODULES.map((name, i) => {
-        const b = { x: 8, y, w: SCR.w - 16, h: 22, label: name };
+      const y0 = 38, rowH = 22, gap = 3, bottomMargin = UI_STATUSBAR_H + 4, pagerGap = 6;
+      let rowsPerPage = Math.max(1, Math.floor((SCR.h - bottomMargin - UI_PAGER_H - pagerGap - y0 + gap) / (rowH + gap)));
+      rowsPerPage = Math.min(rowsPerPage, MODULES.length);
+      modPages = Math.ceil(MODULES.length / rowsPerPage);
+      if (modPage >= modPages) modPage = modPages - 1;
+      if (modPage < 0) modPage = 0;
+      const base = modPage * rowsPerPage;
+      this._modBase = base;
+      let y = y0;
+      this._rows = MODULES.slice(base, base + rowsPerPage).map((name, i) => {
+        const idx = base + i;
+        const b = { x: 8, y, w: SCR.w - 16, h: rowH, label: name };
         uiDrawMenuButton(b);
-        tft.fillCircle(SCR.w - 26, y + 11, modHidden[i] ? 2 : 6, modHidden[i] ? C.DIM_GREY : C.GREEN);
-        y += 25;
+        tft.fillCircle(SCR.w - 26, y + rowH / 2, modHidden[idx] ? 2 : 6, modHidden[idx] ? C.DIM_GREY : C.GREEN);
+        y += rowH + gap;
         return b;
       });
+      const pagerY = y0 + rowsPerPage * (rowH + gap) - gap + pagerGap;
+      this._modPrevBtn = {}; this._modNextBtn = {};
+      uiDrawPager(pagerY, modPage, modPages, this._modPrevBtn, this._modNextBtn);
     },
     HARDWARE() { this._btns = rowList('Hardware', ['SPI / IRQ pins', 'Battery Info', 'Test GPS', 'Format SD card']); },
     PINS() {
@@ -1588,7 +1827,30 @@ function askText(promptText, initial, cb, opts = {}) {
       let y = 34;
       rows.forEach(([k, v, col]) => { tft.setTextColor(accentLabel()); tft.setCursor(4, y); tft.print(k); tft.setTextColor(col); tft.setCursor(100, y); tft.print(v); y += 15; });
     },
-    DISPLAY() { this._btns = rowList('Display', ['Screen orientation', 'Theme & Color', 'Timezone', 'Recalibrate touch', SPLASH_ON ? 'Boot splash (on)' : 'Boot splash (off)']); },
+    DISPLAY() { this._btns = rowList('Display', ['Screen orientation', 'Theme & Color', 'Timezone', 'Recalibrate touch', SPLASH_ON ? 'Boot splash (on)' : 'Boot splash (off)', 'Display Timeout']); },
+    TIMEOUT() {
+      uiDrawTopBar('Display Timeout'); bgMode = 0; uiClearBelow(29);
+      tft.setTextColor(C.WHITE); tft.setTextSize(1); tft.setTextWrap(false);
+      tft.setCursor(8, 38); tft.print('Turn off the display after:');
+      const rowBtn = { x: 8, y: 56, w: SCR.w - 16, h: 30, label: TIMEOUT_LABELS[timeoutIdx] };
+      const neverBtn = { x: 8, y: 94, w: SCR.w - 16, h: 30, label: timeoutNever ? 'Never (on)' : 'Never (off)' };
+      const applyBtn = { x: 8, y: 140, w: SCR.w - 16, h: 34, label: 'Apply' };
+      if (timeoutNever) uiDrawButtonDim(rowBtn); else uiDrawMenuButton(rowBtn);
+      uiDrawMenuButton(neverBtn);
+      uiDrawMenuButton(applyBtn);
+      this._timeoutRow = rowBtn; this._timeoutNever = neverBtn; this._timeoutApply = applyBtn;
+    },
+    TIMEOUTPICK() {
+      uiDrawTopBar('Timeout'); uiClearBelow(29);
+      let y = 34;
+      this._tp = TIMEOUT_LABELS.map((label, i) => {
+        const b = { x: 8, y, w: SCR.w - 16, h: 30, label, idx: i };
+        uiDrawButton(b);
+        if (i === timeoutIdx) tft.drawRoundRect(b.x - 2, b.y - 2, b.w + 4, b.h + 4, 8, C.GREEN);
+        y += 34;
+        return b;
+      });
+    },
     ROTATION() {
       uiClearRect(0, 0, SCR.w, SCR.h); uiDrawStatusBar();
       tft.setTextSize(1); tft.setTextColor(C.WHITE); tft.setCursor(4, 4); tft.print('Pick orientation');
@@ -1662,7 +1924,12 @@ function askText(promptText, initial, cb, opts = {}) {
   function devTimeStr() { const d = new Date(); return d.toISOString().slice(0, 19).replace('T', ' '); }
 
   Screens.SYSTEM = {
-    enter() { view = 'ROOT'; stack = []; this.draw(); },
+    enter() {
+      view = 'ROOT'; stack = []; rootPage = 0;
+      powerMenuOpen = false; powerConfirmOpen = false; poweredOff = false;
+      timeoutNever = DISPLAY_TIMEOUT_MS === 0; timeoutIdx = timeoutIdxFromMs(DISPLAY_TIMEOUT_MS);
+      this.draw();
+    },
     draw() { (draws[view] || draws.ROOT).call(this); },
     frame() {
       this.draw();
@@ -1670,10 +1937,31 @@ function askText(promptText, initial, cb, opts = {}) {
       const t = touch;
       switch (view) {
         case 'ROOT':
+          if (poweredOff) { poweredOff = false; break; }
+          if (powerConfirmOpen) {
+            if (hit(t, powerConfirmBtns.noBtn)) powerConfirmOpen = false;
+            else if (hit(t, powerConfirmBtns.goBtn)) poweredOff = true;
+            break;
+          }
+          if (powerMenuOpen) {
+            if (hit(t, powerPopupBtns.sleepBtn)) {
+              powerMenuOpen = false;
+              currentScreen = 'MENU';   // "Sleep" wakes to the main menu, not back here -- same as the real firmware
+              displayBlanked = true;    // the MENU dispatch below redraws on its own once this clears
+            } else if (hit(t, powerPopupBtns.offBtn)) {
+              powerMenuOpen = false; powerConfirmOpen = true;
+            } else if (!hit(t, powerPopupBtns.box)) {
+              powerMenuOpen = false;   // tapped outside the box -- cancel
+            }
+            break;
+          }
+          if (touchInPowerIcon(t)) { powerMenuOpen = true; break; }
+          if (hit(t, this._prevBtn) && rootPage > 0) { rootPage--; break; }
+          if (hit(t, this._nextBtn) && rootPage < rootPages - 1) { rootPage++; break; }
           for (const b of this._btns) if (hit(t, b)) {
             if (b.label === 'Display') push('DISPLAY');
             else if (b.label === 'Hardware') push('HARDWARE');
-            else if (b.label === 'Modules') push('MODULES');
+            else if (b.label === 'Modules') { modPage = 0; push('MODULES'); }
             else if (b.label === 'Beep volume') push('BEEP');
             else if (b.label === 'Run setup wizard') uiToast('setup wizard (skipped in sim)');
             else if (b.label === 'About') push('ABOUT');
@@ -1683,7 +1971,9 @@ function askText(promptText, initial, cb, opts = {}) {
           if (this._qr && hit(t, this._qr)) uiToast('splash art (tap to dismiss)');
           break;
         case 'MODULES':
-          for (let i = 0; i < this._rows.length; i++) if (hit(t, this._rows[i])) modHidden[i] = !modHidden[i];
+          if (hit(t, this._modPrevBtn) && modPage > 0) { modPage--; break; }
+          if (hit(t, this._modNextBtn) && modPage < modPages - 1) { modPage++; break; }
+          for (let i = 0; i < this._rows.length; i++) if (hit(t, this._rows[i])) { const idx = this._modBase + i; modHidden[idx] = !modHidden[idx]; }
           break;
         case 'HARDWARE':
           for (const b of this._btns) if (hit(t, b)) {
@@ -1711,8 +2001,23 @@ function askText(promptText, initial, cb, opts = {}) {
             else if (b.label === 'Theme & Color') push('THEME');
             else if (b.label === 'Timezone') { tzSel = TZ_IDX; push('TIMEZONE'); }
             else if (b.label === 'Recalibrate touch') uiToast('touch recalibrated');
-            else { SPLASH_ON = !SPLASH_ON; store.set('splash', SPLASH_ON); }
+            else if (b.label === 'Display Timeout') {
+              timeoutNever = DISPLAY_TIMEOUT_MS === 0; timeoutIdx = timeoutIdxFromMs(DISPLAY_TIMEOUT_MS); push('TIMEOUT');
+            } else { SPLASH_ON = !SPLASH_ON; store.set('splash', SPLASH_ON); }
           }
+          break;
+        case 'TIMEOUT':
+          if (hit(t, this._timeoutRow) && !timeoutNever) push('TIMEOUTPICK');
+          else if (hit(t, this._timeoutNever)) timeoutNever = !timeoutNever;
+          else if (hit(t, this._timeoutApply)) {
+            DISPLAY_TIMEOUT_MS = timeoutNever ? 0 : TIMEOUT_OPTIONS_MS[timeoutIdx];
+            store.set('dispTimeoutMs', DISPLAY_TIMEOUT_MS);
+            noteActivity();
+            popView();
+          }
+          break;
+        case 'TIMEOUTPICK':
+          for (const b of this._tp || []) if (hit(t, b)) { timeoutIdx = b.idx; popView(); }
           break;
         case 'ROTATION':
           for (const b of this._rot || []) if (hit(t, b)) { const idx = ['0', '90', '180', '270'].indexOf(b.label); ROTATION = idx; store.set('rotation', idx); setOrientation(idx); popView(); }
@@ -1734,9 +2039,9 @@ function askText(promptText, initial, cb, opts = {}) {
           else if (this._next && hit(t, this._next) && tzSel + 5 < TZLIST.length) tzSel += 5;
           break;
         case 'BEEP':
-          if (hit(t, this._minus)) { BEEP_VOL = Math.max(0, BEEP_VOL - 10); store.set('beepvol', BEEP_VOL); }
-          else if (hit(t, this._plus)) { BEEP_VOL = Math.min(100, BEEP_VOL + 10); store.set('beepvol', BEEP_VOL); }
-          else if (hit(t, this._test)) uiToast('beep');
+          if (hit(t, this._minus)) { BEEP_VOL = Math.max(0, BEEP_VOL - 10); store.set('beepvol', BEEP_VOL); beep(200, 1800); }
+          else if (hit(t, this._plus)) { BEEP_VOL = Math.min(100, BEEP_VOL + 10); store.set('beepvol', BEEP_VOL); beep(200, 1800); }
+          else if (hit(t, this._test)) beep(200, 1800);
           break;
       }
     },

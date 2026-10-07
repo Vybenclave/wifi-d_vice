@@ -115,19 +115,37 @@ header p a:hover{color:var(--hot)}
   width:6px;height:6px;border-radius:50%;
   background:#000; box-shadow:0 0 0 2px #2f2a52, inset 0 0 2px #444;
 }
-.device .home-btn{
-  position:absolute; bottom:12px; left:50%; transform:translateX(-50%);
-  width:26px;height:8px;border-radius:5px;
-  background:linear-gradient(180deg,#3a3564,#221f3d);
-  box-shadow:0 1px 0 rgba(255,255,255,.08) inset;
-}
 .device .led{
-  position:absolute; top:11px; right:20px;
-  width:6px;height:6px;border-radius:50%;
-  background:#132; box-shadow:0 0 0 1px #000;
+  /* Bottom bezel is 46px (.device's own padding-bottom) -- this circle
+     fills it top-to-bottom, centered, same spot the old .home-btn sat. */
+  position:absolute; bottom:4px; left:50%;
+  width:38px; height:38px;
+  transform:translateX(-50%);
+  border-radius:50%;
+  background:#000; box-shadow:0 0 0 1px #000;
   transition:background .15s, box-shadow .15s;
 }
-.device .led.on{background:#3cff6b; box-shadow:0 0 6px 2px rgba(60,255,107,.8), 0 0 0 1px #000;}
+
+/* BOOT / RESET: the device's two real physical buttons */
+.device .phys-btn{
+  position:absolute; bottom:8px;
+  padding:6px 16px;
+  border-radius:10px;
+  background:linear-gradient(180deg,#3a3564,#221f3d);
+  box-shadow:0 1px 0 rgba(255,255,255,.08) inset;
+  font-family:'VT323',monospace; font-size:22px; letter-spacing:.04em;
+  color:var(--ink-faint);
+  cursor:pointer; user-select:none;
+  transition:background .1s, transform .1s;
+}
+.device .phys-btn:hover{background:linear-gradient(180deg,#453f72,#2a2650);}
+.device .phys-btn:active, .device .phys-btn.active{
+  background:linear-gradient(180deg,#221f3d,#3a3564);
+  transform:translateY(1px);
+  color:#eef0fa;
+}
+.device .boot-btn{left:16px;}
+.device .reset-btn{right:16px;}
 
 .hint-row{
   display:flex; flex-wrap:wrap; justify-content:center; gap:10px;
@@ -188,11 +206,12 @@ footer a:hover{color:var(--cool)}
 <div class="stage">
   <div class="device" id="device">
     <div class="cam"></div>
+    <div class="phys-btn boot-btn" id="bootBtn">BOOT</div>
+    <div class="phys-btn reset-btn" id="resetBtn">RST</div>
     <div class="led" id="statusLed"></div>
     <div class="screen-well">
       <canvas id="tft" width="320" height="240"></canvas>
     </div>
-    <div class="home-btn"></div>
   </div>
   <div class="hint-row">
     <span><kbd>tap</kbd> the screen to use it</span>
