@@ -369,6 +369,20 @@ function uiDrawPager(y, page, pages, prevBtn, nextBtn) {
 }
 function hit(t, b) { return b && t.x >= b.x && t.x < b.x + b.w && t.y >= b.y && t.y < b.y + b.h; }
 
+// Small 4-bar signal-strength icon, right-anchored at xRight, bars rising
+// from baseline. Lit-bar count + color scale with RSSI.
+function drawSignalBars(xRight, baseline, rssi) {
+  const heights = [4, 7, 10, 13];
+  const lit = rssi > -55 ? 4 : rssi > -65 ? 3 : rssi > -75 ? 2 : rssi > -85 ? 1 : 0;
+  const col = rssi > -55 ? C.GREEN : rssi > -75 ? C.YELLOW : C.RED;
+  const barW = 4, gap = 2;
+  let x = xRight - (heights.length * barW + (heights.length - 1) * gap);
+  heights.forEach((h, i) => {
+    tft.fillRect(x, baseline - h, barW, h, i < lit ? col : '#333');
+    x += barW + gap;
+  });
+}
+
 // -------------------------------------------------------------- sim clock
 const BOOT_MS = Date.now() - 3 * 60 * 1000; // pretend it's been up a few minutes
 function simClockMs() { return Date.now(); }
@@ -786,6 +800,7 @@ function askText(promptText, initial, cb, opts = {}) {
       AP_POOL.slice(0, maxRows).forEach((ap) => {
         tft.setTextSize(2); tft.setTextColor(C.WHITE); tft.setTextWrap(false);
         tft.setCursor(4, y); tft.print(sprintf('%-13.13s', ap.ssid));
+        drawSignalBars(SCR.w - 6, y + 16, ap.rssi);
         tft.setTextSize(1); tft.setTextColor(accentLabel());
         tft.setCursor(4, y + 15); tft.print(sprintf('c%-3d %ddBm  %s', ap.channel, ap.rssi, ap.enc));
         ap._row = { x: 0, y, w: SCR.w, h: rowH };
